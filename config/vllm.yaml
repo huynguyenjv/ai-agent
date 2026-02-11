@@ -1,0 +1,28 @@
+# vLLM Configuration
+
+server:
+  base_url: ${VLLM_BASE_URL:http://localhost:8000/v1}
+  api_key: ${VLLM_API_KEY:token-abc123}
+  timeout: 300
+
+model:
+  name: ${VLLM_MODEL:Qwen/Qwen2.5-Coder-32B-Instruct-AWQ}
+  
+generation:
+  # Default generation parameters
+  temperature: 0.2
+  max_tokens: 4096
+  top_p: 0.95
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+  
+  # Stop sequences
+  stop_sequences:
+    - "```"
+    - "// END"
+
+retry:
+  max_attempts: 3
+  backoff_multiplier: 2
+  initial_delay: 1.0
+

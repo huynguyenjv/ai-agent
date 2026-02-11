@@ -1,0 +1,54 @@
+# Agent Orchestrator Configuration
+
+orchestrator:
+  # Maximum context tokens for RAG summaries
+  max_context_tokens: 4000
+  
+  # Number of top-k results from RAG
+  top_k_results: 10
+  
+  # Session timeout in seconds
+  session_timeout: 3600
+  
+  # Enable memory persistence
+  enable_memory: true
+
+prompt:
+  # System prompt template
+  system_template: |
+    You are an expert Java developer specializing in writing unit tests.
+    You follow clean code principles and DDD patterns.
+    
+  # Test generation constraints
+  test_constraints:
+    - Use JUnit5 annotations only (@Test, @BeforeEach, @DisplayName, etc.)
+    - Use Mockito for mocking dependencies (@Mock, @InjectMocks, @ExtendWith(MockitoExtension.class))
+    - NEVER use @SpringBootTest or any Spring test context
+    - Follow AAA pattern (Arrange, Act, Assert) with clear section comments
+    - Verify all mock interactions with verify()
+    - Use meaningful test method names with @DisplayName
+    - Test edge cases and error scenarios
+
+rules:
+  # DDD layer mapping
+  layer_detection:
+    application:
+      - "*Service"
+      - "*UseCase"
+      - "*Handler"
+    domain:
+      - "*Entity"
+      - "*ValueObject"
+      - "*DomainService"
+      - "*Aggregate"
+    infrastructure:
+      - "*Repository"
+      - "*Adapter"
+      - "*Client"
+      - "*Gateway"
+
+  # Dependency injection patterns
+  injection_patterns:
+    - constructor
+    - field_injection
+

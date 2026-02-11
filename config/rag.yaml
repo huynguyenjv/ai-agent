@@ -1,0 +1,43 @@
+# RAG Configuration
+
+qdrant:
+  host: ${QDRANT_HOST:localhost}
+  port: ${QDRANT_PORT:6333}
+  collection: ${QDRANT_COLLECTION:java_codebase}
+  
+  # Vector configuration
+  vector_size: 384  # all-MiniLM-L6-v2 dimension
+  distance: Cosine
+
+embedding:
+  model: ${EMBEDDING_MODEL:sentence-transformers/all-MiniLM-L6-v2}
+  batch_size: 32
+  max_seq_length: 512
+
+indexing:
+  # Chunk configuration
+  summary_min_tokens: 150
+  summary_max_tokens: 250
+  
+  # Metadata schema
+  metadata_fields:
+    - type        # service | entity | method | repository
+    - layer       # application | domain | infrastructure
+    - class_name
+    - method_name
+    - file_path
+    - dependencies
+    - package
+
+search:
+  # Default search parameters
+  default_top_k: 10
+  score_threshold: 0.5
+  
+  # Metadata filters
+  filterable_fields:
+    - type
+    - layer
+    - class_name
+    - package
+
