@@ -1,0 +1,64 @@
+version: '3.8'
+
+# Cách dùng:
+# 1. Chỉ chạy Qdrant: docker-compose up -d qdrant
+# 2. Chạy app local: python main.py (hoặc uvicorn server.api:app --reload)
+# 3. Hoặc chạy cả 2 trong docker: docker-compose up -d
+
+services:
+
+  ai-agent:
+    build: .
+    container_name: ai-agent
+    ports:
+      - "8001:8001"  # Đổi nếu FastAPI chạy port khác
+    environment:
+      - VLLM_BASE_URL=http://vllm:8000/v1
+      - VLLM_API_KEY=token-abc123
+      - VLLM_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+    volumes:
+      - .:/app
+    depends_on:
+      - vllm
+      - qdrant
+    command: ["python", "main.py"]
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # volumes:
+    #   - ./models:/root/.cache/huggingface/hub
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-agent-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  qdrant_data:
+    driver: local
+
