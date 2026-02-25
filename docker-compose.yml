@@ -1,89 +1,104 @@
 version: '3.8'
 
 # =============================================================================
-# AI Agent Docker Compose
-# =============================================================================
-# Cách dùng:
-#   Development (local):
-#     docker-compose up -d qdrant redis    # Chỉ chạy dependencies
-#     python main.py                        # Chạy app local
-#
-#   Production (full stack):
-#     docker-compose up -d                  # Chạy tất cả services
-#
-#   Chỉ Qdrant (không cần Redis):
-#     docker-compose up -d qdrant
+# AI Agent - Production Ready
 # =============================================================================
 
 services:
 
   # ---------------------------------------------------------------------------
-  # AI Agent Application
+  # AI Agent Application (Public Service)
   # ---------------------------------------------------------------------------
   ai-agent:
     build: .
     container_name: ai-agent
+    restart: unless-stopped
+
     ports:
-      - "8080:8080"
+      - "8080:8080"   # Chỉ expose service chính
+
     environment:
       # Server
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8080
       - LOG_LEVEL=INFO
       - MAX_WORKERS=4
+
       # vLLM
       - VLLM_BASE_URL=http://vllm:8000/v1
       - VLLM_API_KEY=token-abc123
-      - VLLM_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+      - VLLM_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+
       # Qdrant
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - QDRANT_COLLECTION=java_codebase
-      # Redis (Memory Backend)
+
+      # Redis
       - MEMORY_BACKEND=redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=
       - REDIS_DB=0
+
       # Security
       - CORS_ORIGINS=*
       - DISABLE_SSL_VERIFY=false
+
     volumes:
       - .:/app
       - ./models:/app/models
+
     depends_on:
       qdrant:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["python", "main.py"]
-    restart: unless-stopped
+      vllm:
+        condition: service_started
+
+    mem_limit: 4g
+    cpus: 4
+
+    networks:
+      - ai-network
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
 
+
   # ---------------------------------------------------------------------------
-  # vLLM Server (GPU required)
+  # vLLM Server (GPU Required)
   # ---------------------------------------------------------------------------
   vllm:
     image: vllm/vllm-openai:latest
     container_name: ai-agent-vllm
-    ports:
-      - "8000:8000"
+    restart: always
+    runtime: nvidia
+
     environment:
-      - MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    restart: unless-stopped
-    # volumes:
-    #   - ./models:/root/.cache/huggingface/hub
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+    volumes:
+      - /root/.cache/huggingface:/root/.cache/huggingface
+
+    shm_size: '16gb'
+
+    command: >
+      --model Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+      --max-model-len 16384
+      --gpu-memory-utilization 0.85
+      --max-num-seqs 16
+      --enable-prefix-caching
+      --trust-remote-code
+
+    networks:
+      - ai-network
+
 
   # ---------------------------------------------------------------------------
   # Qdrant Vector Database
@@ -91,19 +106,23 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: ai-agent-qdrant
-    ports:
-      - "6333:6333"
-      - "6334:6334"
+    restart: unless-stopped
+
     volumes:
       - qdrant_data:/qdrant/storage
+
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
-    restart: unless-stopped
+
+    networks:
+      - ai-network
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+
 
   # ---------------------------------------------------------------------------
   # Redis (Session Memory Store)
@@ -111,36 +130,40 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ai-agent-redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
-    restart: unless-stopped
+
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+
+    networks:
+      - ai-network
+
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
 
-  # ---------------------------------------------------------------------------
-  # Redis Commander (Optional - Web UI for Redis)
-  # ---------------------------------------------------------------------------
-  redis-commander:
-    image: rediscommander/redis-commander:latest
-    container_name: ai-agent-redis-ui
-    ports:
-      - "8081:8081"
-    environment:
-      - REDIS_HOSTS=local:redis:6379
-    depends_on:
-      - redis
-    profiles:
-      - tools  # Only start with: docker-compose --profile tools up -d
 
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  ai-network:
+    driver: bridge
+
+
+# =============================================================================
+# Volumes
+# =============================================================================
 volumes:
   qdrant_data:
     driver: local
   redis_data:
     driver: local
-

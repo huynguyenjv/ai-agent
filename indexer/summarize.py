@@ -85,6 +85,12 @@ class CodeSummarizer:
             if dependencies:
                 parts.append(f"Dependencies: {', '.join(dependencies)}")
 
+        # Used domain types (models, DTOs, entities) from fields/params/return types
+        # e.g. OrderService -> "Used Types: OrderRequest, OrderEntity, OrderResponse"
+        used_types = self._collect_used_types_for_summary(class_info)
+        if used_types:
+            parts.append(f"Used Types: {', '.join(used_types[:12])}")
+
         # Detailed fields (prefer over legacy format)
         if hasattr(class_info, 'detailed_fields') and class_info.detailed_fields:
             field_summaries = []
@@ -265,12 +271,58 @@ class CodeSummarizer:
 
         return list(set(dependencies))
 
+    def _collect_used_types_for_summary(self, class_info: ClassInfo) -> list[str]:
+        """Collect custom domain types used by this class (for summary embedding).
+        
+        Mirrors IndexBuilder._extract_used_types logic — extracts types from
+        fields, method parameters, and return types, filtering out Java builtins.
+        """
+        import re
+        _BUILTINS = {
+            "void", "boolean", "byte", "char", "short", "int", "long", "float", "double",
+            "Boolean", "Byte", "Character", "Short", "Integer", "Long", "Float", "Double",
+            "Number", "Object", "String", "StringBuilder", "StringBuffer", "CharSequence",
+            "UUID", "URI", "URL", "BigDecimal", "BigInteger",
+            "LocalDate", "LocalDateTime", "LocalTime", "ZonedDateTime", "Instant",
+            "Date", "Calendar", "Timestamp",
+            "List", "Map", "Set", "Collection", "Optional", "Stream",
+            "ArrayList", "HashMap", "HashSet", "LinkedList",
+            "Mono", "Flux",
+            "ResponseEntity", "HttpStatus", "HttpHeaders", "Page", "Pageable",
+            "Sort", "Slice", "Result", "Void", "Class", "Enum",
+        }
+        service_suffixes = {"Service", "Repository", "Client", "Gateway", "Handler"}
+
+        def extract(raw_type: str) -> list[str]:
+            return [
+                t for t in re.findall(r'[A-Z][A-Za-z0-9]+', raw_type)
+                if t not in _BUILTINS and len(t) > 2
+                and t != class_info.name
+                and not any(t.endswith(s) for s in service_suffixes)
+            ]
+
+        result: set[str] = set()
+        for f in getattr(class_info, 'detailed_fields', []):
+            result.update(extract(f.type))
+        for field_type, _, _ in class_info.fields:
+            result.update(extract(field_type))
+        for method in class_info.methods:
+            result.update(extract(method.return_type))
+            for param_type, _ in method.parameters:
+                result.update(extract(param_type))
+        return sorted(result)
+
     def _is_public_method(self, method: MethodInfo) -> bool:
-        """Check if method is public (no private/protected annotation)."""
-        for ann in method.annotations:
-            if "private" in ann.lower() or "protected" in ann.lower():
-                return False
-        # In Java, methods without explicit modifier in interface are public
+        """Check if method is likely public (not explicitly private/protected).
+        
+        Note: JavaParser extracts annotations, not modifiers, per method.
+        We conservatively include all methods in summaries (overinclusion is fine).
+        Filter out only obvious private patterns from method name conventions.
+        """
+        # Exclude common private/internal method naming patterns
+        name = method.name
+        if name.startswith("_") or name == "equals" or name == "hashCode":
+            return False
         return True
 
     def _method_signature(self, method: MethodInfo) -> str:

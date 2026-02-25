@@ -86,7 +86,6 @@ DOMAIN SOURCE RULE (CRITICAL)
 - Use accessors exactly as in source:
     - record → .field()
     - class → getX()/isX() as defined
-- Create objects based on annotations:
     - @Builder → MUST use Builder pattern: ClassName.builder().field(value).build()
     - @Builder(toBuilder=true) → can also use obj.toBuilder().field(newValue).build()
     - @Data/@Getter/@Setter → use new ClassName() + setters OR all-args constructor
@@ -94,8 +93,13 @@ DOMAIN SOURCE RULE (CRITICAL)
     - @AllArgsConstructor → new ClassName(all, fields, in, order) is available
     - record WITHOUT @Builder → use canonical constructor: new RecordName(field1, field2, ...)
     - record WITH @Builder → MUST use RecordName.builder().field(value).build()
-- Do NOT use new ClassName(...) if class/record has @Builder (use builder pattern instead)
-- Do NOT assume .toBuilder() exists unless @Builder(toBuilder=true) is present
+        - record WITHOUT @Builder → use canonical constructor: new RecordName(field1, field2, ...)
+        - record WITH @Builder → MUST use RecordName.builder().field(value).build()
+
+IMPORTANT:
+If record does NOT have @Builder annotation, NEVER use builder pattern. Only use canonical constructor: new RecordName(field1, field2, ...).
+Do NOT use new ClassName(...) if class/record has @Builder (use builder pattern instead)
+Do NOT assume .toBuilder() exists unless @Builder(toBuilder=true) is present
 
 STATIC UTILITIES (ONLY IF PRESENT IN SOURCE)
 - If service uses static utilities: mock via Mockito MockedStatic (try-with-resources).
@@ -141,15 +145,27 @@ NOW: analyze and write tests for the following service:
             parts.append("\n## Codebase Context")
             parts.append("Use this context to understand the class and its dependencies:\n")
 
-            # Group by type
+            # Group chunks by role
             main_class = None
-            dependencies = []
-            related = []
+            used_type_names: set[str] = set()
+            domain_types = []   # models/DTOs/entities from used_types
+            dependencies = []   # service-level deps
+            related = []        # other related code
 
+            # Determine used_type names from main class chunk
             for chunk in rag_chunks:
                 if chunk.class_name == class_name:
                     main_class = chunk
-                elif chunk.class_name in [c.class_name for c in rag_chunks if c.class_name == class_name]:
+                    used_type_names = set(chunk.used_types)
+                    break
+
+            for chunk in rag_chunks:
+                if chunk.class_name == class_name:
+                    continue  # already handled as main_class
+                elif chunk.class_name in used_type_names:
+                    domain_types.append(chunk)
+                elif any(chunk.class_name in (dep_chunk.dependencies or [])
+                         for dep_chunk in rag_chunks if dep_chunk.class_name == class_name):
                     dependencies.append(chunk)
                 else:
                     related.append(chunk)
@@ -162,9 +178,18 @@ NOW: analyze and write tests for the following service:
                 else:
                     parts.append(f"### Target Class Summary\n```\n{main_class.summary}\n```")
 
-            # Dependencies
+            # Domain types: FULL summary — LLM needs exact field/builder info
+            if domain_types:
+                parts.append("\n### Domain Types Used by This Class")
+                parts.append("⚠️ Use ONLY accessors and constructors exactly as shown below.\n")
+                for dt in domain_types:
+                    construction = self._get_construction_hint(dt)
+                    parts.append(f"\n**{dt.class_name}** ({dt.java_type or dt.type}){' — ' + construction if construction else ''}")
+                    parts.append(f"```\n{dt.summary}\n```")
+
+            # Service dependencies (truncated)
             if dependencies:
-                parts.append("\n### Dependencies")
+                parts.append("\n### Service Dependencies (Mocks)")
                 for dep in dependencies[:5]:
                     lombok_info = self._get_lombok_info(dep)
                     type_info = dep.type
@@ -173,20 +198,14 @@ NOW: analyze and write tests for the following service:
                     parts.append(f"\n**{dep.class_name}** ({type_info})")
                     parts.append(f"```\n{dep.summary[:300]}...\n```" if len(dep.summary) > 300 else f"```\n{dep.summary}\n```")
 
-            # Related code
+            # Related code (brief)
             if related:
                 parts.append("\n### Related Code")
-                for rel in related[:5]:
-                    # Build type info with Lombok annotations
-                    type_info = f"{rel.type}, {rel.layer}"
-                    if hasattr(rel, 'java_type') and rel.java_type:
-                        type_info = f"{rel.java_type}, {type_info}"
-                    
-                    # Add Lombok info
+                for rel in related[:3]:
+                    type_info = f"{rel.java_type or rel.type}, {rel.layer}"
                     lombok_info = self._get_lombok_info(rel)
                     if lombok_info:
                         type_info += f", {lombok_info}"
-                    
                     parts.append(f"\n**{rel.class_name}** ({type_info})")
                     summary = rel.summary[:200] + "..." if len(rel.summary) > 200 else rel.summary
                     parts.append(f"```\n{summary}\n```")
