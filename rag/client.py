@@ -92,6 +92,14 @@ class RAGClient:
                 method_name=payload.get("method_name"),
                 start_line=payload.get("start_line"),
                 end_line=payload.get("end_line"),
+                # Inheritance
+                extends=payload.get("extends"),
+                implements=payload.get("implements", []),
+                # Class meta
+                method_count=payload.get("method_count", 0),
+                modifiers=payload.get("modifiers", []),
+                # Domain types used (models, DTOs, entities)
+                used_types=payload.get("used_types", []),
                 # Lombok info
                 has_builder=payload.get("has_builder", False),
                 has_builder_to_builder=payload.get("has_builder_to_builder", False),
@@ -100,6 +108,9 @@ class RAGClient:
                 has_setter=payload.get("has_setter", False),
                 has_value=payload.get("has_value", False),
                 is_immutable=payload.get("is_immutable", False),
+                has_no_args_constructor=payload.get("has_no_args_constructor", False),
+                has_all_args_constructor=payload.get("has_all_args_constructor", False),
+                has_required_args_constructor=payload.get("has_required_args_constructor", False),
                 # Fields info
                 field_count=payload.get("field_count", 0),
                 fields=fields,
@@ -251,6 +262,23 @@ class RAGClient:
                 )
             )
 
+        # Inheritance filters
+        if filters.implements:
+            conditions.append(
+                models.FieldCondition(
+                    key="implements",
+                    match=models.MatchValue(value=filters.implements),
+                )
+            )
+
+        if filters.extends:
+            conditions.append(
+                models.FieldCondition(
+                    key="extends",
+                    match=models.MatchValue(value=filters.extends),
+                )
+            )
+
         # Lombok filters
         if filters.has_builder is not None:
             conditions.append(
@@ -268,11 +296,52 @@ class RAGClient:
                 )
             )
 
+        if filters.has_getter is not None:
+            conditions.append(
+                models.FieldCondition(
+                    key="has_getter",
+                    match=models.MatchValue(value=filters.has_getter),
+                )
+            )
+
+        if filters.has_setter is not None:
+            conditions.append(
+                models.FieldCondition(
+                    key="has_setter",
+                    match=models.MatchValue(value=filters.has_setter),
+                )
+            )
+
         if filters.is_immutable is not None:
             conditions.append(
                 models.FieldCondition(
                     key="is_immutable",
                     match=models.MatchValue(value=filters.is_immutable),
+                )
+            )
+
+        if filters.has_no_args_constructor is not None:
+            conditions.append(
+                models.FieldCondition(
+                    key="has_no_args_constructor",
+                    match=models.MatchValue(value=filters.has_no_args_constructor),
+                )
+            )
+
+        if filters.has_all_args_constructor is not None:
+            conditions.append(
+                models.FieldCondition(
+                    key="has_all_args_constructor",
+                    match=models.MatchValue(value=filters.has_all_args_constructor),
+                )
+            )
+
+        if filters.uses_type:
+            # Match classes that have the given type anywhere in their used_types list
+            conditions.append(
+                models.FieldCondition(
+                    key="used_types",
+                    match=models.MatchValue(value=filters.uses_type),
                 )
             )
 

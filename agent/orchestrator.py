@@ -247,29 +247,60 @@ class AgentOrchestrator:
                 return [CodeChunk(**c) for c in cached]
 
         chunks = []
+        existing_names: set[str] = set()
 
-        # Search for the main class
+        # Step 1: Fetch main class + its service dependencies
         main_result = self.rag.search_by_class(
             class_name=class_name,
             top_k=1,
             include_dependencies=True,
         )
-        chunks.extend(main_result.chunks)
-
-        # Search for related code
-        related_query = SearchQuery(
-            query=f"service {class_name} dependencies methods",
-            top_k=self.top_k - len(chunks),
-            score_threshold=0.4,
-        )
-        related_result = self.rag.search(related_query)
-
-        # Add unique chunks
-        existing_names = {c.fully_qualified_name for c in chunks}
-        for chunk in related_result.chunks:
+        for chunk in main_result.chunks:
             if chunk.fully_qualified_name not in existing_names:
                 chunks.append(chunk)
                 existing_names.add(chunk.fully_qualified_name)
+
+        # Step 2: Fetch used domain types (models, DTOs, entities) from the main class
+        # e.g. ResourceUseCaseService uses [Resource, ResourceDetail]
+        # → fetch each to get their fields, @Builder, Lombok annotations etc.
+        main_chunk = chunks[0] if chunks else None
+        if main_chunk and main_chunk.used_types:
+            logger.info(
+                "Fetching used_types for context",
+                class_name=class_name,
+                used_types=main_chunk.used_types,
+            )
+            for used_type in main_chunk.used_types[:8]:  # limit to avoid context explosion
+                if used_type in existing_names:
+                    continue
+                type_result = self.rag.search_by_class(
+                    class_name=used_type,
+                    top_k=1,
+                    include_dependencies=False,  # don't recurse into sub-deps
+                )
+                for chunk in type_result.chunks:
+                    if chunk.fully_qualified_name not in existing_names:
+                        chunks.append(chunk)
+                        existing_names.add(chunk.fully_qualified_name)
+                        logger.debug(
+                            "Added used_type to context",
+                            used_type=used_type,
+                            fqn=chunk.fully_qualified_name,
+                        )
+
+        # Step 3: Semantic search for related code to fill remaining slots
+        remaining = self.top_k - len(chunks)
+        if remaining > 0:
+            related_query = SearchQuery(
+                query=f"service {class_name} dependencies methods",
+                top_k=remaining,
+                score_threshold=0.4,
+            )
+            related_result = self.rag.search(related_query)
+            for chunk in related_result.chunks:
+                if chunk.fully_qualified_name not in existing_names:
+                    chunks.append(chunk)
+                    existing_names.add(chunk.fully_qualified_name)
 
         # Cache in session
         if session:
@@ -282,6 +313,7 @@ class AgentOrchestrator:
             "RAG context retrieved",
             class_name=class_name,
             chunks=len(chunks),
+            used_types_fetched=len(main_chunk.used_types) if main_chunk else 0,
         )
 
         return chunks[:self.top_k]

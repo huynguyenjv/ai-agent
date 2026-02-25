@@ -28,6 +28,9 @@ class CodeChunk(BaseModel):
     fully_qualified_name: str
     dependencies: list[str] = Field(default_factory=list)
     annotations: list[str] = Field(default_factory=list)
+    # used_types: domain types used via fields, method params, return types
+    # e.g. OrderService uses [OrderRequest, OrderEntity, OrderResponse]
+    used_types: list[str] = Field(default_factory=list)
     # element_type: class | record | interface | enum | annotation | method
     element_type: str = "class"
     # java_type: class | record | interface | enum | annotation (raw Java type)
@@ -35,6 +38,12 @@ class CodeChunk(BaseModel):
     method_name: Optional[str] = None
     start_line: Optional[int] = None
     end_line: Optional[int] = None
+    # Inheritance / interfaces
+    extends: Optional[str] = None
+    implements: list[str] = Field(default_factory=list)
+    # Class meta
+    method_count: int = 0
+    modifiers: list[str] = Field(default_factory=list)
     # Lombok info
     has_builder: bool = False
     has_builder_to_builder: bool = False
@@ -43,6 +52,9 @@ class CodeChunk(BaseModel):
     has_setter: bool = False
     has_value: bool = False
     is_immutable: bool = False
+    has_no_args_constructor: bool = False
+    has_all_args_constructor: bool = False
+    has_required_args_constructor: bool = False
     # Fields info
     field_count: int = 0
     fields: list[FieldSchema] = Field(default_factory=list)
@@ -59,10 +71,19 @@ class MetadataFilter(BaseModel):
     class_name: Optional[str] = None
     package: Optional[str] = None
     package_prefix: Optional[str] = None  # For package hierarchy filtering
+    # Inheritance
+    implements: Optional[str] = None   # Filter by implemented interface name
+    extends: Optional[str] = None     # Filter by superclass name
     # Lombok filters
     has_builder: Optional[bool] = None
     has_data: Optional[bool] = None
+    has_getter: Optional[bool] = None
+    has_setter: Optional[bool] = None
     is_immutable: Optional[bool] = None
+    has_no_args_constructor: Optional[bool] = None
+    has_all_args_constructor: Optional[bool] = None
+    # Filter by domain type usage (e.g. find all classes that use OrderRequest)
+    uses_type: Optional[str] = None
 
 
 class SearchQuery(BaseModel):
@@ -94,4 +115,3 @@ class IndexStats(BaseModel):
     status: str
     type_distribution: dict[str, int] = Field(default_factory=dict)
     layer_distribution: dict[str, int] = Field(default_factory=dict)
-
