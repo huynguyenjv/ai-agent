@@ -1,31 +1,75 @@
 version: '3.8'
 
+# =============================================================================
+# AI Agent Docker Compose
+# =============================================================================
 # Cách dùng:
-# 1. Chỉ chạy Qdrant: docker-compose up -d qdrant
-# 2. Chạy app local: python main.py (hoặc uvicorn server.api:app --reload)
-# 3. Hoặc chạy cả 2 trong docker: docker-compose up -d
+#   Development (local):
+#     docker-compose up -d qdrant redis    # Chỉ chạy dependencies
+#     python main.py                        # Chạy app local
+#
+#   Production (full stack):
+#     docker-compose up -d                  # Chạy tất cả services
+#
+#   Chỉ Qdrant (không cần Redis):
+#     docker-compose up -d qdrant
+# =============================================================================
 
 services:
 
+  # ---------------------------------------------------------------------------
+  # AI Agent Application
+  # ---------------------------------------------------------------------------
   ai-agent:
     build: .
     container_name: ai-agent
     ports:
-      - "8001:8001"  # Đổi nếu FastAPI chạy port khác
+      - "8080:8080"
     environment:
+      # Server
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - LOG_LEVEL=INFO
+      - MAX_WORKERS=4
+      # vLLM
       - VLLM_BASE_URL=http://vllm:8000/v1
       - VLLM_API_KEY=token-abc123
       - VLLM_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+      # Qdrant
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_COLLECTION=java_codebase
+      # Redis (Memory Backend)
+      - MEMORY_BACKEND=redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - REDIS_DB=0
+      # Security
+      - CORS_ORIGINS=*
+      - DISABLE_SSL_VERIFY=false
     volumes:
       - .:/app
+      - ./models:/app/models
     depends_on:
-      - vllm
-      - qdrant
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: ["python", "main.py"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
+  # ---------------------------------------------------------------------------
+  # vLLM Server (GPU required)
+  # ---------------------------------------------------------------------------
   vllm:
     image: vllm/vllm-openai:latest
-    container_name: vllm
+    container_name: ai-agent-vllm
     ports:
       - "8000:8000"
     environment:
@@ -37,10 +81,13 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    restart: unless-stopped
     # volumes:
     #   - ./models:/root/.cache/huggingface/hub
 
+  # ---------------------------------------------------------------------------
   # Qdrant Vector Database
+  # ---------------------------------------------------------------------------
   qdrant:
     image: qdrant/qdrant:latest
     container_name: ai-agent-qdrant
@@ -58,7 +105,42 @@ services:
       timeout: 10s
       retries: 3
 
+  # ---------------------------------------------------------------------------
+  # Redis (Session Memory Store)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ai-agent-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Redis Commander (Optional - Web UI for Redis)
+  # ---------------------------------------------------------------------------
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: ai-agent-redis-ui
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    profiles:
+      - tools  # Only start with: docker-compose --profile tools up -d
+
 volumes:
   qdrant_data:
+    driver: local
+  redis_data:
     driver: local
 

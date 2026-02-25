@@ -1,13 +1,17 @@
 """
 Session memory for maintaining agent context across interactions.
+Supports pluggable storage backends (in-memory for dev, Redis for prod).
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import deque
 
 import structlog
+
+from .memory_store import MemoryStore, SessionData, create_memory_store
 
 logger = structlog.get_logger()
 
@@ -34,19 +38,24 @@ class GeneratedTest:
 
 
 class SessionMemory:
-    """Manages session state and conversation history."""
+    """Manages session state and conversation history.
+    
+    Supports optional persistent storage for Long-Lived Agent pattern.
+    """
 
     def __init__(
         self,
         session_id: str,
         max_history: int = 20,
         timeout_seconds: int = 3600,
+        store: Optional[MemoryStore] = None,
     ):
         self.session_id = session_id
         self.max_history = max_history
         self.timeout_seconds = timeout_seconds
         self.created_at = time.time()
         self.last_activity = time.time()
+        self._store = store  # Optional persistent store
 
         # Conversation history
         self.history: deque[ConversationTurn] = deque(maxlen=max_history)
@@ -59,8 +68,8 @@ class SessionMemory:
         # Generated tests in this session
         self.generated_tests: list[GeneratedTest] = []
 
-        # RAG context cache
-        self.rag_context: dict[str, list[dict]] = {}
+        # RAG context cache (local, backed by store if available)
+        self._rag_context_local: dict[str, list[dict]] = {}
 
         logger.info("Session created", session_id=session_id)
 
@@ -104,13 +113,28 @@ class SessionMemory:
         self.last_activity = time.time()
 
     def cache_rag_context(self, key: str, chunks: list[dict]) -> None:
-        """Cache RAG results for reuse."""
-        self.rag_context[key] = chunks
+        """Cache RAG results for reuse (with optional persistent storage)."""
+        self._rag_context_local[key] = chunks
         self.last_activity = time.time()
+        
+        # Also persist to store if available
+        if self._store:
+            self._store.cache_rag_context(key, chunks, ttl=3600)
 
     def get_cached_rag_context(self, key: str) -> Optional[list[dict]]:
-        """Get cached RAG results."""
-        return self.rag_context.get(key)
+        """Get cached RAG results (checks local cache first, then store)."""
+        # Check local cache first
+        if key in self._rag_context_local:
+            return self._rag_context_local[key]
+        
+        # Try persistent store
+        if self._store:
+            cached = self._store.get_rag_context(key)
+            if cached:
+                self._rag_context_local[key] = cached  # Populate local cache
+                return cached
+        
+        return None
 
     def record_generated_test(
         self,
@@ -119,7 +143,7 @@ class SessionMemory:
         success: bool = True,
         feedback: Optional[str] = None,
     ) -> None:
-        """Record a generated test."""
+        """Record a generated test (with optional persistent storage)."""
         self.generated_tests.append(
             GeneratedTest(
                 class_name=class_name,
@@ -130,6 +154,10 @@ class SessionMemory:
             )
         )
         self.last_activity = time.time()
+        
+        # Persist test code to store for refinement
+        if self._store:
+            self._store.save_generated_test(self.session_id, class_name, test_code)
 
     def get_conversation_context(self, max_turns: int = 5) -> str:
         """Get recent conversation as context string."""
@@ -169,65 +197,179 @@ class SessionMemory:
         self.current_file = None
         self.current_package = None
         self.generated_tests.clear()
-        self.rag_context.clear()
+        self._rag_context_local.clear()
         logger.info("Session cleared", session_id=self.session_id)
 
 
 class MemoryManager:
-    """Manages multiple session memories."""
+    """Manages multiple session memories with pluggable storage backend.
+    
+    For Long-Lived Agent pattern:
+    - In-memory store for development (fast, no dependencies)
+    - Redis store for production (distributed, persistent)
+    
+    Configure via environment variables:
+    - MEMORY_BACKEND: "memory" (default) or "redis"
+    - REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB (for Redis backend)
+    """
 
-    def __init__(self, default_timeout: int = 3600):
-        self.sessions: dict[str, SessionMemory] = {}
+    def __init__(self, default_timeout: int = 3600, store: Optional[MemoryStore] = None):
         self.default_timeout = default_timeout
+        
+        # Local cache for active sessions (reduces store lookups)
+        self._local_cache: dict[str, SessionMemory] = {}
+        
+        # Initialize storage backend
+        if store:
+            self._store = store
+        else:
+            backend = os.getenv("MEMORY_BACKEND", "memory")
+            if backend == "redis":
+                self._store = create_memory_store(
+                    backend="redis",
+                    host=os.getenv("REDIS_HOST", "localhost"),
+                    port=int(os.getenv("REDIS_PORT", "6379")),
+                    password=os.getenv("REDIS_PASSWORD"),
+                    db=int(os.getenv("REDIS_DB", "0")),
+                )
+            else:
+                self._store = create_memory_store(backend="memory")
+        
+        logger.info("MemoryManager initialized", backend=type(self._store).__name__)
 
     def get_or_create_session(self, session_id: str) -> SessionMemory:
         """Get existing session or create new one."""
-        if session_id in self.sessions:
-            session = self.sessions[session_id]
+        # Check local cache first
+        if session_id in self._local_cache:
+            session = self._local_cache[session_id]
             if not session.is_expired():
                 return session
             else:
-                # Clean up expired session
-                del self.sessions[session_id]
+                del self._local_cache[session_id]
+        
+        # Try to load from store
+        session_data = self._store.load_session(session_id)
+        if session_data:
+            session = self._restore_session(session_data)
+            self._local_cache[session_id] = session
+            return session
 
         # Create new session
         session = SessionMemory(
             session_id=session_id,
             timeout_seconds=self.default_timeout,
+            store=self._store,
         )
-        self.sessions[session_id] = session
+        self._local_cache[session_id] = session
+        self._persist_session(session)
         return session
 
     def get_session(self, session_id: str) -> Optional[SessionMemory]:
         """Get session if it exists and is not expired."""
-        session = self.sessions.get(session_id)
-        if session and not session.is_expired():
+        # Check local cache
+        if session_id in self._local_cache:
+            session = self._local_cache[session_id]
+            if not session.is_expired():
+                return session
+            else:
+                del self._local_cache[session_id]
+        
+        # Try to load from store
+        session_data = self._store.load_session(session_id)
+        if session_data:
+            session = self._restore_session(session_data)
+            self._local_cache[session_id] = session
             return session
+        
         return None
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session."""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
+        # Remove from local cache
+        if session_id in self._local_cache:
+            del self._local_cache[session_id]
+        
+        # Remove from store
+        result = self._store.delete_session(session_id)
+        if result:
             logger.info("Session deleted", session_id=session_id)
-            return True
-        return False
+        return result
 
     def cleanup_expired(self) -> int:
         """Remove all expired sessions."""
-        expired = [
-            sid for sid, session in self.sessions.items() if session.is_expired()
+        # Cleanup local cache
+        expired_local = [
+            sid for sid, session in self._local_cache.items() if session.is_expired()
         ]
-        for sid in expired:
-            del self.sessions[sid]
-
-        if expired:
-            logger.info("Cleaned up expired sessions", count=len(expired))
-        return len(expired)
+        for sid in expired_local:
+            del self._local_cache[sid]
+        
+        # Cleanup store
+        store_count = self._store.cleanup_expired()
+        
+        total = len(expired_local) + store_count
+        if total > 0:
+            logger.info("Cleaned up expired sessions", count=total)
+        return total
 
     def get_active_sessions(self) -> list[str]:
         """Get list of active session IDs."""
-        return [
-            sid for sid, session in self.sessions.items() if not session.is_expired()
-        ]
+        return self._store.list_sessions()
+    
+    def _persist_session(self, session: SessionMemory) -> None:
+        """Persist session to store."""
+        session_data = SessionData(
+            session_id=session.session_id,
+            created_at=session.created_at,
+            last_activity=session.last_activity,
+            timeout_seconds=session.timeout_seconds,
+            current_class=session.current_class,
+            current_file=session.current_file,
+            current_package=session.current_package,
+            history=[
+                {"role": t.role, "content": t.content[:500], "timestamp": t.timestamp}
+                for t in list(session.history)[-10:]  # Only persist last 10 turns
+            ],
+            max_history=session.max_history,
+            generated_tests_meta=[
+                {"class_name": t.class_name, "timestamp": t.timestamp, "success": t.success}
+                for t in session.generated_tests[-5:]  # Only metadata, not full code
+            ],
+        )
+        self._store.save_session(session_data)
+    
+    def _restore_session(self, data: SessionData) -> SessionMemory:
+        """Restore SessionMemory from SessionData."""
+        session = SessionMemory(
+            session_id=data.session_id,
+            max_history=data.max_history,
+            timeout_seconds=data.timeout_seconds,
+            store=self._store,
+        )
+        session.created_at = data.created_at
+        session.last_activity = data.last_activity
+        session.current_class = data.current_class
+        session.current_file = data.current_file
+        session.current_package = data.current_package
+        
+        # Restore history
+        for h in data.history:
+            session.history.append(ConversationTurn(
+                role=h["role"],
+                content=h["content"],
+                timestamp=h.get("timestamp", time.time()),
+            ))
+        
+        # Restore generated tests metadata
+        for t in data.generated_tests_meta:
+            # Try to get full test code from store
+            test_code = self._store.get_generated_test(data.session_id, t["class_name"])
+            session.generated_tests.append(GeneratedTest(
+                class_name=t["class_name"],
+                test_code=test_code or "",
+                timestamp=t["timestamp"],
+                success=t["success"],
+            ))
+        
+        return session
 

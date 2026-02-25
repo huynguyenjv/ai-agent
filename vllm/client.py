@@ -2,6 +2,7 @@
 vLLM client for OpenAI-compatible API.
 """
 
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,7 +25,7 @@ class GenerationResponse:
 
 
 class VLLMClient:
-    """Client for vLLM OpenAI-compatible API."""
+    """Client for vLLM OpenAI-compatible API with connection pooling."""
 
     def __init__(
         self,
@@ -35,6 +36,8 @@ class VLLMClient:
         max_tokens: int = 4096,
         top_p: float = 0.95,
         timeout: int = 600,  # Increased timeout for long generations
+        max_connections: int = 10,  # Connection pool size
+        max_keepalive_connections: int = 5,  # Keep-alive connections
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -43,6 +46,14 @@ class VLLMClient:
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.timeout = timeout
+        self._closed = False
+
+        # Configure connection pool for better performance
+        limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive_connections,
+            keepalive_expiry=30.0,  # Keep connections alive for 30 seconds
+        )
 
         # Use longer timeouts for connect and read
         self.client = httpx.Client(
@@ -52,16 +63,19 @@ class VLLMClient:
                 write=30.0,
                 pool=30.0,
             ),
+            limits=limits,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
+            http2=False,  # Disable HTTP/2 for better compatibility with vLLM
         )
 
         logger.info(
             "vLLM client initialized",
             base_url=base_url,
             model=model,
+            max_connections=max_connections,
         )
 
     @retry(
@@ -74,8 +88,9 @@ class VLLMClient:
         user_prompt: str,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        stream: bool = True,  # Default to streaming to avoid KV cache blocking
     ) -> GenerationResponse:
-        """Generate completion using vLLM."""
+        """Generate completion using vLLM with streaming to avoid KV cache blocking."""
         try:
             payload = {
                 "model": self.model,
@@ -86,38 +101,20 @@ class VLLMClient:
                 "temperature": temperature or self.temperature,
                 "max_tokens": max_tokens or self.max_tokens,
                 "top_p": self.top_p,
+                "stream": stream,
             }
 
             logger.debug(
                 "Sending generation request",
                 model=self.model,
                 prompt_length=len(user_prompt),
+                stream=stream,
             )
 
-            response = self.client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-            )
-            response.raise_for_status()
-
-            data = response.json()
-            choice = data["choices"][0]
-            message = choice["message"]
-
-            tokens_used = data.get("usage", {}).get("total_tokens", 0)
-
-            logger.info(
-                "Generation complete",
-                tokens_used=tokens_used,
-                finish_reason=choice.get("finish_reason", ""),
-            )
-
-            return GenerationResponse(
-                success=True,
-                content=message["content"],
-                tokens_used=tokens_used,
-                finish_reason=choice.get("finish_reason", ""),
-            )
+            if stream:
+                return self._generate_streaming(payload)
+            else:
+                return self._generate_non_streaming(payload)
 
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP error: {e.response.status_code}"
@@ -134,12 +131,95 @@ class VLLMClient:
             logger.error("vLLM request failed", error=error_msg)
             return GenerationResponse(success=False, error=error_msg)
 
+    def _generate_streaming(self, payload: dict) -> GenerationResponse:
+        """Generate with streaming - releases KV cache incrementally."""
+        content_parts = []
+        finish_reason = ""
+        
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            
+            for line in response.iter_lines():
+                if not line or line.startswith(":"):
+                    continue
+                    
+                if line.startswith("data: "):
+                    data_str = line[6:]  # Remove "data: " prefix
+                    
+                    if data_str.strip() == "[DONE]":
+                        break
+                    
+                    try:
+                        data = json.loads(data_str)
+                        choice = data.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        
+                        if "content" in delta:
+                            content_parts.append(delta["content"])
+                        
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                            
+                    except json.JSONDecodeError:
+                        continue
+
+        content = "".join(content_parts)
+        # Estimate tokens (streaming doesn't always return usage)
+        tokens_used = len(content) // 4  # Rough estimate
+        
+        logger.info(
+            "Streaming generation complete",
+            content_length=len(content),
+            finish_reason=finish_reason,
+        )
+
+        return GenerationResponse(
+            success=True,
+            content=content,
+            tokens_used=tokens_used,
+            finish_reason=finish_reason,
+        )
+
+    def _generate_non_streaming(self, payload: dict) -> GenerationResponse:
+        """Generate without streaming - may block KV cache longer."""
+        payload["stream"] = False
+        
+        response = self.client.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        choice = data["choices"][0]
+        message = choice["message"]
+
+        tokens_used = data.get("usage", {}).get("total_tokens", 0)
+
+        logger.info(
+            "Generation complete",
+            tokens_used=tokens_used,
+            finish_reason=choice.get("finish_reason", ""),
+        )
+
+        return GenerationResponse(
+            success=True,
+            content=message["content"],
+            tokens_used=tokens_used,
+            finish_reason=choice.get("finish_reason", ""),
+        )
+
     def generate_with_history(
         self,
         system_prompt: str,
         messages: list[dict],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        stream: bool = True,  # Default to streaming
     ) -> GenerationResponse:
         """Generate completion with conversation history."""
         try:
@@ -152,24 +232,13 @@ class VLLMClient:
                 "temperature": temperature or self.temperature,
                 "max_tokens": max_tokens or self.max_tokens,
                 "top_p": self.top_p,
+                "stream": stream,
             }
 
-            response = self.client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-            )
-            response.raise_for_status()
-
-            data = response.json()
-            choice = data["choices"][0]
-            message = choice["message"]
-
-            return GenerationResponse(
-                success=True,
-                content=message["content"],
-                tokens_used=data.get("usage", {}).get("total_tokens", 0),
-                finish_reason=choice.get("finish_reason", ""),
-            )
+            if stream:
+                return self._generate_streaming(payload)
+            else:
+                return self._generate_non_streaming(payload)
 
         except Exception as e:
             logger.error("vLLM request failed", error=str(e))
@@ -199,12 +268,24 @@ class VLLMClient:
             return None
 
     def close(self):
-        """Close the HTTP client."""
-        self.client.close()
+        """Close the HTTP client and release all connections."""
+        if not self._closed:
+            self._closed = True
+            self.client.close()
+            logger.info("vLLM client closed")
+
+    def is_closed(self) -> bool:
+        """Check if the client is closed."""
+        return self._closed
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+    def __del__(self):
+        """Ensure client is closed on garbage collection."""
+        if not self._closed:
+            self.close()
 

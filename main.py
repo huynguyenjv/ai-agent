@@ -8,69 +8,70 @@ import ssl
 import warnings
 
 # =============================================================================
-# CORPORATE PROXY & SSL BYPASS - Phải đặt TRƯỚC khi import bất kỳ thư viện nào
+# CORPORATE PROXY & SSL BYPASS - Configurable via environment
+# Set DISABLE_SSL_VERIFY=true only in corporate environments with proxy issues
 # =============================================================================
 
-# Disable SSL verification globally
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-os.environ['SSL_CERT_FILE'] = ''
-os.environ['SSL_CERT_DIR'] = ''
+# Sentence transformers model path
+os.environ['SENTENCE_TRANSFORMERS_HOME'] = os.getenv('SENTENCE_TRANSFORMERS_HOME', './models')
 
-# HuggingFace specific
-os.environ['HF_HUB_DISABLE_SSL_VERIFY'] = '1'
+# HuggingFace telemetry
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
-os.environ['TRANSFORMERS_OFFLINE'] = '0'
 
-# Sentence transformers
-os.environ['SENTENCE_TRANSFORMERS_HOME'] = './models'
+# Check if SSL bypass is enabled (default: False for production safety)
+DISABLE_SSL_VERIFY = os.getenv('DISABLE_SSL_VERIFY', 'false').lower() == 'true'
 
-# Suppress all SSL warnings
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings('ignore', message='Unverified HTTPS request')
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-
-# Monkey-patch SSL context để bypass verification
-_original_create_default_context = ssl.create_default_context
-
-def _create_unverified_context(*args, **kwargs):
-    context = _original_create_default_context(*args, **kwargs)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    return context
-
-ssl.create_default_context = _create_unverified_context
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# Patch requests để không verify SSL
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
+if DISABLE_SSL_VERIFY:
+    # WARNING: Only use in corporate environments with proxy issues
+    print("⚠️  WARNING: SSL verification is DISABLED. This is insecure for production!", file=sys.stderr)
     
-    class SSLAdapter(HTTPAdapter):
-        def init_poolmanager(self, *args, **kwargs):
-            kwargs['ssl_context'] = ssl._create_unverified_context()
-            return super().init_poolmanager(*args, **kwargs)
-    
-    # Patch Session
-    _original_session_init = requests.Session.__init__
-    
-    def _patched_session_init(self, *args, **kwargs):
-        _original_session_init(self, *args, **kwargs)
-        self.verify = False
-        self.mount('https://', SSLAdapter())
-    
-    requests.Session.__init__ = _patched_session_init
-except ImportError:
-    pass
+    # Disable SSL verification globally
+    os.environ['CURL_CA_BUNDLE'] = ''
+    os.environ['REQUESTS_CA_BUNDLE'] = ''
+    os.environ['SSL_CERT_FILE'] = ''
+    os.environ['SSL_CERT_DIR'] = ''
+    os.environ['HF_HUB_DISABLE_SSL_VERIFY'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '0'
 
-# Patch httpx nếu có
-try:
-    import httpx
-    httpx._config.DEFAULT_TIMEOUT_CONFIG = httpx.Timeout(timeout=120.0)
-except ImportError:
-    pass
+    # Suppress SSL warnings
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+    # Monkey-patch SSL context để bypass verification
+    _original_create_default_context = ssl.create_default_context
+
+    def _create_unverified_context(*args, **kwargs):
+        context = _original_create_default_context(*args, **kwargs)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+
+    ssl.create_default_context = _create_unverified_context
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    # Patch requests để không verify SSL
+    try:
+        import requests
+        from requests.adapters import HTTPAdapter
+        
+        class SSLAdapter(HTTPAdapter):
+            def init_poolmanager(self, *args, **kwargs):
+                kwargs['ssl_context'] = ssl._create_unverified_context()
+                return super().init_poolmanager(*args, **kwargs)
+        
+        # Patch Session
+        _original_session_init = requests.Session.__init__
+        
+        def _patched_session_init(self, *args, **kwargs):
+            _original_session_init(self, *args, **kwargs)
+            self.verify = False
+            self.mount('https://', SSLAdapter())
+        
+        requests.Session.__init__ = _patched_session_init
+    except ImportError:
+        pass
 
 # =============================================================================
 
