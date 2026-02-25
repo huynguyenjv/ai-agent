@@ -3,10 +3,12 @@ FastAPI server for the AI coding agent.
 Compatible with Tabby IDE via OpenAI-compatible API.
 """
 
+import asyncio
 import json
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional, Literal
 
@@ -19,10 +21,11 @@ structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
 )
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+from collections import defaultdict
 
 from agent.orchestrator import AgentOrchestrator, GenerationRequest
 from indexer.build_index import IndexBuilder
@@ -40,6 +43,19 @@ logger = structlog.get_logger()
 orchestrator: Optional[AgentOrchestrator] = None
 index_builder: Optional[IndexBuilder] = None
 session_manager: SessionManager = SessionManager()
+
+# Thread pool for running blocking operations
+# Use limited workers to prevent resource exhaustion
+_executor: Optional[ThreadPoolExecutor] = None
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+
+# Rate limiting configuration
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))  # requests per window
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # window in seconds
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))  # max request time in seconds
+
+# Simple in-memory rate limiter (use Redis for distributed deployments)
+_rate_limit_store: dict[str, list[float]] = defaultdict(list)
 
 
 # ============================================================================
@@ -171,10 +187,19 @@ def create_orchestrator() -> AgentOrchestrator:
         embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
     )
 
+    vllm_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+    vllm_model = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ")
+    
+    logger.info(
+        "Creating vLLM client",
+        base_url=vllm_base_url,
+        model=vllm_model,
+    )
+    
     vllm_client = VLLMClient(
-        base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
+        base_url=vllm_base_url,
         api_key=os.getenv("VLLM_API_KEY", "token-abc123"),
-        model=os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"),
+        model=vllm_model,
     )
 
     return AgentOrchestrator(
@@ -196,13 +221,20 @@ def create_index_builder() -> IndexBuilder:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global orchestrator, index_builder
+    global orchestrator, index_builder, _executor
 
     logger.info("Starting AI Agent server...")
+
+    # Initialize thread pool for blocking operations
+    _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    logger.info("Thread pool initialized", max_workers=MAX_WORKERS)
 
     # Initialize components
     orchestrator = create_orchestrator()
     index_builder = create_index_builder()
+
+    # Start background task for session cleanup
+    cleanup_task = asyncio.create_task(_periodic_session_cleanup())
 
     logger.info("Server initialized successfully")
 
@@ -210,6 +242,72 @@ async def lifespan(app: FastAPI):
 
     # Cleanup
     logger.info("Shutting down server...")
+    
+    # Cancel cleanup task
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+    # Close vLLM client connection
+    if orchestrator and orchestrator.vllm:
+        orchestrator.vllm.close()
+        logger.info("vLLM client closed")
+
+    # Shutdown thread pool
+    if _executor:
+        _executor.shutdown(wait=True, cancel_futures=True)
+        logger.info("Thread pool shutdown complete")
+
+
+async def _periodic_session_cleanup():
+    """Background task to cleanup expired sessions periodically."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Every 5 minutes
+            count = session_manager.cleanup_expired()
+            if count > 0:
+                logger.info("Cleaned up expired sessions", count=count)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Session cleanup failed", error=str(e))
+
+
+async def run_in_executor(func, *args):
+    """Run a blocking function in the thread pool with timeout."""
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, func, *args),
+            timeout=REQUEST_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.error("Request timed out", timeout=REQUEST_TIMEOUT)
+        raise HTTPException(
+            status_code=504,
+            detail=f"Request timed out after {REQUEST_TIMEOUT} seconds"
+        )
+
+
+def check_rate_limit(client_ip: str) -> bool:
+    """Check if client has exceeded rate limit. Returns True if allowed."""
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+    
+    # Clean old entries
+    _rate_limit_store[client_ip] = [
+        ts for ts in _rate_limit_store[client_ip] if ts > window_start
+    ]
+    
+    # Check limit
+    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
+        return False
+    
+    # Record this request
+    _rate_limit_store[client_ip].append(now)
+    return True
 
 
 def create_app() -> FastAPI:
@@ -221,14 +319,49 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS middleware
+    # CORS middleware - configurable for production
+    # In production, set CORS_ORIGINS env var to comma-separated list of allowed origins
+    cors_origins_str = os.getenv("CORS_ORIGINS", "*")
+    if cors_origins_str == "*":
+        # Development mode - allow all
+        allow_origins = ["*"]
+        allow_credentials = False  # Cannot use credentials with wildcard origin
+    else:
+        # Production mode - specific origins only
+        allow_origins = [origin.strip() for origin in cors_origins_str.split(",")]
+        allow_credentials = True
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allow_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
     )
+
+    # Rate limiting middleware
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        # Skip rate limiting for health checks
+        if request.url.path in ["/health", "/v1/health", "/v1/models"]:
+            return await call_next(request)
+        
+        # Get client IP (handle proxy headers)
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if not client_ip:
+            client_ip = request.client.host if request.client else "unknown"
+        
+        # Check rate limit
+        if not check_rate_limit(client_ip):
+            logger.warning("Rate limit exceeded", client_ip=client_ip)
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": f"Rate limit exceeded. Max {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds."
+                }
+            )
+        
+        return await call_next(request)
 
     return app
 
@@ -295,7 +428,8 @@ async def generate_test(request: GenerateTestRequest):
         session_id=session_id,
     )
 
-    result = orchestrator.generate_test(gen_request)
+    # Run blocking operation in thread pool to avoid blocking event loop
+    result = await run_in_executor(orchestrator.generate_test, gen_request)
 
     # Update session
     if result.success:
@@ -330,9 +464,11 @@ async def refine_test(request: RefineTestRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    result = orchestrator.refine_test(
-        session_id=request.session_id,
-        feedback=request.feedback,
+    # Run blocking operation in thread pool
+    result = await run_in_executor(
+        orchestrator.refine_test,
+        request.session_id,
+        request.feedback,
     )
 
     if result.success:
@@ -502,14 +638,15 @@ async def chat_completions(request: ChatCompletionRequest):
         except Exception as e:
             logger.warning("RAG search failed", error=str(e))
 
-    # Build the prompt
+    # Build the prompt and run generation in thread pool
     if is_test_request and request.file_path:
         logger.info("Using test generation logic", file_path=request.file_path)
         gen_request = GenerationRequest(
             file_path=request.file_path,
             task_description=user_content,
         )
-        result = orchestrator.generate_test(gen_request)
+        # Run blocking operation in thread pool
+        result = await run_in_executor(orchestrator.generate_test, gen_request)
         logger.debug("Test generation result", result=result)
 
         if result.success:
@@ -525,11 +662,15 @@ async def chat_completions(request: ChatCompletionRequest):
             enhanced_prompt = f"{user_content}\n{rag_context}"
 
         logger.info("Calling vLLM for generation", prompt=enhanced_prompt[:200])
-        vllm_response = orchestrator.vllm.generate(
-            system_prompt=system_content or orchestrator.prompt_builder.build_system_prompt(),
-            user_prompt=enhanced_prompt,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
+        
+        # Run blocking vLLM call in thread pool
+        vllm_response = await run_in_executor(
+            lambda: orchestrator.vllm.generate(
+                system_prompt=system_content or orchestrator.prompt_builder.build_system_prompt(),
+                user_prompt=enhanced_prompt,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
         )
         logger.debug("vLLM response", vllm_response=vllm_response)
 

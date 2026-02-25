@@ -8,6 +8,9 @@ python-dotenv==1.0.1
 # Vector database
 qdrant-client==1.7.3
 
+# Redis (Session Memory Store - optional for production)
+redis==5.0.1
+
 # Embeddings
 sentence-transformers==2.3.1
 
