@@ -28,6 +28,8 @@ from pydantic import BaseModel, Field
 from collections import defaultdict
 
 from agent.orchestrator import AgentOrchestrator, GenerationRequest
+from agent.events import get_event_bus, Event, EventType
+from agent.metrics import MetricsCollector
 from indexer.build_index import IndexBuilder
 from rag.client import RAGClient
 from rag.schema import SearchQuery
@@ -42,6 +44,7 @@ logger = structlog.get_logger()
 # Global instances
 orchestrator: Optional[AgentOrchestrator] = None
 index_builder: Optional[IndexBuilder] = None
+metrics_collector: Optional[MetricsCollector] = None
 session_manager: SessionManager = SessionManager()
 
 # Thread pool for running blocking operations
@@ -62,10 +65,43 @@ _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 # OpenAI-Compatible Models (for Tabby integration)
 # ============================================================================
 
+# ── Tool-calling types (OpenAI function-calling protocol) ────────────
+
+class FunctionDefinition(BaseModel):
+    """Function schema for tool calling."""
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict] = None  # JSON Schema
+
+
+class ToolDefinition(BaseModel):
+    """Tool wrapper (OpenAI format)."""
+    type: str = "function"
+    function: FunctionDefinition
+
+
+class FunctionCall(BaseModel):
+    """A function call made by the model."""
+    name: str
+    arguments: str  # JSON string
+
+
+class ToolCall(BaseModel):
+    """Tool call in assistant message."""
+    id: str
+    type: str = "function"
+    function: FunctionCall
+
+
+# ── Chat messages & request/response ────────────────────────────────
+
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
-    role: Literal["system", "user", "assistant"]
-    content: str
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
+    tool_calls: Optional[list[ToolCall]] = None    # assistant → tool calls
+    tool_call_id: Optional[str] = None             # tool → result
+    name: Optional[str] = None                     # tool function name
 
 
 class ChatCompletionRequest(BaseModel):
@@ -75,16 +111,19 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.2
     max_tokens: Optional[int] = 4096
     stream: Optional[bool] = False
+    # Tool calling (Continue IDE sends these)
+    tools: Optional[list[ToolDefinition]] = None
+    tool_choice: Optional[str | dict] = None  # "auto" | "none" | {"type":"function","function":{"name":...}}
     # Custom fields for RAG
-    file_path: Optional[str] = None  # Current file being edited
-    workspace_path: Optional[str] = None  # Workspace root
+    file_path: Optional[str] = None
+    workspace_path: Optional[str] = None
 
 
 class ChatCompletionChoice(BaseModel):
     """OpenAI-compatible chat completion choice."""
     index: int = 0
     message: Optional[ChatMessage] = None
-    delta: Optional[ChatMessage] = None  # For streaming
+    delta: Optional[dict] = None  # For streaming (loose dict for flexibility)
     finish_reason: Optional[str] = "stop"
 
 
@@ -221,7 +260,7 @@ def create_index_builder() -> IndexBuilder:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global orchestrator, index_builder, _executor
+    global orchestrator, index_builder, _executor, metrics_collector
 
     logger.info("Starting AI Agent server...")
 
@@ -232,6 +271,9 @@ async def lifespan(app: FastAPI):
     # Initialize components
     orchestrator = create_orchestrator()
     index_builder = create_index_builder()
+
+    # Phase 4: metrics collector is wired via the orchestrator's event bus
+    metrics_collector = orchestrator.metrics if orchestrator else None
 
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(_periodic_session_cleanup())
@@ -371,15 +413,19 @@ app = create_app()
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Check the health of all services."""
+    """Check the health of all services (non-blocking)."""
     vllm_healthy = False
     qdrant_healthy = False
     index_stats = None
 
     if orchestrator:
-        vllm_healthy = orchestrator.vllm.health_check()
+        # Run sync health checks in thread pool to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+
+        vllm_healthy = await loop.run_in_executor(None, orchestrator.vllm.health_check)
+
         try:
-            stats = orchestrator.rag.get_stats()
+            stats = await loop.run_in_executor(None, orchestrator.rag.get_stats)
             # Qdrant status có thể là "green", "yellow", hoặc tên khác tùy version
             qdrant_healthy = stats.status in ("green", "yellow", "Green", "Yellow") or stats.total_points >= 0
             index_stats = {
@@ -392,7 +438,9 @@ async def health_check():
             logger.warning("Qdrant health check failed", error=str(e))
             # Try direct connection check
             try:
-                collections = orchestrator.rag.qdrant.get_collections()
+                collections = await loop.run_in_executor(
+                    None, orchestrator.rag.qdrant.get_collections
+                )
                 qdrant_healthy = True
                 index_stats = {"collection": "java_codebase", "total_points": 0, "status": "connected"}
             except Exception:
@@ -611,66 +659,65 @@ def _extract_java_file_path_from_message(content: str) -> Optional[str]:
     return None
 
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+@app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
+    """OpenAI-compatible chat completions endpoint.
+
+    This is the main endpoint for Continue IDE / Tabby integration.
+    Supports:
+      - Non-streaming and real SSE streaming (piped from vLLM)
+      - Tool calling (tools in request, tool_calls in response)
+      - Test generation pipeline (with RAG + validation + repair)
+      - General chat with RAG context enhancement
     """
-    OpenAI-compatible chat completions endpoint.
-    This is the main endpoint for Tabby integration.
-    """
-    logger.info("/v1/chat/completions called", request=request.model_dump())
     if not orchestrator:
-        logger.error("Orchestrator not initialized")
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    # Extract user message
+    # ── Parse messages ───────────────────────────────────────────────
     user_messages = [m for m in request.messages if m.role == "user"]
     if not user_messages:
-        logger.error("No user message provided", messages=request.messages)
         raise HTTPException(status_code=400, detail="No user message provided")
 
-    user_content = user_messages[-1].content
+    user_content = user_messages[-1].content or ""
     system_messages = [m for m in request.messages if m.role == "system"]
     system_content = system_messages[0].content if system_messages else ""
 
-    # Filter out Continue/IDE agent system prompts (they are too long and not useful)
-    # These prompts contain tool instructions that we don't need
+    # Filter overly-long IDE agent system prompts
     if system_content and any(marker in system_content for marker in [
-        "<important_rules>",
-        "You are in agent mode",
-        "TOOL_NAME:",
-        "read_file tool",
-        "create_new_file tool",
+        "<important_rules>", "You are in agent mode",
+        "TOOL_NAME:", "read_file tool", "create_new_file tool",
     ]):
-        logger.info("Filtered out IDE agent system prompt (too long/not relevant)")
-        system_content = ""  # Use our own system prompt instead
+        system_content = ""
 
-    logger.debug("Parsed messages", user_content=user_content[:100], system_content=system_content[:100] if system_content else "")
+    # ── Handle tool calls from Continue ──────────────────────────────
+    # If Continue sent tool results, include them in the message history
+    # and forward to vLLM for the next response.
+    tool_messages = [m for m in request.messages if m.role == "tool"]
 
-    # Check if this is a test generation request
+    # ── Detect request intent ────────────────────────────────────────
     is_test_request = any(
-        keyword in user_content.lower()
-        for keyword in ["test", "junit", "unit test", "mockito", "generate test"]
+        kw in user_content.lower()
+        for kw in ["test", "junit", "unit test", "mockito", "generate test"]
     )
 
-    # Resolve file_path: from request, or extract from inline code block (Continue IDE)
     file_path = request.file_path
     if not file_path:
         file_path = _extract_java_file_path_from_message(user_content)
-        if file_path:
-            logger.info("Extracted file_path from inline code block", file_path=file_path)
 
-    logger.debug("Is test request", is_test_request=is_test_request, file_path=file_path)
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    created_time = int(time.time())
 
-    # Route: test generation (with full RAG pipeline) or general chat
+    # ═════════════════════════════════════════════════════════════════
+    # PATH 1: Test generation (full pipeline — always buffered because
+    #         the output needs validation + repair before sending)
+    # ═════════════════════════════════════════════════════════════════
     if is_test_request and file_path:
         logger.info("Using test generation pipeline", file_path=file_path)
         gen_request = GenerationRequest(
             file_path=file_path,
             task_description=user_content,
         )
-        # Run blocking operation in thread pool
         result = await run_in_executor(orchestrator.generate_test, gen_request)
-        logger.debug("Test generation result", success=result.success, rag_chunks=result.rag_chunks_used)
 
         if result.success:
             response_content = result.test_code or ""
@@ -678,136 +725,256 @@ async def chat_completions(request: ChatCompletionRequest):
         else:
             response_content = f"Error generating test: {result.error}"
             tokens_used = 0
-    else:
-        # General chat — try to add RAG context if we have a file_path
-        enhanced_prompt = user_content
-        if file_path:
-            class_name = file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
-            try:
-                logger.debug("Searching RAG context for general chat", class_name=class_name)
-                search_result = orchestrator.rag.search(SearchQuery(
-                    query=f"{class_name} service methods dependencies",
-                    top_k=5,
-                    score_threshold=0.4,
-                ))
-                if search_result.chunks:
-                    rag_context = "\n\n## Codebase Context:\n"
-                    for chunk in search_result.chunks:
-                        rag_context += f"\n### {chunk.class_name} ({chunk.type}, {chunk.layer})\n"
-                        rag_context += f"```\n{chunk.summary[:500]}\n```\n"
-                    enhanced_prompt = f"{user_content}\n{rag_context}"
-            except Exception as e:
-                logger.warning("RAG search failed", error=str(e))
 
-        logger.info("Calling vLLM for general generation", prompt=enhanced_prompt[:200])
+        # ── Enriched metadata (Fix C) ────────────────────────────────
+        # Append a summary block so Continue / the user can see
+        # validation results without needing a separate API call.
+        meta_block = _build_metadata_block(result)
+        full_content = f"{response_content}\n\n{meta_block}" if meta_block else response_content
 
-        # Run blocking vLLM call in thread pool
-        vllm_response = await run_in_executor(
-            lambda: orchestrator.vllm.generate(
-                system_prompt=system_content or orchestrator.prompt_builder.build_system_prompt(),
-                user_prompt=enhanced_prompt,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
+        if request.stream:
+            return _stream_buffered(response_id, created_time, request.model, full_content)
+
+        return _non_streaming_response(
+            response_id, created_time, request.model,
+            full_content, user_content, tokens_used,
         )
-        logger.debug("vLLM response", vllm_response=vllm_response)
 
-        if vllm_response.success:
-            response_content = vllm_response.content
-            tokens_used = vllm_response.tokens_used
-        else:
-            response_content = f"Error: {vllm_response.error}"
-            tokens_used = 0
+    # ═════════════════════════════════════════════════════════════════
+    # PATH 2: General chat — supports real streaming from vLLM
+    # ═════════════════════════════════════════════════════════════════
 
-    logger.info("Returning chat completion response", response_preview=response_content[:200] if response_content else "empty")
-    
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-    created_time = int(time.time())
-    
-    # Handle streaming response
+    # Build the enhanced prompt (with optional RAG context)
+    enhanced_prompt = user_content
+    if file_path:
+        enhanced_prompt = await _enrich_with_rag(user_content, file_path)
+
+    effective_system = system_content or orchestrator.prompt_builder.build_system_prompt()
+
+    # ── REAL STREAMING (Fix A) ───────────────────────────────────────
     if request.stream:
-        async def generate_stream():
-            # Send content in chunks for streaming
-            # First chunk with role
-            first_chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": request.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": ""},
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(first_chunk)}\n\n"
-            
-            # Send content in smaller chunks
-            chunk_size = 50
-            for i in range(0, len(response_content), chunk_size):
-                chunk_text = response_content[i:i+chunk_size]
-                chunk_data = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": request.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": chunk_text},
-                        "finish_reason": None
-                    }]
-                }
-                yield f"data: {json.dumps(chunk_data)}\n\n"
-            
-            # Final chunk
-            final_chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": request.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            }
-            yield f"data: {json.dumps(final_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-        
-        return StreamingResponse(
-            generate_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            }
+        return _stream_from_vllm(
+            response_id, created_time, request.model,
+            effective_system, enhanced_prompt,
+            request.temperature, request.max_tokens,
         )
-    
-    # Non-streaming response
+
+    # ── Non-streaming ────────────────────────────────────────────────
+    vllm_response = await run_in_executor(
+        lambda: orchestrator.vllm.generate(
+            system_prompt=effective_system,
+            user_prompt=enhanced_prompt,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
+    )
+
+    if vllm_response.success:
+        response_content = vllm_response.content
+        tokens_used = vllm_response.tokens_used
+    else:
+        response_content = f"Error: {vllm_response.error}"
+        tokens_used = 0
+
+    return _non_streaming_response(
+        response_id, created_time, request.model,
+        response_content, user_content, tokens_used,
+    )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def _non_streaming_response(
+    response_id: str,
+    created_time: int,
+    model: str,
+    content: str,
+    user_content: str,
+    tokens_used: int,
+) -> ChatCompletionResponse:
+    """Build a standard non-streaming ChatCompletionResponse."""
     return ChatCompletionResponse(
         id=response_id,
         created=created_time,
-        model=request.model,
+        model=model,
         choices=[
             ChatCompletionChoice(
-                message=ChatMessage(role="assistant", content=response_content),
+                message=ChatMessage(role="assistant", content=content),
                 finish_reason="stop",
             )
         ],
         usage=ChatCompletionUsage(
             prompt_tokens=len(user_content) // 4,
-            completion_tokens=len(response_content) // 4,
-            total_tokens=tokens_used or (len(user_content) + len(response_content)) // 4,
+            completion_tokens=len(content) // 4,
+            total_tokens=tokens_used or (len(user_content) + len(content)) // 4,
         ),
     )
 
 
+def _stream_buffered(
+    response_id: str,
+    created_time: int,
+    model: str,
+    content: str,
+) -> StreamingResponse:
+    """Stream already-buffered content as SSE chunks (for test-gen)."""
+
+    async def _generate():
+        # Role chunk
+        yield _sse_chunk(response_id, created_time, model,
+                         delta={"role": "assistant", "content": ""})
+        # Content in ~80-char pieces
+        chunk_size = 80
+        for i in range(0, len(content), chunk_size):
+            yield _sse_chunk(response_id, created_time, model,
+                             delta={"content": content[i:i + chunk_size]})
+        # Finish
+        yield _sse_chunk(response_id, created_time, model,
+                         delta={}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+def _stream_from_vllm(
+    response_id: str,
+    created_time: int,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+) -> StreamingResponse:
+    """Pipe vLLM streaming directly to the client — real TTFT."""
+
+    async def _generate():
+        # Role chunk
+        yield _sse_chunk(response_id, created_time, model,
+                         delta={"role": "assistant", "content": ""})
+        try:
+            # stream_generate() is a sync generator (httpx sync client),
+            # so we run it in a thread and ferry deltas via an asyncio.Queue
+            # to avoid blocking the event loop.
+            queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+            def _run_sync_gen():
+                try:
+                    for delta_text in orchestrator.vllm.stream_generate(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    ):
+                        queue.put_nowait(delta_text)
+                except Exception as exc:
+                    queue.put_nowait(f"\n\n[Error: {exc}]")
+                finally:
+                    queue.put_nowait(None)  # sentinel
+
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _run_sync_gen)
+
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield _sse_chunk(response_id, created_time, model,
+                                 delta={"content": item})
+
+        except Exception as e:
+            logger.error("Streaming generation error", error=str(e))
+            yield _sse_chunk(response_id, created_time, model,
+                             delta={"content": f"\n\n[Error: {e}]"})
+        # Finish
+        yield _sse_chunk(response_id, created_time, model,
+                         delta={}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+def _sse_chunk(
+    response_id: str,
+    created_time: int,
+    model: str,
+    delta: dict,
+    finish_reason: Optional[str] = None,
+) -> str:
+    """Format a single SSE data line."""
+    chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def _build_metadata_block(result) -> str:
+    """Build a human-readable metadata block for test generation results."""
+    parts = []
+    parts.append("---")
+    parts.append(f"**Validation:** {'✅ passed' if result.validation_passed else '❌ failed'}")
+
+    if result.validation_issues:
+        parts.append(f"**Issues:** {', '.join(result.validation_issues[:5])}")
+
+    if result.repair_attempts:
+        parts.append(f"**Repair attempts:** {result.repair_attempts}")
+
+    if result.rag_chunks_used:
+        parts.append(f"**RAG context chunks:** {result.rag_chunks_used}")
+
+    if result.validation_summary:
+        vs = result.validation_summary
+        parts.append(
+            f"**Details:** {vs.get('errors', 0)} errors, "
+            f"{vs.get('warnings', 0)} warnings, "
+            f"{vs.get('test_count', '?')} test(s)"
+        )
+
+    parts.append(f"**Tokens used:** {result.tokens_used}")
+    return "\n".join(parts)
+
+
+async def _enrich_with_rag(user_content: str, file_path: str) -> str:
+    """Add RAG context to the prompt for general chat."""
+    class_name = file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
+    try:
+        search_result = await run_in_executor(
+            lambda: orchestrator.rag.search(SearchQuery(
+                query=f"{class_name} service methods dependencies",
+                top_k=5,
+                score_threshold=0.4,
+            ))
+        )
+        if search_result.chunks:
+            rag_context = "\n\n## Codebase Context:\n"
+            for chunk in search_result.chunks:
+                rag_context += f"\n### {chunk.class_name} ({chunk.type}, {chunk.layer})\n"
+                rag_context += f"```\n{chunk.summary[:500]}\n```\n"
+            return f"{user_content}\n{rag_context}"
+    except Exception as e:
+        logger.warning("RAG search failed", error=str(e))
+    return user_content
+
+
 @app.post("/v1/completions")
 async def completions(request: dict):
-    """
-    OpenAI-compatible completions endpoint (legacy).
-    Redirects to chat completions.
-    """
+    """OpenAI-compatible completions endpoint (legacy). Redirects to chat."""
     prompt = request.get("prompt", "")
     messages = [ChatMessage(role="user", content=prompt)]
 
@@ -820,7 +987,10 @@ async def completions(request: dict):
 
     response = await chat_completions(chat_request)
 
-    # Convert to completions format
+    # If it's a streaming response, return as-is
+    if isinstance(response, StreamingResponse):
+        return response
+
     return {
         "id": response.id,
         "object": "text_completion",
@@ -828,67 +998,127 @@ async def completions(request: dict):
         "model": response.model,
         "choices": [
             {
-                "text": response.choices[0].message.content,
+                "text": response.choices[0].message.content if response.choices[0].message else "",
                 "index": 0,
                 "finish_reason": "stop",
             }
         ],
-        "usage": response.usage.model_dump(),
+        "usage": response.usage.model_dump() if response.usage else {},
     }
 
-def get_orchestrator():
-    # In production, import from server.api, here fallback to new instance
-    try:
-        from .api import orchestrator
-        if orchestrator:
-            return orchestrator
-    except Exception:
-        pass
-    # Fallback: create new (may not share memory/session)
-    from rag.client import RAGClient
-    from vllm.client import VLLMClient
-    return AgentOrchestrator(
-        rag_client=RAGClient(),
-        vllm_client=VLLMClient(
-            base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
-            api_key=os.getenv("VLLM_API_KEY", "token-abc123"),
-            model=os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"),
-        ),
-    )
-# API: get RAG context for a class/file
+
+# ============================================================================
+# RAG Context Inspection
+# ============================================================================
+
 @app.get("/v1/rag-context")
-def get_rag_context(
+async def get_rag_context(
     class_name: str,
     file_path: str = "",
-    session_id: str = ""
+    session_id: str = "",
 ):
+    """Return RAG chunks used to build the prompt for a given class.
+
+    Useful for debugging and transparency — lets callers see
+    exactly what context the agent retrieves from the vector DB.
     """
-    Trả về context (các chunk) mà agent thực sự dùng để build prompt cho model.
-    """
-    logger.info("Received request for RAG context", class_name=class_name, file_path=file_path, session_id=session_id)
-    orchestrator = get_orchestrator()
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
     session = None
     if session_id:
         session = orchestrator.memory_manager.get_session(session_id)
-    chunks = orchestrator._get_rag_context(class_name, file_path, session)
-    # return {
-    #     "class_name": class_name,
-    #     "file_path": file_path,
-    #     "chunks": [
-    #         {
-    #             "class_name": c.class_name,
-    #             "type": c.type,
-    #             "java_type": c.java_type,
-    #             "fields": [f"{f.type} {f.name}" for f in getattr(c, "fields", [])],
-    #             "record_components": [f"{f.type} {f.name}" for f in getattr(c, "record_components", [])],
-    #             "dependencies": getattr(c, "dependencies", []),
-    #             "used_types": getattr(c, "used_types", []),
-    #             "summary": c.summary,
-    #         }
-    #         for c in chunks
-    #     ]
-    # }
+
+    chunks = await run_in_executor(
+        orchestrator._get_rag_context, class_name, file_path, session
+    )
     return chunks
+
+
+# ============================================================================
+# Phase 4: Agent Status & Metrics Endpoints
+# ============================================================================
+
+@app.get("/v1/agent/status")
+async def agent_status():
+    """Get agent pipeline status and metrics (Phase 4 observability)."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    metrics_data = orchestrator.metrics.get_metrics() if orchestrator.metrics else {}
+    event_bus = orchestrator.event_bus
+
+    return {
+        "status": "running",
+        "event_bus": {
+            "total_events": event_bus.event_count,
+            "subscribers": event_bus.subscriber_count,
+        },
+        "metrics": metrics_data,
+    }
+
+
+@app.get("/v1/agent/metrics")
+async def agent_metrics():
+    """Get detailed agent metrics (Phase 4 observability)."""
+    if not orchestrator or not orchestrator.metrics:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    return orchestrator.metrics.get_metrics()
+
+
+@app.get("/v1/agent/events/stream")
+async def agent_event_stream():
+    """SSE stream of real-time agent events (Phase 4).
+
+    Clients connect via EventSource / SSE and receive live events
+    as the agent processes requests.
+    """
+    import asyncio
+    import queue
+
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    event_queue: queue.Queue = queue.Queue(maxsize=100)
+
+    def _forward_to_queue(event: Event) -> None:
+        try:
+            event_queue.put_nowait({
+                "type": event.type.value,
+                "data": event.data,
+                "timestamp": event.timestamp,
+                "source": event.source,
+                "plan_id": event.plan_id,
+            })
+        except queue.Full:
+            pass  # Drop oldest events if consumer is slow
+
+    # Subscribe to all events
+    orchestrator.event_bus.subscribe_all(_forward_to_queue)
+
+    async def _event_generator():
+        try:
+            while True:
+                try:
+                    evt = event_queue.get_nowait()
+                    yield f"data: {json.dumps(evt)}\n\n"
+                except queue.Empty:
+                    # Send keepalive every 15s
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(1)
+        finally:
+            # Cleanup: best-effort unsubscribe
+            try:
+                orchestrator.event_bus._wildcard_handlers.remove(_forward_to_queue)
+            except (ValueError, AttributeError):
+                pass
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 # ============================================================================
