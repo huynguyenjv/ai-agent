@@ -1,14 +1,19 @@
 """
 Build and manage the Qdrant vector index for Java codebase.
+
+New in this version:
+  - Dependency graph: tracks which classes use which other classes
+  - Referenced type resolution: resolves simple names to fully-qualified names
+  - Model-aware indexing: model/DTO classes get usage hints embedded in their summary
+  - Enriched service summaries: include resolved model shapes for referenced types
 """
 
-import hashlib
 import os
-import re
 import warnings
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Optional
 
-# Bypass SSL for corporate proxy
 os.environ.setdefault('HF_HUB_DISABLE_SSL_VERIFY', '1')
 warnings.filterwarnings('ignore')
 
@@ -17,11 +22,65 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 
-from .parse_java import JavaParser, ClassInfo
+from .parse_java import JavaParser, ClassInfo, TypeReference
 from .summarize import CodeSummarizer
 
 logger = structlog.get_logger()
 
+
+# ---------------------------------------------------------------------------
+# Dependency graph
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DependencyEdge:
+    """A directed edge: source_class --[context]--> target_class"""
+    source: str          # fully qualified name of the using class
+    target: str          # fully qualified name (or simple name) of the used class
+    context: str         # "field", "parameter", "return_type", "extends", "implements"
+    member: str          # field/method name where dependency appears
+
+
+@dataclass
+class DependencyGraph:
+    """
+    Bidirectional dependency graph over all parsed classes.
+
+    outgoing[A] = list of classes A depends on
+    incoming[B] = list of classes that depend on B
+    """
+    edges: list[DependencyEdge] = field(default_factory=list)
+    outgoing: dict[str, list[DependencyEdge]] = field(default_factory=lambda: defaultdict(list))
+    incoming: dict[str, list[DependencyEdge]] = field(default_factory=lambda: defaultdict(list))
+
+    def add_edge(self, edge: DependencyEdge):
+        self.edges.append(edge)
+        self.outgoing[edge.source].append(edge)
+        self.incoming[edge.target].append(edge)
+
+    def dependencies_of(self, fqn: str) -> list[str]:
+        """Classes that `fqn` directly depends on."""
+        return list({e.target for e in self.outgoing.get(fqn, [])})
+
+    def dependents_of(self, fqn: str) -> list[str]:
+        """Classes that directly use `fqn`."""
+        return list({e.source for e in self.incoming.get(fqn, [])})
+
+    def to_payload(self, fqn: str) -> dict:
+        """Serialize graph neighbourhood for a class into Qdrant payload."""
+        return {
+            "dependencies": self.dependencies_of(fqn),
+            "dependents": self.dependents_of(fqn),
+            "dependency_edges": [
+                {"target": e.target, "context": e.context, "member": e.member}
+                for e in self.outgoing.get(fqn, [])
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Index builder
+# ---------------------------------------------------------------------------
 
 class IndexBuilder:
     """Build and manage the vector index for Java code."""
@@ -40,8 +99,11 @@ class IndexBuilder:
         self.parser = JavaParser()
         self.summarizer = CodeSummarizer()
 
+    # ------------------------------------------------------------------
+    # Collection management
+    # ------------------------------------------------------------------
+
     def create_collection(self, recreate: bool = False) -> None:
-        """Create or recreate the Qdrant collection."""
         collections = self.qdrant.get_collections().collections
         exists = any(c.name == self.collection_name for c in collections)
 
@@ -59,177 +121,241 @@ class IndexBuilder:
                     distance=models.Distance.COSINE,
                 ),
             )
+            for fname, ftype in [
+                ("type", models.PayloadSchemaType.KEYWORD),
+                ("layer", models.PayloadSchemaType.KEYWORD),
+                ("class_name", models.PayloadSchemaType.KEYWORD),
+                ("package", models.PayloadSchemaType.KEYWORD),
+                ("java_type", models.PayloadSchemaType.KEYWORD),
+                ("is_model", models.PayloadSchemaType.KEYWORD),
+            ]:
+                self.qdrant.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=fname,
+                    field_schema=ftype,
+                )
 
-            # Create payload indexes for filtering
-            self.qdrant.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="type",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            self.qdrant.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="layer",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            self.qdrant.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="class_name",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            self.qdrant.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="package",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            self.qdrant.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="extends",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            self.qdrant.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="implements",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def index_repository(self, repo_path: str, recreate: bool = False) -> int:
-        """Index all Java files in a repository."""
         logger.info("Starting repository indexing", repo_path=repo_path)
-
-        # Create collection
         self.create_collection(recreate=recreate)
 
-        # Parse all Java files
+        # 1. Parse all Java files
         classes = self.parser.parse_directory(repo_path)
         logger.info("Parsed Java files", count=len(classes))
 
-        # Index each class
-        points = []
+        # 2. Build lookup maps
+        #    name_map: simple_name -> ClassInfo  (last-wins if duplicate simple names)
+        #    fqn_map:  fully_qualified_name -> ClassInfo
+        name_map: dict[str, ClassInfo] = {}
+        fqn_map: dict[str, ClassInfo] = {}
+        for c in classes:
+            name_map[c.name] = c
+            fqn_map[c.fully_qualified_name] = c
+
+        # 3. Build dependency graph
+        graph = self._build_dependency_graph(classes, name_map, fqn_map)
+        logger.info("Built dependency graph", edges=len(graph.edges))
+
+        # 4. Build index points
+        points: list[models.PointStruct] = []
+        point_id = 0
 
         for class_info in classes:
-            # Stable point ID from fully_qualified_name hash
-            # Using int from first 8 hex chars of MD5 → avoids conflict on re-index
-            class_fqn = class_info.fully_qualified_name
-            class_id = int(hashlib.md5(class_fqn.encode()).hexdigest()[:15], 16)
-
-            # Index the class itself
-            class_point = self._create_class_point(class_info, class_id)
+            class_point = self._create_class_point(
+                class_info, point_id, name_map, fqn_map, graph
+            )
             if class_point:
                 points.append(class_point)
+                point_id += 1
 
-            # Index individual methods for large classes (> 5 methods)
+            # Index methods individually for large classes
             if len(class_info.methods) > 5:
                 for method in class_info.methods:
-                    method_fqn = f"{class_fqn}.{method.name}"
-                    method_id = int(hashlib.md5(method_fqn.encode()).hexdigest()[:15], 16)
-                    method_point = self._create_method_point(method, class_info, method_id)
+                    method_point = self._create_method_point(method, class_info, point_id)
                     if method_point:
                         points.append(method_point)
+                        point_id += 1
 
-        # Batch upsert to Qdrant
-        if points:
-            batch_size = 100
-            for i in range(0, len(points), batch_size):
-                batch = points[i : i + batch_size]
-                self.qdrant.upsert(
-                    collection_name=self.collection_name,
-                    points=batch,
-                )
-                logger.info("Indexed batch", start=i, end=i + len(batch))
+        # 5. Batch upsert
+        batch_size = 100
+        for i in range(0, len(points), batch_size):
+            batch = points[i: i + batch_size]
+            self.qdrant.upsert(collection_name=self.collection_name, points=batch)
+            logger.info("Indexed batch", start=i, end=i + len(batch))
 
         logger.info("Indexing complete", total_points=len(points))
         return len(points)
 
+    # ------------------------------------------------------------------
+    # Dependency graph construction
+    # ------------------------------------------------------------------
+
+    def _build_dependency_graph(
+        self,
+        classes: list[ClassInfo],
+        name_map: dict[str, ClassInfo],
+        fqn_map: dict[str, ClassInfo],
+    ) -> DependencyGraph:
+        """
+        For every class, resolve its referenced_types to FQNs (where possible)
+        and build a directed dependency graph.
+        """
+        graph = DependencyGraph()
+
+        for cls in classes:
+            source_fqn = cls.fully_qualified_name
+
+            for ref in cls.referenced_types:
+                # Resolve to FQN if we have it in the codebase
+                target_fqn = self._resolve_type(ref.type_name, cls, name_map, fqn_map)
+                if target_fqn is None:
+                    # External dependency — still track with simple name
+                    target_fqn = ref.type_name
+
+                # Avoid self-loops
+                if target_fqn == source_fqn:
+                    continue
+
+                graph.add_edge(DependencyEdge(
+                    source=source_fqn,
+                    target=target_fqn,
+                    context=ref.context,
+                    member=ref.field_or_method,
+                ))
+
+        return graph
+
+    def _resolve_type(
+        self,
+        simple_name: str,
+        cls: ClassInfo,
+        name_map: dict[str, ClassInfo],
+        fqn_map: dict[str, ClassInfo],
+    ) -> Optional[str]:
+        """
+        Try to resolve a simple type name to a fully-qualified name.
+        Strategy:
+          1. Check same package first
+          2. Check import statements
+          3. Fall back to global name_map
+        """
+        # 1. Same package
+        candidate_fqn = f"{cls.package}.{simple_name}" if cls.package else simple_name
+        if candidate_fqn in fqn_map:
+            return candidate_fqn
+
+        # 2. Explicit import
+        for imp in cls.imports:
+            if imp.endswith(f".{simple_name}"):
+                if imp in fqn_map:
+                    return imp
+                # Even if not in fqn_map, use the import string as the target
+                return imp
+
+        # 3. Global lookup by simple name (may be ambiguous)
+        if simple_name in name_map:
+            return name_map[simple_name].fully_qualified_name
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Point creation
+    # ------------------------------------------------------------------
+
     def _create_class_point(
-        self, class_info: ClassInfo, point_id: int
+        self,
+        class_info: ClassInfo,
+        point_id: int,
+        name_map: dict[str, ClassInfo],
+        fqn_map: dict[str, ClassInfo],
+        graph: DependencyGraph,
     ) -> Optional[models.PointStruct]:
-        """Create a Qdrant point for a class."""
         try:
-            # Generate summary
+            is_model = self._is_model_class(class_info)
+            fqn = class_info.fully_qualified_name
+
+            # --- Build summary ---
             summary = self.summarizer.summarize_class(class_info)
 
-            # Generate embedding
+            # For service/component classes: append resolved model shapes
+            # so that the embedding captures HOW to use the models they depend on
+            if not is_model:
+                resolved_model_hints = self._resolve_model_hints(
+                    class_info, name_map, fqn_map
+                )
+                if resolved_model_hints:
+                    hint_block = "\n\nReferenced Model Shapes:\n" + "\n---\n".join(resolved_model_hints)
+                    # Keep total length reasonable
+                    combined = summary + hint_block
+                    summary = combined[:4000]  # character cap; fine for embedding
+
+            # --- Dependency graph neighbourhood ---
+            graph_payload = graph.to_payload(fqn)
+
+            # --- Resolved referenced models (for payload, not just embedding) ---
+            referenced_models_detail = self._build_referenced_models_payload(
+                class_info, name_map, fqn_map
+            )
+
+            # --- Embedding ---
             embedding = self.embedder.encode(summary).tolist()
 
-            # Extract service-level dependencies (fields injected as services)
-            dependencies = []
-            for field_type, _, _ in class_info.fields:
-                if any(
-                    field_type.endswith(suffix)
-                    for suffix in ["Service", "Repository", "Client", "Gateway", "Handler"]
-                ):
-                    dependencies.append(field_type)
-
-            # Extract all used domain types (models, DTOs, entities)
-            # from fields + method params + method return types
-            used_types = self._extract_used_types(class_info)
-
-            # Create point
             return models.PointStruct(
                 id=point_id,
                 vector=embedding,
                 payload={
+                    # Identity
                     "type": self.summarizer.detect_type(class_info),
-                    "java_type": class_info.class_type,  # class, record, interface, enum, annotation
+                    "java_type": class_info.class_type,
                     "layer": self.summarizer.detect_layer(class_info),
                     "class_name": class_info.name,
                     "package": class_info.package,
                     "file_path": class_info.file_path,
-                    "fully_qualified_name": class_info.fully_qualified_name,
+                    "fully_qualified_name": fqn,
+                    "element_type": "class",
+                    # Content
                     "summary": summary,
-                    "dependencies": dependencies,
-                    "used_types": used_types,
-                    "method_count": len(class_info.methods),
                     "annotations": class_info.annotations,
-                    "element_type": class_info.class_type,  # class, record, interface, enum, annotation
-                    "modifiers": getattr(class_info, 'modifiers', []),
-                    # Inheritance
-                    "extends": class_info.extends,
-                    "implements": class_info.implements,
-                    # Record/Enum specifics (for filtering)
-                    "enum_constants": getattr(class_info, 'enum_constants', [])[:10],
-                    "record_components": [
-                        {"type": c.type, "name": c.name}
-                        for c in getattr(class_info, 'record_components', [])
-                    ],
-                    # Lombok info
-                    "has_builder": getattr(class_info, 'has_builder', False),
-                    "has_builder_to_builder": getattr(class_info, 'has_builder_to_builder', False),
-                    "has_data": getattr(class_info, 'has_data', False),
-                    "has_getter": getattr(class_info, 'has_getter', False),
-                    "has_setter": getattr(class_info, 'has_setter', False),
-                    "has_value": getattr(class_info, 'has_value', False),
-                    "is_immutable": getattr(class_info, 'is_immutable', False),
-                    "has_no_args_constructor": getattr(class_info, 'has_no_args_constructor', False),
-                    "has_all_args_constructor": getattr(class_info, 'has_all_args_constructor', False),
-                    "has_required_args_constructor": getattr(class_info, 'has_required_args_constructor', False),
-                    # Fields info
-                    "field_count": len(class_info.fields),
+                    "modifiers": class_info.modifiers,
+                    "method_count": len(class_info.methods),
+                    "field_count": len(class_info.detailed_fields),
                     "fields": [
                         {"type": f.type, "name": f.name, "annotations": f.annotations}
-                        for f in getattr(class_info, 'detailed_fields', [])
-                    ][:20],  # Limit to 20 fields
+                        for f in class_info.detailed_fields[:20]
+                    ],
+                    # Model / instantiation info
+                    "is_model": is_model,
+                    "usage_hint": self.summarizer.generate_usage_hint(class_info),
+                    # Lombok flags
+                    "has_builder": class_info.has_builder,
+                    "has_builder_to_builder": class_info.has_builder_to_builder,
+                    "has_data": class_info.has_data,
+                    "has_getter": class_info.has_getter,
+                    "has_setter": class_info.has_setter,
+                    "has_value": class_info.has_value,
+                    "is_immutable": class_info.is_immutable,
+                    # Type references (simple names)
+                    "referenced_class_names": class_info.referenced_class_names,
+                    # Resolved model info for RAG context injection
+                    "referenced_models": referenced_models_detail,
+                    # Dependency graph
+                    **graph_payload,
                 },
             )
         except Exception as e:
-            logger.error(
-                "Failed to create class point",
-                class_name=class_info.name,
-                error=str(e),
-            )
+            logger.error("Failed to create class point", class_name=class_info.name, error=str(e))
             return None
 
     def _create_method_point(
         self, method, class_info: ClassInfo, point_id: int
     ) -> Optional[models.PointStruct]:
-        """Create a Qdrant point for a method."""
         try:
-            # Generate summary
             summary = self.summarizer.summarize_method(method, class_info)
-
-            # Generate embedding
             embedding = self.embedder.encode(summary).tolist()
-
             return models.PointStruct(
                 id=point_id,
                 vector=embedding,
@@ -242,7 +368,6 @@ class IndexBuilder:
                     "file_path": class_info.file_path,
                     "fully_qualified_name": f"{class_info.fully_qualified_name}.{method.name}",
                     "summary": summary,
-                    "dependencies": [],
                     "annotations": method.annotations,
                     "element_type": "method",
                     "start_line": method.start_line,
@@ -250,107 +375,123 @@ class IndexBuilder:
                 },
             )
         except Exception as e:
-            logger.error(
-                "Failed to create method point",
-                method_name=method.name,
-                class_name=class_info.name,
-                error=str(e),
-            )
+            logger.error("Failed to create method point", method_name=method.name,
+                         class_name=class_info.name, error=str(e))
             return None
 
-    def _extract_used_types(self, class_info: ClassInfo) -> list[str]:
-        """Extract all custom domain types used by this class.
+    # ------------------------------------------------------------------
+    # Model detection
+    # ------------------------------------------------------------------
 
-        Collects types from:
-        - Field types (detailed_fields and legacy fields)
-        - Method parameter types
-        - Method return types
-
-        Filters out Java builtins so only domain-specific types remain
-        (e.g., OrderRequest, OrderEntity, OrderResponse).
+    def _is_model_class(self, class_info: ClassInfo) -> bool:
         """
-        # Java builtins and common library types to exclude
-        _BUILTINS = {
-            # Primitives and wrappers
-            "void", "boolean", "byte", "char", "short", "int", "long", "float", "double",
-            "Boolean", "Byte", "Character", "Short", "Integer", "Long", "Float", "Double",
-            "Number", "Object",
-            # Strings and common value types
-            "String", "StringBuilder", "StringBuffer", "CharSequence",
-            "UUID", "URI", "URL", "BigDecimal", "BigInteger",
-            # Temporal
-            "LocalDate", "LocalDateTime", "LocalTime", "ZonedDateTime", "Instant",
-            "Date", "Calendar", "Timestamp",
-            # Collections (generic wrappers — inner type may be domain)
-            "List", "Map", "Set", "Collection", "Optional", "Stream",
-            "ArrayList", "HashMap", "HashSet", "LinkedList",
-            # Reactive
-            "Mono", "Flux",
-            # Spring / framework
-            "ResponseEntity", "HttpStatus", "HttpHeaders", "Page", "Pageable",
-            "Sort", "Slice", "Result",
-            # Misc
-            "Void", "Class", "Enum",
-        }
+        Detect if a class is a model/DTO that needs usage hints
+        (as opposed to a service/component that is Spring-managed).
+        """
+        name = class_info.name
+        annotations_lower = " ".join(class_info.annotations).lower()
 
-        def _is_custom_type(raw_type: str) -> bool:
-            """Return True if raw_type looks like a domain class name."""
-            if not raw_type:
-                return False
-            inner = re.findall(r'[A-Z][A-Za-z0-9]*', raw_type)
-            return any(t not in _BUILTINS for t in inner)
+        # Records are almost always DTOs
+        if class_info.is_record:
+            return True
 
-        def _extract_inner_types(raw_type: str) -> list[str]:
-            """Extract all capitalised type names from a possibly generic type string."""
-            return [
-                t for t in re.findall(r'[A-Z][A-Za-z0-9]+', raw_type)
-                if t not in _BUILTINS and len(t) > 2
-            ]
+        # Naming conventions
+        if any(name.endswith(s) for s in [
+            "Request", "Response", "Dto", "DTO", "Command",
+            "Event", "Query", "Payload", "Form", "Model",
+        ]):
+            return True
 
-        seen: set[str] = set()
-        # Exclude self and own service-level dependencies
-        seen.add(class_info.name)
+        # JPA entity
+        if "@entity" in annotations_lower:
+            return True
 
-        # 1. Field types (detailed)
-        for f in getattr(class_info, 'detailed_fields', []):
-            for t in _extract_inner_types(f.type):
-                seen.add(t)  # will be added to result below
+        # Lombok data/value/builder on a non-service class
+        is_spring_managed = any(
+            x in annotations_lower
+            for x in ("@service", "@component", "@repository", "@controller", "@restcontroller")
+        )
+        if not is_spring_managed and (class_info.has_data or class_info.has_value or class_info.has_builder):
+            return True
 
-        # 2. Field types (legacy tuple)
-        for field_type, _, _ in class_info.fields:
-            for t in _extract_inner_types(field_type):
-                seen.add(t)
+        return False
 
-        result: set[str] = set()
+    # ------------------------------------------------------------------
+    # Referenced model resolution helpers
+    # ------------------------------------------------------------------
 
-        # Re-run to separate out self/builtins
-        def collect(raw_type: str):
-            for t in _extract_inner_types(raw_type):
-                if t != class_info.name:
-                    result.add(t)
+    def _resolve_model_hints(
+        self,
+        class_info: ClassInfo,
+        name_map: dict[str, ClassInfo],
+        fqn_map: dict[str, ClassInfo],
+    ) -> list[str]:
+        """
+        For each referenced class that exists in the codebase AND is a model,
+        generate a compact shape+usage string to embed alongside the parent class.
+        """
+        hints = []
+        for ref_name in class_info.referenced_class_names:
+            ref_class = name_map.get(ref_name)
+            if ref_class and self._is_model_class(ref_class):
+                hint = self.summarizer.generate_usage_hint(ref_class)
+                fields_preview = ", ".join(
+                    f"{f.type} {f.name}" for f in ref_class.detailed_fields[:5]
+                )
+                if not fields_preview and ref_class.record_components:
+                    fields_preview = ", ".join(
+                        f"{c.type} {c.name}" for c in ref_class.record_components
+                    )
+                hints.append(
+                    f"{ref_class.fully_qualified_name} ({ref_class.class_type})\n"
+                    f"Fields: {fields_preview}\n"
+                    f"Usage:\n{hint}"
+                )
+        return hints
 
-        for f in getattr(class_info, 'detailed_fields', []):
-            collect(f.type)
-        for field_type, _, _ in class_info.fields:
-            collect(field_type)
+    def _build_referenced_models_payload(
+        self,
+        class_info: ClassInfo,
+        name_map: dict[str, ClassInfo],
+        fqn_map: dict[str, ClassInfo],
+    ) -> list[dict]:
+        """
+        Build a structured payload entry for each referenced class found in the codebase.
+        Stored in Qdrant so retrieval-time context can inject model shapes without re-querying.
+        """
+        result = []
+        for ref_name in class_info.referenced_class_names:
+            ref_class = name_map.get(ref_name)
+            if not ref_class:
+                # External type — just record the name
+                result.append({"class_name": ref_name, "resolved": False})
+                continue
 
-        # 3. Method parameters and return types
-        for method in class_info.methods:
-            collect(method.return_type)
-            for param_type, _ in method.parameters:
-                collect(param_type)
+            result.append({
+                "class_name": ref_class.name,
+                "fully_qualified_name": ref_class.fully_qualified_name,
+                "java_type": ref_class.class_type,
+                "resolved": True,
+                "is_model": self._is_model_class(ref_class),
+                "usage_hint": self.summarizer.generate_usage_hint(ref_class),
+                "fields": [
+                    {"type": f.type, "name": f.name}
+                    for f in ref_class.detailed_fields[:10]
+                ],
+                "record_components": [
+                    {"type": c.type, "name": c.name}
+                    for c in ref_class.record_components
+                ],
+                "has_builder": ref_class.has_builder,
+                "is_immutable": ref_class.is_immutable,
+            })
+        return result
 
-        # Remove service-level dependencies (those are in 'dependencies' field)
-        service_suffixes = {"Service", "Repository", "Client", "Gateway", "Handler"}
-        result = {
-            t for t in result
-            if not any(t.endswith(s) for s in service_suffixes)
-        }
-
-        return sorted(result)
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
 
     def get_collection_info(self) -> dict:
-        """Get information about the collection."""
         try:
             info = self.qdrant.get_collection(self.collection_name)
             return {
@@ -364,7 +505,6 @@ class IndexBuilder:
             return {"error": str(e)}
 
     def delete_collection(self) -> bool:
-        """Delete the collection."""
         try:
             self.qdrant.delete_collection(self.collection_name)
             logger.info("Collection deleted", collection=self.collection_name)
@@ -373,3 +513,12 @@ class IndexBuilder:
             logger.error("Failed to delete collection", error=str(e))
             return False
 
+    def get_dependency_graph(self, repo_path: str) -> DependencyGraph:
+        """
+        Public helper: parse a repo and return the dependency graph
+        without indexing — useful for analysis / visualization.
+        """
+        classes = self.parser.parse_directory(repo_path)
+        name_map = {c.name: c for c in classes}
+        fqn_map = {c.fully_qualified_name: c for c in classes}
+        return self._build_dependency_graph(classes, name_map, fqn_map)
