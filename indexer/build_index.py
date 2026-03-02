@@ -296,6 +296,19 @@ class IndexBuilder:
             # --- Dependency graph neighbourhood ---
             graph_payload = graph.to_payload(fqn)
 
+            # --- Separate used_types (domain models) from service deps ---
+            all_dep_fqns = set(graph_payload.get("dependencies", []))
+            service_deps: list[str] = []   # simple names of service-level deps
+            used_types: list[str] = []     # simple names of domain model types
+
+            for dep_fqn in all_dep_fqns:
+                simple = dep_fqn.rsplit(".", 1)[-1] if "." in dep_fqn else dep_fqn
+                dep_class = fqn_map.get(dep_fqn) or name_map.get(simple)
+                if dep_class and self._is_model_class(dep_class):
+                    used_types.append(simple)
+                else:
+                    service_deps.append(simple)
+
             # --- Resolved referenced models (for payload, not just embedding) ---
             referenced_models_detail = self._build_referenced_models_payload(
                 class_info, name_map, fqn_map
@@ -327,6 +340,14 @@ class IndexBuilder:
                         {"type": f.type, "name": f.name, "annotations": f.annotations}
                         for f in class_info.detailed_fields[:20]
                     ],
+                    # Record components (for Java records)
+                    "record_components": [
+                        {"type": c.type, "name": c.name, "annotations": getattr(c, 'annotations', [])}
+                        for c in class_info.record_components
+                    ],
+                    # Inheritance / interfaces
+                    "extends": class_info.extends,
+                    "implements": class_info.implements,
                     # Model / instantiation info
                     "is_model": is_model,
                     "usage_hint": self.summarizer.generate_usage_hint(class_info),
@@ -338,11 +359,17 @@ class IndexBuilder:
                     "has_setter": class_info.has_setter,
                     "has_value": class_info.has_value,
                     "is_immutable": class_info.is_immutable,
+                    # Constructor flags
+                    "has_no_args_constructor": class_info.has_no_args_constructor,
+                    "has_all_args_constructor": class_info.has_all_args_constructor,
+                    "has_required_args_constructor": class_info.has_required_args_constructor,
                     # Type references (simple names)
                     "referenced_class_names": class_info.referenced_class_names,
+                    # Separated dependency lists (simple names)
+                    "used_types": used_types,          # domain models/DTOs/entities
                     # Resolved model info for RAG context injection
                     "referenced_models": referenced_models_detail,
-                    # Dependency graph
+                    # Dependency graph (FQNs)
                     **graph_payload,
                 },
             )

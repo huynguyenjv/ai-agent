@@ -187,9 +187,19 @@ class RAGClient:
             main_chunk = result.chunks[0]
             all_chunks = [main_chunk]
 
-            for dep in main_chunk.dependencies:
+            # Collect simple names from dependencies (FQNs) + used_types (simple names)
+            types_to_fetch: set[str] = set()
+            for dep_fqn in (main_chunk.dependencies or []):
+                simple = dep_fqn.rsplit(".", 1)[-1] if "." in dep_fqn else dep_fqn
+                types_to_fetch.add(simple)
+            for ut in (main_chunk.used_types or []):
+                types_to_fetch.add(ut)
+            # Remove self
+            types_to_fetch -= {main_chunk.class_name}
+
+            for type_name in types_to_fetch:
                 dep_query = SearchQuery(
-                    query=f"class {dep}",
+                    query=f"class {type_name}",
                     top_k=1,
                     score_threshold=0.3,
                 )
