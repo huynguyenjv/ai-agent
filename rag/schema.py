@@ -58,6 +58,8 @@ class CodeChunk(BaseModel):
     # Fields info
     field_count: int = 0
     fields: list[FieldSchema] = Field(default_factory=list)
+    # For Java records: record components (fields of a record)
+    record_components: list[FieldSchema] = Field(default_factory=list)
 
 
 class MetadataFilter(BaseModel):
