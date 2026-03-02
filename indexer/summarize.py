@@ -1,6 +1,7 @@
 """
 Code summarizer for generating semantic summaries of Java code.
 Produces compact summaries (150-250 tokens) for RAG indexing.
+Includes usage hint generation so LLMs know HOW to instantiate each model.
 """
 
 from typing import Optional
@@ -19,106 +20,88 @@ class CodeSummarizer:
         self.min_tokens = min_tokens
         self.max_tokens = max_tokens
 
+    # ------------------------------------------------------------------
+    # Public summarizers
+    # ------------------------------------------------------------------
+
     def summarize_class(self, class_info: ClassInfo) -> str:
         """Generate a semantic summary for a class/record/enum/interface."""
         parts = []
 
-        # Class type and name
         class_type_label = self._get_class_type_label(class_info)
         parts.append(f"{class_type_label}: {class_info.fully_qualified_name}")
-
-        # Java type (class, record, interface, enum, annotation)
         parts.append(f"Type: {class_info.class_type}")
 
-        # Modifiers (abstract, final, sealed, etc.)
-        if hasattr(class_info, 'modifiers') and class_info.modifiers:
+        if class_info.modifiers:
             parts.append(f"Modifiers: {', '.join(class_info.modifiers)}")
-
-        # Annotations (important for understanding purpose)
         if class_info.annotations:
             parts.append(f"Annotations: {', '.join(class_info.annotations)}")
-
-        # Lombok annotations summary
-        if hasattr(class_info, 'lombok_annotations') and class_info.lombok_annotations:
+        if class_info.lombok_annotations:
             parts.append(f"Lombok: {', '.join(class_info.lombok_annotations)}")
-        
-        # Builder info
-        if hasattr(class_info, 'has_builder') and class_info.has_builder:
-            builder_info = "@Builder"
-            if class_info.has_builder_to_builder:
-                builder_info += "(toBuilder=true)"
-            parts.append(f"Builder: {builder_info}")
-
-        # Inheritance
         if class_info.extends:
             parts.append(f"Extends: {class_info.extends}")
         if class_info.implements:
             parts.append(f"Implements: {', '.join(class_info.implements)}")
 
-        # Record components (for records)
-        if hasattr(class_info, 'record_components') and class_info.record_components:
+        # Record components
+        if class_info.record_components:
             components = [f"{c.type} {c.name}" for c in class_info.record_components]
             parts.append(f"Record Components: {', '.join(components)}")
-            # Add usage hint for records
-            if class_info.has_builder:
-                parts.append(f"Usage: {class_info.name}.builder().field(value).build()")
-            else:
-                args = ", ".join([c.name for c in class_info.record_components])
-                parts.append(f"Usage: new {class_info.name}({args})")
 
         # Enum constants
-        if hasattr(class_info, 'enum_constants') and class_info.enum_constants:
-            constants = class_info.enum_constants[:10]  # Limit to 10
+        if class_info.enum_constants:
+            constants = class_info.enum_constants[:10]
             if len(class_info.enum_constants) > 10:
                 constants.append("...")
             parts.append(f"Constants: {', '.join(constants)}")
 
-        # Javadoc summary
+        # Javadoc
         if class_info.javadoc:
             doc_summary = self._extract_javadoc_summary(class_info.javadoc)
             if doc_summary:
                 parts.append(f"Purpose: {doc_summary}")
 
-        # Dependencies (injected fields) - only for classes
+        # Usage hint — always include so LLM knows how to instantiate
+        hint = self.generate_usage_hint(class_info)
+        if hint:
+            parts.append(f"Instantiation:\n{hint}")
+
+        # Dependencies for service/component classes
         if class_info.class_type == "class":
             dependencies = self._extract_dependencies(class_info)
             if dependencies:
                 parts.append(f"Dependencies: {', '.join(dependencies)}")
 
-        # Used domain types (models, DTOs, entities) from fields/params/return types
-        # e.g. OrderService -> "Used Types: OrderRequest, OrderEntity, OrderResponse"
-        used_types = self._collect_used_types_for_summary(class_info)
-        if used_types:
-            parts.append(f"Used Types: {', '.join(used_types[:12])}")
-
-        # Detailed fields (prefer over legacy format)
-        if hasattr(class_info, 'detailed_fields') and class_info.detailed_fields:
+        # Fields
+        if class_info.detailed_fields:
             field_summaries = []
             for f in class_info.detailed_fields[:8]:
                 field_str = f"{f.type} {f.name}"
-                if f.annotations:
-                    # Show important annotations
-                    important_anns = [a for a in f.annotations if any(
-                        x in a.lower() for x in ['@id', '@column', '@notnull', '@nullable', '@valid', '@jsonproperty']
-                    )]
-                    if important_anns:
-                        field_str = f"{' '.join(important_anns)} {field_str}"
+                important_anns = [
+                    a for a in f.annotations
+                    if any(x in a.lower() for x in ['@id', '@column', '@notnull', '@nullable', '@valid', '@jsonproperty'])
+                ]
+                if important_anns:
+                    field_str = f"{' '.join(important_anns)} {field_str}"
                 field_summaries.append(field_str)
             if len(class_info.detailed_fields) > 8:
                 field_summaries.append(f"... +{len(class_info.detailed_fields) - 8} more")
             parts.append(f"Fields: {'; '.join(field_summaries)}")
         elif class_info.class_type != "record" and class_info.fields:
-            # Fallback to legacy format
             field_summaries = [f"{t} {n}" for t, n, _ in class_info.fields[:5]]
             if len(class_info.fields) > 5:
                 field_summaries.append("...")
             parts.append(f"Fields: {', '.join(field_summaries)}")
 
-        # Public methods summary
+        # Methods
         public_methods = [m for m in class_info.methods if self._is_public_method(m)]
         if public_methods:
-            method_signatures = [self._method_signature(m) for m in public_methods[:10]]
-            parts.append(f"Methods: {'; '.join(method_signatures)}")
+            sigs = [self._method_signature(m) for m in public_methods[:10]]
+            parts.append(f"Methods: {'; '.join(sigs)}")
+
+        # Referenced types (compact — full info goes in index payload)
+        if class_info.referenced_class_names:
+            parts.append(f"Uses: {', '.join(class_info.referenced_class_names[:10])}")
 
         summary = "\n".join(parts)
         return self._truncate_to_tokens(summary, self.max_tokens)
@@ -126,254 +109,131 @@ class CodeSummarizer:
     def summarize_method(self, method: MethodInfo, class_info: ClassInfo) -> str:
         """Generate a semantic summary for a method."""
         parts = []
-
-        # Method signature
         parts.append(f"Method: {class_info.fully_qualified_name}.{method.name}")
         parts.append(f"Signature: {self._method_signature(method)}")
-
-        # Annotations
         if method.annotations:
             parts.append(f"Annotations: {', '.join(method.annotations)}")
-
-        # Javadoc
         if method.javadoc:
             doc_summary = self._extract_javadoc_summary(method.javadoc)
             if doc_summary:
                 parts.append(f"Purpose: {doc_summary}")
-
-        # Method body summary (key operations)
         if method.body:
             body_summary = self._summarize_method_body(method.body)
             if body_summary:
                 parts.append(f"Operations: {body_summary}")
+        return self._truncate_to_tokens("\n".join(parts), self.max_tokens)
 
-        summary = "\n".join(parts)
-        return self._truncate_to_tokens(summary, self.max_tokens)
+    # ------------------------------------------------------------------
+    # Usage hint generation (NEW — core feature)
+    # ------------------------------------------------------------------
 
-    def _get_class_type_label(self, class_info: ClassInfo) -> str:
-        """Determine the semantic type of the class."""
+    def generate_usage_hint(self, class_info: ClassInfo) -> str:
+        """
+        Generate the correct instantiation pattern for a class.
+
+        Priority:
+          1. @Builder / @Builder(toBuilder=true)
+          2. record (canonical constructor)
+          3. @Value (immutable, all-args constructor)
+          4. @AllArgsConstructor
+          5. @Data / @Setter (no-args + setters)
+          6. @NoArgsConstructor only
+          7. Plain class fallback
+        """
         name = class_info.name
-        annotations = " ".join(class_info.annotations).lower()
-        class_type = class_info.class_type
 
-        # Check Java type first (record, enum, interface, annotation)
-        if class_type == "record":
-            if name.endswith("Request") or name.endswith("Response"):
-                return "DTO Record"
-            if name.endswith("Event"):
-                return "Event Record"
-            if name.endswith("Command"):
-                return "Command Record"
-            return "Record"
-        
-        if class_type == "enum":
-            return "Enum"
-        
-        if class_type == "annotation":
-            return "Annotation"
-        
-        if class_type == "interface":
-            if name.endswith("Repository"):
-                return "Repository Interface"
-            if name.endswith("Service"):
-                return "Service Interface"
-            if name.endswith("UseCase"):
-                return "UseCase Interface"
-            if name.endswith("Port"):
-                return "Port Interface"
-            if name.endswith("Gateway"):
-                return "Gateway Interface"
-            return "Interface"
+        # ---- Record cases ----
+        if class_info.is_record:
+            if class_info.has_builder:
+                return self._builder_hint(name, [c.name for c in class_info.record_components])
+            # Canonical constructor
+            args = ", ".join(c.name for c in class_info.record_components)
+            return f"new {name}({args})"
 
-        # Check annotations
-        if "@service" in annotations:
-            return "Service"
-        if "@repository" in annotations:
-            return "Repository"
-        if "@entity" in annotations:
-            return "Entity"
-        if "@controller" in annotations or "@restcontroller" in annotations:
-            return "Controller"
-        if "@component" in annotations:
-            return "Component"
-
-        # Check naming conventions
-        if name.endswith("Service") or name.endswith("ServiceImpl"):
-            return "Service"
-        if name.endswith("Repository") or name.endswith("RepositoryImpl"):
-            return "Repository"
-        if name.endswith("Entity") or "@entity" in annotations:
-            return "Entity"
-        if name.endswith("Controller"):
-            return "Controller"
-        if name.endswith("Handler"):
-            return "Handler"
-        if name.endswith("UseCase"):
-            return "UseCase"
-        if name.endswith("Adapter"):
-            return "Adapter"
-        if name.endswith("Gateway"):
-            return "Gateway"
-        if name.endswith("Factory"):
-            return "Factory"
-        if name.endswith("Mapper"):
-            return "Mapper"
-
-        # Check if it's an interface
-        if class_info.class_type == "interface":
-            if name.endswith("Repository"):
-                return "Repository Interface"
-            return "Interface"
-
-        return "Class"
-
-    def _extract_javadoc_summary(self, javadoc: str) -> Optional[str]:
-        """Extract the main description from javadoc."""
-        if not javadoc:
-            return None
-
-        # Remove comment markers
-        lines = javadoc.replace("/**", "").replace("*/", "").split("\n")
-        summary_lines = []
-
-        for line in lines:
-            line = line.strip().lstrip("*").strip()
-            # Stop at tags
-            if line.startswith("@"):
-                break
-            if line:
-                summary_lines.append(line)
-
-        summary = " ".join(summary_lines)
-        # Truncate to first sentence or 100 chars
-        if "." in summary:
-            summary = summary.split(".")[0] + "."
-        return summary[:200] if summary else None
-
-    def _extract_dependencies(self, class_info: ClassInfo) -> list[str]:
-        """Extract injected dependencies from fields."""
-        dependencies = []
-        injection_annotations = {"@Autowired", "@Inject", "@Resource"}
-
-        for field_type, field_name, annotations in class_info.fields:
-            # Check for injection annotations
-            has_injection = any(
-                ann.startswith(inj) for ann in annotations for inj in injection_annotations
-            )
-            # Also consider final fields in constructor-injected classes
-            if has_injection or (
-                field_type.endswith("Service")
-                or field_type.endswith("Repository")
-                or field_type.endswith("Client")
-                or field_type.endswith("Gateway")
-            ):
-                dependencies.append(field_type)
-
-        return list(set(dependencies))
-
-    def _collect_used_types_for_summary(self, class_info: ClassInfo) -> list[str]:
-        """Collect custom domain types used by this class (for summary embedding).
-        
-        Mirrors IndexBuilder._extract_used_types logic — extracts types from
-        fields, method parameters, and return types, filtering out Java builtins.
-        """
-        import re
-        _BUILTINS = {
-            "void", "boolean", "byte", "char", "short", "int", "long", "float", "double",
-            "Boolean", "Byte", "Character", "Short", "Integer", "Long", "Float", "Double",
-            "Number", "Object", "String", "StringBuilder", "StringBuffer", "CharSequence",
-            "UUID", "URI", "URL", "BigDecimal", "BigInteger",
-            "LocalDate", "LocalDateTime", "LocalTime", "ZonedDateTime", "Instant",
-            "Date", "Calendar", "Timestamp",
-            "List", "Map", "Set", "Collection", "Optional", "Stream",
-            "ArrayList", "HashMap", "HashSet", "LinkedList",
-            "Mono", "Flux",
-            "ResponseEntity", "HttpStatus", "HttpHeaders", "Page", "Pageable",
-            "Sort", "Slice", "Result", "Void", "Class", "Enum",
-        }
-        service_suffixes = {"Service", "Repository", "Client", "Gateway", "Handler"}
-
-        def extract(raw_type: str) -> list[str]:
-            return [
-                t for t in re.findall(r'[A-Z][A-Za-z0-9]+', raw_type)
-                if t not in _BUILTINS and len(t) > 2
-                and t != class_info.name
-                and not any(t.endswith(s) for s in service_suffixes)
+        # ---- @Builder on regular class ----
+        if class_info.has_builder:
+            instance_fields = [
+                f.name for f in class_info.detailed_fields if "static" not in f.modifiers
             ]
+            hint = self._builder_hint(name, instance_fields)
+            if class_info.has_builder_to_builder:
+                hint += f"\n// toBuilder: existing.toBuilder().field(newValue).build()"
+            return hint
 
-        result: set[str] = set()
-        for f in getattr(class_info, 'detailed_fields', []):
-            result.update(extract(f.type))
-        for field_type, _, _ in class_info.fields:
-            result.update(extract(field_type))
-        for method in class_info.methods:
-            result.update(extract(method.return_type))
-            for param_type, _ in method.parameters:
-                result.update(extract(param_type))
-        return sorted(result)
+        # ---- @Value (Lombok immutable) ----
+        if class_info.has_value:
+            fields = [f.name for f in class_info.detailed_fields if "static" not in f.modifiers]
+            args = ", ".join(fields)
+            return f"new {name}({args})  // @Value: all-args, no setters"
 
-    def _is_public_method(self, method: MethodInfo) -> bool:
-        """Check if method is likely public (not explicitly private/protected).
-        
-        Note: JavaParser extracts annotations, not modifiers, per method.
-        We conservatively include all methods in summaries (overinclusion is fine).
-        Filter out only obvious private patterns from method name conventions.
-        """
-        # Exclude common private/internal method naming patterns
-        name = method.name
-        if name.startswith("_") or name == "equals" or name == "hashCode":
-            return False
-        return True
+        # ---- @AllArgsConstructor ----
+        if class_info.has_all_args_constructor:
+            fields = [f.name for f in class_info.detailed_fields if "static" not in f.modifiers]
+            args = ", ".join(fields)
+            return f"new {name}({args})"
 
-    def _method_signature(self, method: MethodInfo) -> str:
-        """Generate a compact method signature."""
-        params = ", ".join(f"{t} {n}" for t, n in method.parameters)
-        return f"{method.return_type} {method.name}({params})"
+        # ---- @Data or @Setter (mutable bean) ----
+        if class_info.has_data or class_info.has_setter:
+            fields = [
+                f.name for f in class_info.detailed_fields
+                if "static" not in f.modifiers
+            ][:6]
+            setter_lines = "\n".join(
+                f"obj.set{f[0].upper()}{f[1:]}(value);" for f in fields
+            )
+            extra = ""
+            if len([f for f in class_info.detailed_fields if "static" not in f.modifiers]) > 6:
+                extra = "\n// ... more setters"
+            return f"{name} obj = new {name}();\n{setter_lines}{extra}"
 
-    def _summarize_method_body(self, body: str) -> Optional[str]:
-        """Extract key operations from method body."""
-        if not body:
-            return None
+        # ---- @NoArgsConstructor only ----
+        if class_info.has_no_args_constructor:
+            return f"new {name}()  // no-args constructor only"
 
-        operations = []
+        # ---- @RequiredArgsConstructor (final fields) ----
+        if class_info.has_required_args_constructor:
+            final_fields = [
+                f.name for f in class_info.detailed_fields
+                if "final" in f.modifiers and "static" not in f.modifiers
+            ]
+            args = ", ".join(final_fields) if final_fields else "/* final fields */"
+            return f"new {name}({args})  // @RequiredArgsConstructor"
 
-        # Look for common patterns
-        if "repository." in body.lower() or "dao." in body.lower():
-            operations.append("database access")
-        if ".save(" in body or ".persist(" in body:
-            operations.append("persist entity")
-        if ".find" in body or ".get" in body:
-            operations.append("query data")
-        if ".delete(" in body or ".remove(" in body:
-            operations.append("delete operation")
-        if "throw new" in body:
-            operations.append("throws exception")
-        if ".map(" in body or ".stream(" in body:
-            operations.append("stream processing")
-        if "validate" in body.lower():
-            operations.append("validation")
-        if ".publish(" in body or ".send(" in body:
-            operations.append("event publishing")
-        if "log." in body.lower() or "logger." in body.lower():
-            operations.append("logging")
+        # ---- Spring @Component/@Service/@Repository — injected, not new'd ----
+        annotations_lower = " ".join(class_info.annotations).lower()
+        if any(x in annotations_lower for x in ("@service", "@component", "@repository", "@controller", "@restcontroller")):
+            return f"// Spring-managed bean — inject via @Autowired or constructor injection"
 
-        return ", ".join(operations) if operations else None
+        # ---- Interface / abstract class ----
+        if class_info.is_interface or class_info.is_abstract:
+            return f"// Interface/Abstract — use an implementing class"
 
-    def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:
-        """Truncate text to approximate token count."""
-        # Rough approximation: 1 token ≈ 4 characters
-        max_chars = max_tokens * 4
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars].rsplit(" ", 1)[0] + "..."
+        # ---- Enum ----
+        if class_info.is_enum:
+            if class_info.enum_constants:
+                return f"{name}.{class_info.enum_constants[0]}  // or any of: {', '.join(class_info.enum_constants[:5])}"
+            return f"{name}.CONSTANT_NAME"
+
+        return f"new {name}()  // check for available constructors"
+
+    def _builder_hint(self, class_name: str, field_names: list[str]) -> str:
+        """Format a builder chain hint."""
+        if not field_names:
+            return f"{class_name}.builder().build()"
+        shown = field_names[:6]
+        lines = "\n  ".join(f".{f}(value)" for f in shown)
+        extra = f"\n  // ... +{len(field_names) - 6} more fields" if len(field_names) > 6 else ""
+        return f"{class_name}.builder()\n  {lines}{extra}\n  .build()"
+
+    # ------------------------------------------------------------------
+    # Layer / type detection
+    # ------------------------------------------------------------------
 
     def detect_layer(self, class_info: ClassInfo) -> str:
-        """Detect DDD layer for a class."""
         name = class_info.name.lower()
         package = class_info.package.lower()
         annotations = " ".join(class_info.annotations).lower()
 
-        # Infrastructure layer
         if any(x in package for x in ["infrastructure", "adapter", "persistence", "repository"]):
             return "infrastructure"
         if any(x in name for x in ["repository", "adapter", "client", "gateway"]):
@@ -381,7 +241,6 @@ class CodeSummarizer:
         if "@repository" in annotations:
             return "infrastructure"
 
-        # Application layer
         if any(x in package for x in ["application", "service", "usecase"]):
             return "application"
         if any(x in name for x in ["service", "usecase", "handler", "facade"]):
@@ -389,7 +248,6 @@ class CodeSummarizer:
         if "@service" in annotations:
             return "application"
 
-        # Domain layer
         if any(x in package for x in ["domain", "model", "entity"]):
             return "domain"
         if any(x in name for x in ["entity", "valueobject", "aggregate", "domainservice"]):
@@ -397,11 +255,13 @@ class CodeSummarizer:
         if "@entity" in annotations:
             return "domain"
 
+        # DTO / model layer
+        if any(x in name for x in ["request", "response", "dto", "command", "event", "query", "payload"]):
+            return "dto"
+
         return "unknown"
 
     def detect_type(self, class_info: ClassInfo) -> str:
-        """Detect the semantic type of a class/record/enum/interface."""
-        # First check Java type
         java_type = class_info.class_type
         if java_type == "record":
             return "record"
@@ -411,10 +271,9 @@ class CodeSummarizer:
             return "annotation"
         if java_type == "interface":
             return "interface"
-        
-        # Then check semantic label
+
         label = self._get_class_type_label(class_info)
-        type_mapping = {
+        return {
             "Service": "service",
             "Repository": "repository",
             "Repository Interface": "repository",
@@ -436,6 +295,145 @@ class CodeSummarizer:
             "Command Record": "record",
             "Enum": "enum",
             "Annotation": "annotation",
-        }
-        return type_mapping.get(label, "class")
+            "Mapper": "mapper",
+            "Factory": "factory",
+        }.get(label, "class")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_class_type_label(self, class_info: ClassInfo) -> str:
+        name = class_info.name
+        annotations = " ".join(class_info.annotations).lower()
+        class_type = class_info.class_type
+
+        if class_type == "record":
+            if name.endswith("Request") or name.endswith("Response"):
+                return "DTO Record"
+            if name.endswith("Event"):
+                return "Event Record"
+            if name.endswith("Command"):
+                return "Command Record"
+            return "Record"
+        if class_type == "enum":
+            return "Enum"
+        if class_type == "annotation":
+            return "Annotation"
+        if class_type == "interface":
+            if name.endswith("Repository"):
+                return "Repository Interface"
+            if name.endswith("Service"):
+                return "Service Interface"
+            if name.endswith("UseCase"):
+                return "UseCase Interface"
+            if name.endswith("Port"):
+                return "Port Interface"
+            if name.endswith("Gateway"):
+                return "Gateway Interface"
+            return "Interface"
+
+        if "@service" in annotations:
+            return "Service"
+        if "@repository" in annotations:
+            return "Repository"
+        if "@entity" in annotations:
+            return "Entity"
+        if "@controller" in annotations or "@restcontroller" in annotations:
+            return "Controller"
+        if "@component" in annotations:
+            return "Component"
+
+        if name.endswith("Service") or name.endswith("ServiceImpl"):
+            return "Service"
+        if name.endswith("Repository") or name.endswith("RepositoryImpl"):
+            return "Repository"
+        if name.endswith("Entity") or "@entity" in annotations:
+            return "Entity"
+        if name.endswith("Controller"):
+            return "Controller"
+        if name.endswith("Handler"):
+            return "Handler"
+        if name.endswith("UseCase"):
+            return "UseCase"
+        if name.endswith("Adapter"):
+            return "Adapter"
+        if name.endswith("Gateway"):
+            return "Gateway"
+        if name.endswith("Factory"):
+            return "Factory"
+        if name.endswith("Mapper"):
+            return "Mapper"
+
+        return "Class"
+
+    def _extract_javadoc_summary(self, javadoc: str) -> Optional[str]:
+        if not javadoc:
+            return None
+        lines = javadoc.replace("/**", "").replace("*/", "").split("\n")
+        summary_lines = []
+        for line in lines:
+            line = line.strip().lstrip("*").strip()
+            if line.startswith("@"):
+                break
+            if line:
+                summary_lines.append(line)
+        summary = " ".join(summary_lines)
+        if "." in summary:
+            summary = summary.split(".")[0] + "."
+        return summary[:200] if summary else None
+
+    def _extract_dependencies(self, class_info: ClassInfo) -> list[str]:
+        dependencies = []
+        injection_annotations = {"@Autowired", "@Inject", "@Resource"}
+        for field_type, field_name, annotations in class_info.fields:
+            has_injection = any(
+                ann.startswith(inj) for ann in annotations for inj in injection_annotations
+            )
+            if has_injection or any(
+                field_type.endswith(s)
+                for s in ["Service", "Repository", "Client", "Gateway", "Handler"]
+            ):
+                dependencies.append(field_type)
+        return list(set(dependencies))
+
+    def _is_public_method(self, method: MethodInfo) -> bool:
+        for ann in method.annotations:
+            if "private" in ann.lower() or "protected" in ann.lower():
+                return False
+        return True
+
+    def _method_signature(self, method: MethodInfo) -> str:
+        params = ", ".join(f"{t} {n}" for t, n in method.parameters)
+        return f"{method.return_type} {method.name}({params})"
+
+    def _summarize_method_body(self, body: str) -> Optional[str]:
+        if not body:
+            return None
+        operations = []
+        bl = body.lower()
+        if "repository." in bl or "dao." in bl:
+            operations.append("database access")
+        if ".save(" in bl or ".persist(" in bl:
+            operations.append("persist entity")
+        if ".find" in bl or ".get" in bl:
+            operations.append("query data")
+        if ".delete(" in bl or ".remove(" in bl:
+            operations.append("delete operation")
+        if "throw new" in bl:
+            operations.append("throws exception")
+        if ".map(" in bl or ".stream(" in bl:
+            operations.append("stream processing")
+        if "validate" in bl:
+            operations.append("validation")
+        if ".publish(" in bl or ".send(" in bl:
+            operations.append("event publishing")
+        if "log." in bl or "logger." in bl:
+            operations.append("logging")
+        return ", ".join(operations) if operations else None
+
+    def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:
+        max_chars = max_tokens * 4
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rsplit(" ", 1)[0] + "..."
