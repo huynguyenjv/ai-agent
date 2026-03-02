@@ -576,6 +576,41 @@ async def list_models():
 
 
 
+def _extract_java_file_path_from_message(content: str) -> Optional[str]:
+    """Extract Java file path from inline code blocks sent by Continue IDE.
+
+    Continue IDE format when user uses @ClassName:
+        ```src/main/java/com/example/ClassName.java
+        package com.example;
+        ...
+        ```
+
+    Returns the file path if found, None otherwise.
+    """
+    import re
+
+    # Pattern 1: code block with file path as info string
+    # ```src/main/java/.../ClassName.java  or  ```java src/.../ClassName.java
+    code_block_pattern = r'```(?:java\s+)?([^\n]*?\.java)\s*\n'
+    match = re.search(code_block_pattern, content)
+    if match:
+        return match.group(1).strip()
+
+    # Pattern 2: look for class declaration to infer class name as fallback
+    class_pattern = r'(?:public\s+)?class\s+(\w+)'
+    class_match = re.search(class_pattern, content)
+    if class_match:
+        class_name = class_match.group(1)
+        # Try to find package declaration for a better path
+        pkg_match = re.search(r'package\s+([\w.]+)\s*;', content)
+        if pkg_match:
+            package_path = pkg_match.group(1).replace('.', '/')
+            return f"src/main/java/{package_path}/{class_name}.java"
+        return f"{class_name}.java"
+
+    return None
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(request: ChatCompletionRequest):
     """
@@ -616,38 +651,26 @@ async def chat_completions(request: ChatCompletionRequest):
         keyword in user_content.lower()
         for keyword in ["test", "junit", "unit test", "mockito", "generate test"]
     )
-    logger.debug("Is test request", is_test_request=is_test_request)
 
-    # Get RAG context if file_path is provided
-    rag_context = ""
-    if request.file_path:
-        class_name = request.file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
-        try:
-            logger.debug("Searching RAG context", class_name=class_name)
-            search_result = orchestrator.rag.search(SearchQuery(
-                query=f"{class_name} service methods dependencies",
-                top_k=5,
-                score_threshold=0.4,
-            ))
-            if search_result.chunks:
-                rag_context = "\n\n## Codebase Context:\n"
-                for chunk in search_result.chunks:
-                    rag_context += f"\n### {chunk.class_name} ({chunk.type}, {chunk.layer})\n"
-                    rag_context += f"```\n{chunk.summary[:500]}\n```\n"
-            logger.debug("RAG context result", rag_context=rag_context)
-        except Exception as e:
-            logger.warning("RAG search failed", error=str(e))
+    # Resolve file_path: from request, or extract from inline code block (Continue IDE)
+    file_path = request.file_path
+    if not file_path:
+        file_path = _extract_java_file_path_from_message(user_content)
+        if file_path:
+            logger.info("Extracted file_path from inline code block", file_path=file_path)
 
-    # Build the prompt and run generation in thread pool
-    if is_test_request and request.file_path:
-        logger.info("Using test generation logic", file_path=request.file_path)
+    logger.debug("Is test request", is_test_request=is_test_request, file_path=file_path)
+
+    # Route: test generation (with full RAG pipeline) or general chat
+    if is_test_request and file_path:
+        logger.info("Using test generation pipeline", file_path=file_path)
         gen_request = GenerationRequest(
-            file_path=request.file_path,
+            file_path=file_path,
             task_description=user_content,
         )
         # Run blocking operation in thread pool
         result = await run_in_executor(orchestrator.generate_test, gen_request)
-        logger.debug("Test generation result", result=result)
+        logger.debug("Test generation result", success=result.success, rag_chunks=result.rag_chunks_used)
 
         if result.success:
             response_content = result.test_code or ""
@@ -656,13 +679,28 @@ async def chat_completions(request: ChatCompletionRequest):
             response_content = f"Error generating test: {result.error}"
             tokens_used = 0
     else:
-        # General chat with RAG context
+        # General chat — try to add RAG context if we have a file_path
         enhanced_prompt = user_content
-        if rag_context:
-            enhanced_prompt = f"{user_content}\n{rag_context}"
+        if file_path:
+            class_name = file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
+            try:
+                logger.debug("Searching RAG context for general chat", class_name=class_name)
+                search_result = orchestrator.rag.search(SearchQuery(
+                    query=f"{class_name} service methods dependencies",
+                    top_k=5,
+                    score_threshold=0.4,
+                ))
+                if search_result.chunks:
+                    rag_context = "\n\n## Codebase Context:\n"
+                    for chunk in search_result.chunks:
+                        rag_context += f"\n### {chunk.class_name} ({chunk.type}, {chunk.layer})\n"
+                        rag_context += f"```\n{chunk.summary[:500]}\n```\n"
+                    enhanced_prompt = f"{user_content}\n{rag_context}"
+            except Exception as e:
+                logger.warning("RAG search failed", error=str(e))
 
-        logger.info("Calling vLLM for generation", prompt=enhanced_prompt[:200])
-        
+        logger.info("Calling vLLM for general generation", prompt=enhanced_prompt[:200])
+
         # Run blocking vLLM call in thread pool
         vllm_response = await run_in_executor(
             lambda: orchestrator.vllm.generate(
@@ -797,6 +835,60 @@ async def completions(request: dict):
         ],
         "usage": response.usage.model_dump(),
     }
+
+def get_orchestrator():
+    # In production, import from server.api, here fallback to new instance
+    try:
+        from .api import orchestrator
+        if orchestrator:
+            return orchestrator
+    except Exception:
+        pass
+    # Fallback: create new (may not share memory/session)
+    from rag.client import RAGClient
+    from vllm.client import VLLMClient
+    return AgentOrchestrator(
+        rag_client=RAGClient(),
+        vllm_client=VLLMClient(
+            base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
+            api_key=os.getenv("VLLM_API_KEY", "token-abc123"),
+            model=os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"),
+        ),
+    )
+# API: get RAG context for a class/file
+@app.get("/v1/rag-context")
+def get_rag_context(
+    class_name: str,
+    file_path: str = "",
+    session_id: str = ""
+):
+    """
+    Trả về context (các chunk) mà agent thực sự dùng để build prompt cho model.
+    """
+    logger.info("Received request for RAG context", class_name=class_name, file_path=file_path, session_id=session_id)
+    orchestrator = get_orchestrator()
+    session = None
+    if session_id:
+        session = orchestrator.memory_manager.get_session(session_id)
+    chunks = orchestrator._get_rag_context(class_name, file_path, session)
+    # return {
+    #     "class_name": class_name,
+    #     "file_path": file_path,
+    #     "chunks": [
+    #         {
+    #             "class_name": c.class_name,
+    #             "type": c.type,
+    #             "java_type": c.java_type,
+    #             "fields": [f"{f.type} {f.name}" for f in getattr(c, "fields", [])],
+    #             "record_components": [f"{f.type} {f.name}" for f in getattr(c, "record_components", [])],
+    #             "dependencies": getattr(c, "dependencies", []),
+    #             "used_types": getattr(c, "used_types", []),
+    #             "summary": c.summary,
+    #         }
+    #         for c in chunks
+    #     ]
+    # }
+    return chunks
 
 
 # ============================================================================

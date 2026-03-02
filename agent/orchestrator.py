@@ -4,6 +4,7 @@ Agent orchestrator for coordinating test generation workflow.
 
 import re
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import structlog
@@ -12,7 +13,7 @@ from .prompt import PromptBuilder
 from .rules import TestRules
 from .memory import SessionMemory, MemoryManager
 from rag.client import RAGClient
-from rag.schema import SearchQuery, CodeChunk
+from rag.schema import SearchQuery, CodeChunk, MetadataFilter
 from vllm.client import VLLMClient
 
 logger = structlog.get_logger()
@@ -89,8 +90,11 @@ class AgentOrchestrator:
                 session = self.memory_manager.get_or_create_session(request.session_id)
                 session.set_context(class_name=class_name, file_path=request.file_path)
 
-            # Query RAG for context
-            rag_chunks = self._get_rag_context(class_name, request.file_path, session)
+            # Query RAG for context, with fallback extraction from inline source
+            rag_chunks = self._get_rag_context(
+                class_name, request.file_path, session,
+                inline_source=request.task_description,
+            )
 
             # Build prompts
             system_prompt = self.prompt_builder.build_system_prompt()
@@ -122,21 +126,24 @@ class AgentOrchestrator:
                     error=response.error,
                 )
 
-            # Extract code from response
-            test_code = self._extract_code(response.content)
+            # Full LLM response = Analysis Report + Test Plan + Code + Coverage Notes
+            full_response = response.content
+
+            # Extract code for validation only (don't strip the response)
+            extracted_code = self._extract_code(full_response)
 
             # Validate generated code
-            is_valid, issues = self.test_rules.validate_generated_code(test_code)
+            is_valid, issues = self.test_rules.validate_generated_code(extracted_code)
 
-            # Record in session
+            # Record in session (store extracted code for refinement)
             if session:
                 session.add_assistant_message(
-                    test_code,
+                    extracted_code,
                     metadata={"validation_passed": is_valid},
                 )
                 session.record_generated_test(
                     class_name=class_name,
-                    test_code=test_code,
+                    test_code=extracted_code,
                     success=is_valid,
                 )
 
@@ -147,9 +154,11 @@ class AgentOrchestrator:
                 issues=issues,
             )
 
+            # Return FULL response (not just extracted code) so user sees
+            # Analysis Report + Test Plan + Implementation + Coverage Notes
             return GenerationResult(
                 success=True,
-                test_code=test_code,
+                test_code=full_response,
                 class_name=class_name,
                 validation_passed=is_valid,
                 validation_issues=issues,
@@ -185,12 +194,21 @@ class AgentOrchestrator:
 
         last_test = session.generated_tests[-1]
 
+        # Lấy lại RAG context từ session cache để LLM có đủ thông tin source code
+        rag_chunks: list[CodeChunk] = []
+        if session.current_file:
+            cache_key = f"{last_test.class_name}:{session.current_file}"
+            cached = session.get_cached_rag_context(cache_key)
+            if cached:
+                rag_chunks = [CodeChunk(**c) for c in cached]
+
         # Build refinement prompt
         _, issues = self.test_rules.validate_generated_code(last_test.test_code)
         refinement_prompt = self.prompt_builder.build_refinement_prompt(
             original_code=last_test.test_code,
             feedback=feedback,
             validation_issues=issues,
+            rag_chunks=rag_chunks,
         )
 
         # Record feedback
@@ -231,14 +249,21 @@ class AgentOrchestrator:
             tokens_used=response.tokens_used,
         )
 
+
+
+
     def _get_rag_context(
         self,
         class_name: str,
         file_path: str,
         session: Optional[SessionMemory],
+        inline_source: Optional[str] = None,
     ) -> list[CodeChunk]:
-        """Get relevant context from RAG."""
-        # Check session cache first
+        """Exact graph traversal: lấy target class → phân tích deps+used_types → parallel fetch tất cả.
+        
+        If deps/used_types from Qdrant are empty, falls back to extracting
+        type names from the inline source code (Continue IDE sends code inline).
+        """
         cache_key = f"{class_name}:{file_path}"
         if session:
             cached = session.get_cached_rag_context(cache_key)
@@ -246,61 +271,71 @@ class AgentOrchestrator:
                 logger.debug("Using cached RAG context", class_name=class_name)
                 return [CodeChunk(**c) for c in cached]
 
-        chunks = []
-        existing_names: set[str] = set()
+        chunks: list[CodeChunk] = []
+        existing_fqns: set[str] = set()
 
-        # Step 1: Fetch main class + its service dependencies
+        # Query 1: lấy đúng 1 chunk service target
         main_result = self.rag.search_by_class(
             class_name=class_name,
             top_k=1,
-            include_dependencies=True,
+            include_dependencies=False,
         )
-        for chunk in main_result.chunks:
-            if chunk.fully_qualified_name not in existing_names:
-                chunks.append(chunk)
-                existing_names.add(chunk.fully_qualified_name)
+        main_chunk = main_result.chunks[0] if main_result.chunks else None
+        if not main_chunk:
+            logger.warning("Service target not found in index", class_name=class_name)
+            return []
+        chunks.append(main_chunk)
+        existing_fqns.add(main_chunk.fully_qualified_name)
 
-        # Step 2: Fetch used domain types (models, DTOs, entities) from the main class
-        # e.g. ResourceUseCaseService uses [Resource, ResourceDetail]
-        # → fetch each to get their fields, @Builder, Lombok annotations etc.
-        main_chunk = chunks[0] if chunks else None
-        if main_chunk and main_chunk.used_types:
-            logger.info(
-                "Fetching used_types for context",
-                class_name=class_name,
-                used_types=main_chunk.used_types,
-            )
-            for used_type in main_chunk.used_types[:8]:  # limit to avoid context explosion
-                if used_type in existing_names:
-                    continue
-                type_result = self.rag.search_by_class(
-                    class_name=used_type,
-                    top_k=1,
-                    include_dependencies=False,  # don't recurse into sub-deps
+        # Gộp dependencies + used_types, loại trùng lặp và loại chính nó
+        deps = set(main_chunk.dependencies or [])
+        used = set(main_chunk.used_types or [])
+        types_to_fetch = (deps | used) - {main_chunk.class_name, class_name}
+
+        # Fallback: nếu Qdrant không có deps/used_types, parse từ inline source
+        if not types_to_fetch and inline_source:
+            fallback_types = self._extract_types_from_source(inline_source, class_name)
+            if fallback_types:
+                types_to_fetch = fallback_types
+                logger.info(
+                    "Using fallback type extraction from inline source",
+                    class_name=class_name,
+                    fallback_types=sorted(types_to_fetch),
                 )
-                for chunk in type_result.chunks:
-                    if chunk.fully_qualified_name not in existing_names:
-                        chunks.append(chunk)
-                        existing_names.add(chunk.fully_qualified_name)
-                        logger.debug(
-                            "Added used_type to context",
-                            used_type=used_type,
-                            fqn=chunk.fully_qualified_name,
-                        )
 
-        # Step 3: Semantic search for related code to fill remaining slots
-        remaining = self.top_k - len(chunks)
-        if remaining > 0:
-            related_query = SearchQuery(
-                query=f"service {class_name} dependencies methods",
-                top_k=remaining,
-                score_threshold=0.4,
+        if not types_to_fetch:
+            logger.info(
+                "RAG context retrieved (target only, no deps/used_types)",
+                class_name=class_name,
             )
-            related_result = self.rag.search(related_query)
-            for chunk in related_result.chunks:
-                if chunk.fully_qualified_name not in existing_names:
+            return chunks
+
+        # Parallel fetch: lấy chunk cho từng dependency/used_type cùng lúc
+        def _fetch_one(type_name: str) -> Optional[CodeChunk]:
+            try:
+                result = self.rag.search_by_class(
+                    class_name=type_name,
+                    top_k=1,
+                    include_dependencies=False,
+                )
+                return result.chunks[0] if result.chunks else None
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch dependency chunk",
+                    type_name=type_name,
+                    error=str(e),
+                )
+                return None
+
+        with ThreadPoolExecutor(max_workers=min(5, len(types_to_fetch))) as executor:
+            future_map = {
+                executor.submit(_fetch_one, t): t for t in types_to_fetch
+            }
+            for future in as_completed(future_map):
+                chunk = future.result()
+                if chunk and chunk.fully_qualified_name not in existing_fqns:
                     chunks.append(chunk)
-                    existing_names.add(chunk.fully_qualified_name)
+                    existing_fqns.add(chunk.fully_qualified_name)
 
         # Cache in session
         if session:
@@ -310,13 +345,65 @@ class AgentOrchestrator:
             )
 
         logger.info(
-            "RAG context retrieved",
+            "RAG context retrieved (target+deps+used_types)",
             class_name=class_name,
-            chunks=len(chunks),
-            used_types_fetched=len(main_chunk.used_types) if main_chunk else 0,
+            total_chunks=len(chunks),
+            types_requested=len(types_to_fetch),
+            fetched=len(chunks) - 1,
         )
 
         return chunks[:self.top_k]
+
+    def _extract_types_from_source(self, source: str, class_name: str) -> set[str]:
+        """Extract domain type names from inline Java source code.
+        
+        Fallback for when Qdrant has empty dependencies/used_types.
+        Parses import statements and field declarations to find
+        domain-specific types that should be fetched from RAG.
+        """
+        types: set[str] = set()
+        
+        # Well-known prefixes to skip
+        _SKIP_PREFIXES = {
+            "java.", "javax.", "jakarta.",
+            "org.springframework.", "org.junit.", "org.mockito.",
+            "org.slf4j.", "org.apache.", "com.fasterxml.",
+            "lombok.",
+        }
+        _SKIP_SIMPLE = {
+            "String", "Integer", "Long", "Double", "Float", "Boolean",
+            "UUID", "Map", "Set", "List", "Page", "Pageable", "Optional",
+            "BigDecimal", "LocalDate", "LocalDateTime", "Instant",
+            "ResponseEntity", "HttpStatus",
+        }
+        
+        for line in source.split("\n"):
+            line = line.strip()
+            
+            # Parse import statements: import com.example.domain.Resource;
+            if line.startswith("import "):
+                import_path = line.replace("import ", "").replace(";", "").strip()
+                # Skip well-known framework imports
+                if any(import_path.startswith(p) for p in _SKIP_PREFIXES):
+                    continue
+                # Extract simple class name from FQN
+                simple_name = import_path.split(".")[-1]
+                if simple_name != class_name and simple_name not in _SKIP_SIMPLE:
+                    types.add(simple_name)
+            
+            # Parse field declarations: private final ResourceQueryService resourceQueryService;
+            field_match = re.match(
+                r'\s*(?:private|protected|public)?\s*(?:final\s+)?(\w+)\s+\w+\s*;',
+                line,
+            )
+            if field_match:
+                field_type = field_match.group(1)
+                if (field_type[0].isupper() and 
+                    field_type != class_name and 
+                    field_type not in _SKIP_SIMPLE):
+                    types.add(field_type)
+        
+        return types
 
     def _extract_class_name(self, file_path: str) -> Optional[str]:
         """Extract class name from file path."""

@@ -74,7 +74,16 @@ class RAGClient:
                 )
                 for f in fields_data if isinstance(f, dict)
             ]
-            
+            # Parse record_components from payload (for Java records)
+            record_components_data = payload.get("record_components", [])
+            record_components = [
+                FieldSchema(
+                    type=f.get("type", ""),
+                    name=f.get("name", ""),
+                    annotations=f.get("annotations", [])
+                )
+                for f in record_components_data if isinstance(f, dict)
+            ]
             chunk = CodeChunk(
                 id=result.id,
                 summary=payload.get("summary", ""),
@@ -114,6 +123,7 @@ class RAGClient:
                 # Fields info
                 field_count=payload.get("field_count", 0),
                 fields=fields,
+                record_components=record_components,
             )
             chunks.append(chunk)
 
@@ -133,11 +143,12 @@ class RAGClient:
             search_time_ms=search_time_ms,
         )
 
+
     def search_by_class(
         self, class_name: str, top_k: int = 10, include_dependencies: bool = True
     ) -> SearchResult:
-        """Search for a specific class and optionally its dependencies."""
-        # First, find the exact class
+        """Search for a specific class and optionally its dependencies. Fallback: match all chunks with class_name if strict filter fails."""
+        # First, try strict filter
         query = SearchQuery(
             query=f"class {class_name}",
             top_k=1,
@@ -146,14 +157,30 @@ class RAGClient:
         )
         result = self.search(query)
 
+        # Fallback: nếu không tìm thấy, tìm mọi chunk có class_name trùng (bất kể package)
         if not result.chunks:
-            # Try semantic search without exact filter
-            query = SearchQuery(
+            fallback_query = SearchQuery(
+                query=f"class {class_name}",
+                top_k=top_k,
+                score_threshold=0.0,
+                filters=None,
+            )
+            fallback_result = self.search(fallback_query)
+            # Ưu tiên chunk có package giống service đang xét nếu có
+            if fallback_result.chunks:
+                return SearchResult(
+                    query=f"class {class_name} (fallback)",
+                    chunks=fallback_result.chunks[:top_k],
+                    total_found=len(fallback_result.chunks),
+                    search_time_ms=fallback_result.search_time_ms,
+                )
+            # Nếu vẫn không có, thử semantic search rộng hơn
+            query2 = SearchQuery(
                 query=f"class {class_name} service implementation",
                 top_k=top_k,
                 score_threshold=0.5,
             )
-            return self.search(query)
+            return self.search(query2)
 
         # If found and we want dependencies, search for them too
         if include_dependencies and result.chunks:
