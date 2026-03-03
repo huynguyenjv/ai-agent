@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 # ── Bootstrap: avoid heavy imports ──────────────────────────────────
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Stub out heavy modules

@@ -433,6 +433,19 @@ class IndexBuilder:
         if "@entity" in annotations_lower:
             return True
 
+        # Package-based detection: types in domain/model/dto/vo/openapi packages
+        pkg = (class_info.package or "").lower()
+        if any(seg in pkg.split(".") for seg in (
+            "domain", "model", "dto", "vo", "entity", "openapi", "payload", "event",
+        )):
+            # But exclude Spring-managed classes in domain packages
+            is_spring_managed = any(
+                x in annotations_lower
+                for x in ("@service", "@component", "@repository", "@controller", "@restcontroller", "@configuration")
+            )
+            if not is_spring_managed:
+                return True
+
         # Lombok data/value/builder on a non-service class
         is_spring_managed = any(
             x in annotations_lower

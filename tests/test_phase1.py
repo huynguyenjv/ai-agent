@@ -8,7 +8,7 @@ import sys
 import os
 import importlib.util
 
-base = os.path.dirname(os.path.abspath(__file__))
+base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, base)
 
 

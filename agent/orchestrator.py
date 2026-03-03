@@ -596,7 +596,12 @@ class AgentOrchestrator:
             sm.transition_to(AgentState.VALIDATING)
 
         # Phase 3: use ValidationPipeline for severity-aware validation
-        validation_result = self.validator.validate(ctx.get("extracted_code", ""))
+        # Pass RAG chunks for construction pattern cross-check (Pass 7)
+        rag_chunks = ctx.get("rag_chunks")
+        validation_result = self.validator.validate(
+            ctx.get("extracted_code", ""),
+            rag_chunks=rag_chunks,
+        )
         ctx["validation_result"] = validation_result
         ctx["validation_passed"] = validation_result.passed
         ctx["validation_issues"] = validation_result.error_messages
@@ -793,6 +798,9 @@ class AgentOrchestrator:
             return chunks
 
         # Parallel fetch for each dependency/used_type
+        fetched_names: set[str] = set()
+        unfound_types: set[str] = set()
+
         def _fetch_one(type_name: str) -> Optional[CodeChunk]:
             try:
                 result = self.rag.search_by_class(
@@ -814,10 +822,23 @@ class AgentOrchestrator:
                 executor.submit(_fetch_one, t): t for t in types_to_fetch
             }
             for future in as_completed(future_map):
+                type_name = future_map[future]
                 chunk = future.result()
                 if chunk and chunk.fully_qualified_name not in existing_fqns:
                     chunks.append(chunk)
                     existing_fqns.add(chunk.fully_qualified_name)
+                    fetched_names.add(type_name)
+                elif not chunk:
+                    unfound_types.add(type_name)
+                    logger.warning(
+                        "Type NOT found in Qdrant index — LLM will be told to mock it",
+                        type_name=type_name,
+                        class_name=class_name,
+                    )
+
+        # Attach unfound types to main_chunk metadata so prompt builder can warn LLM
+        if unfound_types and main_chunk:
+            main_chunk.unfound_types = sorted(unfound_types)
 
         # Cache in session
         if session:
@@ -834,9 +855,13 @@ class AgentOrchestrator:
             used_types_count=len(used),
             types_requested=len(types_to_fetch),
             fetched=len(chunks) - 1,
+            unfound=sorted(unfound_types) if unfound_types else [],
         )
 
-        return chunks[:self.top_k]
+        # Return ALL chunks — do NOT truncate with [:top_k].
+        # Domain types are critical for correct construction patterns.
+        # The prompt builder handles token budgeting separately.
+        return chunks
 
     def _extract_types_from_source(self, source: str, class_name: str) -> set[str]:
         """Extract domain type names from inline Java source code."""

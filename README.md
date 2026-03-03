@@ -1,319 +1,213 @@
-# AI Coding Agent
+# AI Agent — JUnit5 Test Generator
 
-A self-hosted AI coding agent that generates JUnit5 + Mockito unit tests for large DDD Java repositories using RAG (Retrieval Augmented Generation).
+Self-hosted AI agent that generates **JUnit5 + Mockito** unit tests for Java services.  
+Uses RAG (Qdrant) + local LLM (vLLM) to produce tests that are context-aware, compilable, and follow DDD conventions.
 
 ## Architecture
 
 ```
-Tabby (IDE) → Agent Orchestrator → Local RAG Index (Qdrant) → vLLM (Qwen2.5)
+Tabby / Continue IDE
+        │
+        ▼
+┌──────────────────────────────────────────────────────┐
+│  FastAPI Server  (OpenAI-compatible /v1/chat/...)     │
+│  server/api.py                                        │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  Agent Orchestrator        agent/orchestrator.py      │
+│  StateMachine → Planner → Retrieve → Generate        │
+│               → Validate → Repair                     │
+└──────┬──────────────┬────────────────┬───────────────┘
+       │              │                │
+       ▼              ▼                ▼
+┌────────────┐ ┌────────────┐  ┌──────────────┐
+│ RAG Client │ │ vLLM Client│  │ Intelligence │
+│  (Qdrant)  │ │  (Qwen2.5) │  │ (Graph+Symbol│
+│  rag/      │ │  vllm/     │  │  Analysis)   │
+└──────┬─────┘ └────────────┘  └──────────────┘
+       │
+       ▼
+┌────────────┐
+│  Indexer   │
+│ (tree-sitter│
+│  → Qdrant) │
+│  indexer/  │
+└────────────┘
 ```
 
 ## Features
 
-- **Tabby IDE Integration**: OpenAI-compatible API for seamless IDE integration
-- **Semantic Code Understanding**: Uses tree-sitter to parse Java code and extract services, entities, repositories, and methods
-- **RAG-Powered Context**: Precomputed semantic index avoids loading full source into context
-- **DDD-Aware**: Understands application, domain, and infrastructure layers
-- **Test Generation Rules**: Enforces JUnit5 + Mockito patterns, AAA structure, no Spring test context
-- **Session Memory**: Maintains context across multiple interactions
-
-## Prerequisites
-
-- Python 3.11+
-- Docker & Docker Compose
-- vLLM server running with Qwen2.5-Coder model
-- Java repository to index
+- **OpenAI-compatible API** — plug into Tabby IDE or Continue IDE as a custom model provider
+- **Tree-sitter Java parsing** — extracts classes, records, enums, interfaces, Lombok annotations, fields, methods
+- **Semantic vector index** — Qdrant with sentence-transformers (`all-MiniLM-L6-v2`)
+- **DDD-aware layer detection** — auto-classifies service/repository/domain/controller layers
+- **Multi-phase pipeline** — Plan → Retrieve → Generate → Validate → Repair
+- **7-pass validation** — structural checks, anti-patterns, construction cross-checking against RAG metadata
+- **Targeted repair** — per-category repair strategies with focused LLM prompts
+- **Smart context assembly** — priority-based snippet selection + token-budget optimization
+- **Graph intelligence** — file-level dependency graph + global symbol table for smart mock detection
+- **Session memory** — in-memory or Redis-backed conversation persistence
+- **Event bus + metrics** — decoupled observability with timing, counters, quality rates
+- **Streaming support** — token-by-token streaming to avoid vLLM KV cache blocking
 
 ## Quick Start
 
-### 1. Clone and Setup
+### 1. Prerequisites
+
+- Python 3.11+
+- Docker (for Qdrant)
+- vLLM server with a code model (e.g. `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ`)
+
+### 2. Setup
 
 ```bash
-cd ai-agent
-
-# Create virtual environment
+# Clone & create venv
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate        # Linux/Mac
+.\venv\Scripts\Activate.ps1     # Windows PowerShell
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Copy environment file
+# Configure environment
 cp env.example .env
-# Edit .env with your configuration
+# Edit .env — set QDRANT_HOST, VLLM_BASE_URL, JAVA_REPO_PATH
 ```
 
-### 2. Start Services
+### 3. Start Dependencies
 
 ```bash
-# Bước 1: Chạy Qdrant (vector database)
+# Qdrant only (development)
 docker-compose up -d qdrant
 
-# Bước 2: Chạy AI Agent app (kết nối với vLLM server đã forward port về localhost:8000)
+# Full stack (production)
+docker-compose up -d
+```
+
+### 4. Index a Java Repository
+
+```bash
+# Start the server
 python main.py
 
-# Hoặc chạy với auto-reload khi dev
-python -m uvicorn server.api:app --host 0.0.0.0 --port 8080 --reload
-```
-
-> **Note**: Giả định vLLM server đã chạy và forward port về `localhost:8000`
-
-### 3. Index Your Java Repository
-
-```bash
-# Using curl
+# Index your Java codebase (via API)
 curl -X POST http://localhost:8080/reindex \
   -H "Content-Type: application/json" \
-  -d '{
-    "repo_path": "/path/to/your/java/repo",
-    "recreate": true
-  }'
+  -d '{"repo_path": "/path/to/java/repo"}'
 ```
 
-### 4. Configure Tabby IDE
+### 5. Connect IDE
 
-Xem chi tiết tại [TABBY_SETUP.md](./TABBY_SETUP.md)
+See [TABBY_SETUP.md](TABBY_SETUP.md) for detailed Tabby IDE configuration.
 
-**Quick setup trong VS Code:**
-
-1. Mở Settings (Ctrl+,)
-2. Tìm "Tabby"
-3. Đặt **Tabby: Endpoint** = `http://localhost:8080/v1`
-
-Hoặc trong `settings.json`:
+For Continue IDE, add to `config.json`:
 ```json
 {
-  "tabby.endpoint": "http://localhost:8080/v1"
+  "models": [{
+    "title": "AI Agent",
+    "provider": "openai",
+    "model": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
+    "apiBase": "http://localhost:8080/v1",
+    "apiKey": "token-abc123"
+  }]
 }
-```
-
-### 5. Generate Tests
-
-```bash
-# Qua Tabby chat trong IDE:
-# "Generate unit test for UserService"
-
-# Hoặc qua API trực tiếp:
-curl -X POST http://localhost:8080/generate-test \
-  -H "Content-Type: application/json" \
-  -d '{
-    "file_path": "src/main/java/com/example/service/UserService.java",
-    "task_description": "Generate comprehensive unit tests covering all public methods"
-  }'
 ```
 
 ## API Endpoints
 
-### OpenAI-Compatible (for Tabby)
-
-| Endpoint | Mô tả |
-|----------|-------|
-| `GET /v1/models` | List available models |
-| `POST /v1/chat/completions` | Chat completions (main endpoint) |
-| `POST /v1/completions` | Text completions (legacy) |
-| `GET /v1/health` | Health check |
-
-### Native Endpoints
-
-### Test Generation
-
-#### `POST /generate-test`
-
-Generate unit tests for a Java class.
-
-**Request:**
-```json
-{
-  "file_path": "src/main/java/com/example/service/UserService.java",
-  "class_name": "UserService",
-  "task_description": "Generate tests for user registration flow",
-  "session_id": "optional-session-id"
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "test_code": "// Generated test code...",
-  "class_name": "UserService",
-  "validation_passed": true,
-  "validation_issues": [],
-  "session_id": "uuid-session-id",
-  "rag_chunks_used": 8,
-  "tokens_used": 2500
-}
-```
-
-#### `POST /refine-test`
-
-Refine a previously generated test based on feedback.
-
-**Request:**
-```json
-{
-  "session_id": "uuid-session-id",
-  "feedback": "Add more edge case tests for null inputs"
-}
-```
-
-### Indexing
-
-#### `POST /reindex`
-
-Index or reindex a Java repository.
-
-**Request:**
-```json
-{
-  "repo_path": "/path/to/java/repo",
-  "recreate": false
-}
-```
-
-#### `GET /index/stats`
-
-Get statistics about the vector index.
-
-### Session Management
-
-#### `POST /session` - Create new session
-#### `GET /session/{session_id}` - Get session info
-#### `DELETE /session/{session_id}` - Delete session
-#### `GET /sessions` - List all sessions
-
-### Health
-
-#### `GET /health`
-
-Check service health status.
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `QDRANT_HOST` | Qdrant server host | `localhost` |
-| `QDRANT_PORT` | Qdrant server port | `6333` |
-| `QDRANT_COLLECTION` | Collection name | `java_codebase` |
-| `VLLM_BASE_URL` | vLLM API base URL | `http://localhost:8000/v1` |
-| `VLLM_MODEL` | Model name | `Qwen/Qwen2.5-Coder-7B-Instruct` |
-| `VLLM_API_KEY` | vLLM API key | `token-abc123` |
-| `EMBEDDING_MODEL` | Sentence transformer model | `sentence-transformers/all-MiniLM-L6-v2` |
-| `SERVER_HOST` | Server bind host | `0.0.0.0` |
-| `SERVER_PORT` | Server port | `8080` |
-
-### YAML Configuration Files
-
-- `config/agent.yaml` - Agent orchestrator settings
-- `config/rag.yaml` - RAG and Qdrant settings
-- `config/vllm.yaml` - vLLM client settings
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (main IDE integration) |
+| `GET`  | `/v1/models` | List available models |
+| `POST` | `/generate-test` | Native test generation endpoint |
+| `POST` | `/refine-test` | Refine generated test with feedback |
+| `POST` | `/reindex` | Index/re-index a Java repository |
+| `GET`  | `/index/stats` | Qdrant index statistics |
+| `GET`  | `/index/lookup/{class_name}` | Diagnostic: inspect indexed class payload |
+| `GET`  | `/health` | Health check |
+| `GET`  | `/metrics` | Prometheus-style metrics |
+| `POST` | `/session/create` | Create a new session |
+| `GET`  | `/session/{id}` | Get session state |
+| `DELETE` | `/session/{id}` | Delete session |
 
 ## Project Structure
 
 ```
 ai-agent/
-├── agent/
-│   ├── orchestrator.py    # Main workflow coordination
-│   ├── prompt.py          # Prompt construction
-│   ├── rules.py           # Test generation rules
-│   └── memory.py          # Session memory management
-├── indexer/
-│   ├── parse_java.py      # Tree-sitter Java parser
-│   ├── summarize.py       # Code summarization
-│   └── build_index.py     # Qdrant index builder
-├── rag/
-│   ├── client.py          # RAG query client
-│   └── schema.py          # Data models
-├── server/
-│   ├── api.py             # FastAPI endpoints
-│   └── session.py         # Session management
-├── vllm/
-│   └── client.py          # vLLM API client
-├── config/
-│   ├── agent.yaml
-│   ├── rag.yaml
-│   └── vllm.yaml
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-└── README.md
+├── main.py                 # Entry point (uvicorn server)
+├── requirements.txt        # Python dependencies
+├── env.example             # Environment template
+├── Dockerfile              # Container image
+├── docker-compose.yml      # Full stack (agent + qdrant + vllm + redis)
+├── download_model.py       # Download embedding model for offline use
+├── benchmark.py            # API performance benchmark suite
+├── TABBY_SETUP.md          # Tabby IDE integration guide
+│
+├── agent/                  # Core orchestration (state machine, planner, prompt, validation, repair)
+├── server/                 # FastAPI HTTP layer (OpenAI-compatible API)
+├── rag/                    # Qdrant vector search client
+├── vllm/                   # LLM client (OpenAI-compatible)
+├── indexer/                # Java parsing + embedding + indexing
+├── context/                # Smart context assembly (snippet selection, token optimization)
+├── intelligence/           # Repo structural intelligence (graph, symbol map)
+├── config/                 # YAML configurations
+├── models/                 # Downloaded embedding model (gitignored)
+├── benchmark/              # Benchmark results (gitignored)
+└── tests/                  # Development test suites
 ```
 
-## Test Generation Rules
+Each folder has its own `README.md` with detailed documentation.
 
-The agent enforces these rules for generated tests:
+## Configuration
 
-1. **JUnit 5 Only**: Uses `@Test`, `@BeforeEach`, `@DisplayName`, `@Nested`
-2. **Mockito Only**: Uses `@Mock`, `@InjectMocks`, `@ExtendWith(MockitoExtension.class)`
-3. **No Spring Context**: Never uses `@SpringBootTest`, `@DataJpaTest`, `@WebMvcTest`
-4. **AAA Pattern**: All tests follow Arrange-Act-Assert with clear comments
-5. **Interaction Verification**: Uses `verify()` to check mock interactions
-6. **Meaningful Names**: Uses `@DisplayName` for readable test descriptions
+All configuration is via environment variables (see [env.example](env.example)):
 
-## Example Usage with curl
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QDRANT_HOST` | `localhost` | Qdrant server host |
+| `QDRANT_PORT` | `6333` | Qdrant server port |
+| `QDRANT_COLLECTION` | `java_codebase` | Qdrant collection name |
+| `VLLM_BASE_URL` | `http://localhost:8000/v1` | vLLM server URL |
+| `VLLM_MODEL` | `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | Model identifier |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model |
+| `JAVA_REPO_PATH` | — | Java repo to index |
+| `SERVER_PORT` | `8080` | API server port |
+| `MEMORY_BACKEND` | `memory` | `memory` (dev) or `redis` (prod) |
+
+YAML config files in `config/` provide detailed tuning for agent behavior, RAG search, and LLM generation parameters.
+
+## Docker
 
 ```bash
-# 1. Check health
-curl http://localhost:8080/health
+# Development: only dependencies
+docker-compose up -d qdrant redis
 
-# 2. Index repository
-curl -X POST http://localhost:8080/reindex \
-  -H "Content-Type: application/json" \
-  -d '{"repo_path": "/app/repo", "recreate": true}'
+# Production: full stack (requires NVIDIA GPU for vLLM)
+docker-compose up -d
 
-# 3. Check index stats
-curl http://localhost:8080/index/stats
-
-# 4. Create a session
-curl -X POST http://localhost:8080/session
-
-# 5. Generate test
-curl -X POST http://localhost:8080/generate-test \
-  -H "Content-Type: application/json" \
-  -d '{
-    "file_path": "src/main/java/com/example/service/OrderService.java",
-    "session_id": "your-session-id"
-  }'
-
-# 6. Refine test with feedback
-curl -X POST http://localhost:8080/refine-test \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "your-session-id",
-    "feedback": "Add tests for concurrent order processing"
-  }'
+# With monitoring tools
+docker-compose --profile tools up -d
 ```
 
-## Running vLLM
-
-The agent expects a vLLM server running with an OpenAI-compatible API:
+## Running Tests
 
 ```bash
-# Example: Run vLLM with Qwen2.5-Coder
-python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen2.5-Coder-7B-Instruct \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --api-key token-abc123
-```
+# Phase 3/4 tests (validation, repair, events, metrics)
+python -m pytest tests/test_phase3_4.py -v
 
-## Development
+# Phase 1 tests (state machine, planner)
+python tests/test_phase1.py
 
-```bash
-# Run with auto-reload
-python -m uvicorn server.api:app --reload --host 0.0.0.0 --port 8080
+# Phase 2 tests (intelligence, context)
+python tests/test_phase2.py
 
-# Run tests (if you add them)
-pytest tests/
-
-# Format code
-black .
-isort .
+# E2E trace test (AuthUseCaseService scenario)
+python tests/_test_e2e_trace.py
 ```
 
 ## License
 
-MIT License
+Internal use only.
 
