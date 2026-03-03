@@ -60,6 +60,9 @@ class CodeChunk(BaseModel):
     fields: list[FieldSchema] = Field(default_factory=list)
     # For Java records: record components (fields of a record)
     record_components: list[FieldSchema] = Field(default_factory=list)
+    # Types that were requested from RAG but NOT found in the index
+    # Orchestrator sets this on the main_chunk so prompt builder can warn LLM
+    unfound_types: list[str] = Field(default_factory=list)
 
 
 class MetadataFilter(BaseModel):
