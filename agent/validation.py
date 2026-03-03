@@ -46,6 +46,15 @@ class IssueCategory(str, Enum):
     STRUCTURAL = "structural"
     NAMING = "naming"
     QUALITY = "quality"
+    # Anti-pattern categories
+    STATIC_CALL_WITHOUT_MOCK = "static_call_without_mock"
+    INCONSISTENT_MOCK_VALUE = "inconsistent_mock_value"
+    DATETIME_NOW_IN_TEST = "datetime_now_in_test"
+    MISSING_MOCK_FIELD = "missing_mock_field"
+    RAW_VALUE_INSTEAD_OF_ENUM = "raw_value_instead_of_enum"
+    CHAINED_VERIFY_ON_STATIC = "chained_verify_on_static"
+    DOMAIN_TYPE_GUESSING = "domain_type_guessing"
+    WRONG_CONSTRUCTION_PATTERN = "wrong_construction_pattern"
 
 
 @dataclass
@@ -147,8 +156,16 @@ class ValidationPipeline:
         ("@DisplayName", IssueSeverity.WARNING, IssueCategory.MISSING_DISPLAY_NAME),
     ]
 
-    def validate(self, code: str) -> ValidationResult:
-        """Run the full validation pipeline on generated test code."""
+    def validate(self, code: str, rag_chunks: list | None = None) -> ValidationResult:
+        """Run the full validation pipeline on generated test code.
+
+        Args:
+            code: The generated Java test code.
+            rag_chunks: Optional RAG context chunks. When provided, enables
+                        Pass 7 (construction pattern cross-check) which detects
+                        .builder() on records without @Builder, wrong field
+                        names, etc.
+        """
         result = ValidationResult(code_length=len(code))
 
         if not code or len(code.strip()) < 50:
@@ -173,6 +190,13 @@ class ValidationPipeline:
 
         # Pass 5: Quality checks
         self._check_quality(code, result)
+
+        # Pass 6: Anti-pattern detection (complex service issues)
+        self._check_anti_patterns(code, result)
+
+        # Pass 7: RAG-aware construction pattern cross-check
+        if rag_chunks:
+            self._check_construction_patterns(code, rag_chunks, result)
 
         # Count tests and mocks
         result.test_count = len(re.findall(r"@Test\b", code))
@@ -314,3 +338,265 @@ class ValidationPipeline:
                 category=IssueCategory.QUALITY,
                 suggestion="Add @BeforeEach void setUp() for common test data initialization",
             ))
+
+    def _check_anti_patterns(self, code: str, result: ValidationResult) -> None:
+        """Pass 6: Detect common anti-patterns that cause compilation/runtime failures.
+
+        These are the most frequent issues when generating tests for complex services
+        with SecurityContextHolder, multiple dependencies, and domain models.
+        """
+        # --- AP1: SecurityContextHolder used without MockedStatic ---
+        has_security_context_holder = bool(
+            re.search(r"\bSecurityContextHolder\b", code)
+        )
+        has_mocked_static_security = bool(
+            re.search(r"MockedStatic\s*<\s*SecurityContextHolder\s*>", code)
+        )
+        if has_security_context_holder and not has_mocked_static_security:
+            # Direct call like SecurityContextHolder.setContext() or .getContext()
+            result.issues.append(ValidationIssue(
+                message="SecurityContextHolder used without MockedStatic — will leak state between tests",
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.STATIC_CALL_WITHOUT_MOCK,
+                suggestion=(
+                    "Use MockedStatic<SecurityContextHolder> with try-with-resources: "
+                    "try (MockedStatic<SecurityContextHolder> m = mockStatic(SecurityContextHolder.class)) { ... }"
+                ),
+            ))
+
+        # --- AP2: Other common static utility calls without MockedStatic ---
+        static_utils = [
+            (r"\bLocalDateTime\.now\(\)", "LocalDateTime.now()", "LocalDateTime"),
+            (r"\bLocalDate\.now\(\)", "LocalDate.now()", "LocalDate"),
+            (r"\bInstant\.now\(\)", "Instant.now()", "Instant"),
+            (r"\bUUID\.randomUUID\(\)", "UUID.randomUUID()", "UUID"),
+        ]
+        for pattern, name, class_name in static_utils:
+            if re.search(pattern, code):
+                has_mock = bool(re.search(
+                    rf"MockedStatic\s*<\s*{class_name}\s*>", code
+                ))
+                if not has_mock:
+                    # Check if it's in test data (problematic) vs in import (ok)
+                    # Only flag if used in method body, not in import
+                    in_method = bool(re.search(
+                        rf"void\s+\w+\(.*?\).*?\{{[^}}]*{re.escape(name)}",
+                        code, re.DOTALL
+                    ))
+                    if in_method:
+                        result.issues.append(ValidationIssue(
+                            message=(
+                                f"{name} in test data — value will differ from runtime. "
+                                f"Use ArgumentCaptor, any() matcher, or MockedStatic<{class_name}>"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            category=IssueCategory.DATETIME_NOW_IN_TEST,
+                            suggestion=f"Replace {name} with a fixed value, ArgumentCaptor, or MockedStatic",
+                        ))
+
+        # --- AP3: @InjectMocks but potentially missing @Mock fields ---
+        # Extract the @InjectMocks class type
+        inject_match = re.search(
+            r"@InjectMocks\s+(?:private\s+)?(\w+)\s+\w+", code
+        )
+        mock_fields = re.findall(
+            r"@Mock\s+(?:private\s+)?(\w+)\s+\w+", code
+        )
+        if inject_match and len(mock_fields) == 0:
+            result.issues.append(ValidationIssue(
+                message=f"@InjectMocks {inject_match.group(1)} has no @Mock fields — all dependencies will be null",
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.MISSING_MOCK_FIELD,
+                suggestion="Add @Mock field for every constructor parameter of the service under test",
+            ))
+
+        # --- AP4: SecurityContextHolder.setContext() direct call ---
+        if re.search(r"SecurityContextHolder\.setContext\s*\(", code):
+            result.issues.append(ValidationIssue(
+                message="SecurityContextHolder.setContext() called directly — use MockedStatic instead",
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.STATIC_CALL_WITHOUT_MOCK,
+                suggestion=(
+                    "Replace SecurityContextHolder.setContext(ctx) with "
+                    "MockedStatic: securityMock.when(SecurityContextHolder::getContext).thenReturn(ctx)"
+                ),
+            ))
+
+        # --- AP5: SecurityContextHolder.getContext() direct call (without MockedStatic) ---
+        if (re.search(r"SecurityContextHolder\.getContext\s*\(", code)
+                and not has_mocked_static_security):
+            result.issues.append(ValidationIssue(
+                message="SecurityContextHolder.getContext() called directly without MockedStatic",
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.STATIC_CALL_WITHOUT_MOCK,
+                suggestion="Wrap in MockedStatic<SecurityContextHolder> try-with-resources block",
+            ))
+
+        # --- AP6: import MockedStatic if SecurityContextHolder is used ---
+        if has_security_context_holder:
+            if "import org.mockito.MockedStatic" not in code:
+                result.issues.append(ValidationIssue(
+                    message="Missing import for MockedStatic (needed for SecurityContextHolder)",
+                    severity=IssueSeverity.WARNING,
+                    category=IssueCategory.MISSING_IMPORT,
+                    suggestion="Add: import org.mockito.MockedStatic;",
+                ))
+
+        # --- AP7: verify() on chained static calls ---
+        # Detect: verify(SecurityContextHolder.getContext().getAuthentication()).getName()
+        # This is fragile/wrong — should verify on the mock variable directly
+        if re.search(
+            r"verify\s*\(\s*SecurityContextHolder\s*\.\s*getContext\s*\(",
+            code,
+        ):
+            result.issues.append(ValidationIssue(
+                message=(
+                    "verify() used on chained SecurityContextHolder.getContext()... call — "
+                    "verify the mock object variable directly instead"
+                ),
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.CHAINED_VERIFY_ON_STATIC,
+                suggestion=(
+                    "Replace verify(SecurityContextHolder.getContext().getAuthentication()).getName() "
+                    "with verify(authentication).getName() — verify on the mock variable, not via static chain"
+                ),
+            ))
+
+        # --- AP8: Overly verbose setUp building domain objects with many fields ---
+        # Heuristic: if setUp has more than 8 builder calls, it's likely guessing fields
+        setup_match = re.search(
+            r"void\s+setUp\s*\(\s*\)\s*\{(.*?)(?=\n\s*(?:@Test|void\s+\w+_))",
+            code, re.DOTALL,
+        )
+        if setup_match:
+            setup_body = setup_match.group(1)
+            builder_field_count = len(re.findall(r"\.\w+\([^)]*\)", setup_body))
+            if builder_field_count > 30:
+                result.issues.append(ValidationIssue(
+                    message=(
+                        f"setUp has {builder_field_count} builder/setter calls — likely guessing "
+                        f"domain type fields. Use mock(Type.class) + stub only accessed fields"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    category=IssueCategory.DOMAIN_TYPE_GUESSING,
+                    suggestion=(
+                        "Instead of building domain objects with many guessed fields in setUp, "
+                        "use mock(Type.class) and stub only the accessors called in the method under test"
+                    ),
+                ))
+    def _check_construction_patterns(
+        self, code: str, rag_chunks: list, result: ValidationResult
+    ) -> None:
+        """Pass 7: Cross-check construction patterns against RAG metadata.
+
+        Detects:
+        - .builder() used on record/class that has NO @Builder
+        - new Constructor() used on class that HAS @Builder (should use builder)
+        - Wrong field names in builder chains (field not in record_components/fields)
+        """
+        for chunk in rag_chunks:
+            name = chunk.class_name
+            if not name:
+                continue
+
+            java_type = getattr(chunk, "java_type", None) or chunk.type
+            has_builder = getattr(chunk, "has_builder", False)
+
+            # --- Check 1: .builder() on type WITHOUT @Builder ---
+            builder_pattern = rf"\b{re.escape(name)}\.builder\s*\("
+            if re.search(builder_pattern, code) and not has_builder:
+                if java_type == "record":
+                    components = getattr(chunk, "record_components", None)
+                    args = ", ".join(rc.name for rc in components) if components else "..."
+                    result.issues.append(ValidationIssue(
+                        message=(
+                            f"{name}.builder() used but {name} is a record WITHOUT @Builder. "
+                            f"Use canonical constructor: new {name}({args})"
+                        ),
+                        severity=IssueSeverity.ERROR,
+                        category=IssueCategory.WRONG_CONSTRUCTION_PATTERN,
+                        suggestion=(
+                            f"Replace {name}.builder()...build() with "
+                            f"new {name}({args})"
+                        ),
+                    ))
+                else:
+                    result.issues.append(ValidationIssue(
+                        message=(
+                            f"{name}.builder() used but {name} does NOT have @Builder annotation"
+                        ),
+                        severity=IssueSeverity.ERROR,
+                        category=IssueCategory.WRONG_CONSTRUCTION_PATTERN,
+                        suggestion=(
+                            f"Use constructor or mock({name}.class) instead of .builder()"
+                        ),
+                    ))
+
+            # --- Check 2: Wrong fields in builder chain ---
+            # If builder IS used (with or without @Builder), check field names
+            # Use parenthesis-depth tracking to extract only chain-level methods,
+            # ignoring nested calls like UUID.fromString() inside arguments.
+            known_fields: set[str] = set()
+            components = getattr(chunk, "record_components", None)
+            fields = getattr(chunk, "fields", None)
+            if components:
+                known_fields = {rc.name for rc in components}
+            elif fields:
+                known_fields = {f.name for f in fields}
+
+            if known_fields:
+                for m in re.finditer(
+                    rf"\b{re.escape(name)}\.builder\s*\(\)", code
+                ):
+                    chain_fields = self._extract_builder_chain_fields(
+                        code, m.end()
+                    )
+                    wrong = [f for f in chain_fields if f not in known_fields]
+                    if wrong:
+                        result.issues.append(ValidationIssue(
+                            message=(
+                                f"{name}: builder uses fields {wrong} "
+                                f"which do NOT exist. Known fields: {sorted(known_fields)}"
+                            ),
+                            severity=IssueSeverity.ERROR,
+                            category=IssueCategory.WRONG_CONSTRUCTION_PATTERN,
+                            suggestion=(
+                                f"Use only these fields for {name}: {sorted(known_fields)}"
+                            ),
+                        ))
+
+    @staticmethod
+    def _extract_builder_chain_fields(code: str, start: int) -> list[str]:
+        """Extract top-level builder method names using paren-depth tracking.
+
+        Scans from `start` (right after `.builder()`) and collects `.fieldName(`
+        only at depth 0, ignoring nested calls like UUID.fromString() inside args.
+        """
+        fields: list[str] = []
+        depth = 0
+        i = start
+        length = len(code)
+        while i < length:
+            c = code[i]
+            if c == '(':
+                depth += 1
+                i += 1
+            elif c == ')':
+                depth -= 1
+                if depth < 0:
+                    break
+                i += 1
+            elif c == '.' and depth == 0:
+                m = re.match(r'\.(\w+)\s*\(', code[i:])
+                if m:
+                    name = m.group(1)
+                    if name not in ("build", "toBuilder"):
+                        fields.append(name)
+                    i += m.end() - 1  # position at '(' — next iter handles depth
+                else:
+                    i += 1
+            elif c == ';':
+                break
+            else:
+                i += 1
+        return fields

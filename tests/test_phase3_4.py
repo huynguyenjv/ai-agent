@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 # ── Bootstrap: avoid heavy imports ──────────────────────────────────
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 for mod_name in [

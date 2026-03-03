@@ -101,6 +101,15 @@ class RepairStrategySelector:
         IssueCategory.STRUCTURAL: "_strategy_structural",
         IssueCategory.NAMING: "_strategy_naming",
         IssueCategory.QUALITY: "_strategy_quality",
+        # Anti-pattern strategies
+        IssueCategory.STATIC_CALL_WITHOUT_MOCK: "_strategy_static_call",
+        IssueCategory.INCONSISTENT_MOCK_VALUE: "_strategy_inconsistent_values",
+        IssueCategory.DATETIME_NOW_IN_TEST: "_strategy_datetime_now",
+        IssueCategory.MISSING_MOCK_FIELD: "_strategy_missing_mock_field",
+        IssueCategory.RAW_VALUE_INSTEAD_OF_ENUM: "_strategy_raw_value",
+        IssueCategory.CHAINED_VERIFY_ON_STATIC: "_strategy_chained_verify",
+        IssueCategory.DOMAIN_TYPE_GUESSING: "_strategy_domain_guessing",
+        IssueCategory.WRONG_CONSTRUCTION_PATTERN: "_strategy_wrong_construction",
     }
 
     def build_repair_plan(
@@ -291,4 +300,158 @@ class RepairStrategySelector:
             priority=40,
             category=IssueCategory.QUALITY,
             context=issue.suggestion or "",
+        )]
+
+    # ── Anti-pattern repair strategies ───────────────────────────────
+
+    def _strategy_static_call(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Replace direct static calls with MockedStatic try-with-resources."""
+        return [RepairInstruction(
+            action=RepairAction.RESTRUCTURE,
+            description="Wrap static utility calls in MockedStatic try-with-resources",
+            priority=5,
+            category=IssueCategory.STATIC_CALL_WITHOUT_MOCK,
+            context=(
+                "CRITICAL: SecurityContextHolder and other static utilities MUST be mocked with "
+                "MockedStatic<SecurityContextHolder>. Replace any direct SecurityContextHolder.setContext() "
+                "or .getContext() calls with:\n"
+                "  try (MockedStatic<SecurityContextHolder> securityMock = mockStatic(SecurityContextHolder.class)) {\n"
+                "      securityMock.when(SecurityContextHolder::getContext).thenReturn(securityContext);\n"
+                "      when(securityContext.getAuthentication()).thenReturn(authentication);\n"
+                "      // ... rest of test ...\n"
+                "  }\n"
+                "Also add: import org.mockito.MockedStatic;"
+            ),
+        )]
+
+    def _strategy_inconsistent_values(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Fix inconsistent literal values between setUp and test methods."""
+        return [RepairInstruction(
+            action=RepairAction.MINOR_FIX,
+            description="Fix inconsistent mock/test data values",
+            priority=10,
+            category=IssueCategory.INCONSISTENT_MOCK_VALUE,
+            context=(
+                "Ensure all literal values are consistent: if setUp creates data with "
+                "'encoded-password', then when(encoder.matches(raw, encoded)) must use "
+                "'encoded-password' — not a different string. Trace every literal value "
+                "to verify consistency between setUp, when(), verify(), and assertEquals()."
+            ),
+        )]
+
+    def _strategy_datetime_now(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Replace LocalDateTime.now() in test data with fixed values or captures."""
+        return [RepairInstruction(
+            action=RepairAction.REPLACE_PATTERN,
+            description="Replace LocalDateTime.now()/Instant.now() with fixed values",
+            priority=12,
+            category=IssueCategory.DATETIME_NOW_IN_TEST,
+            search_pattern="LocalDateTime.now()",
+            replacement="LocalDateTime.of(2024, 1, 15, 10, 30, 0)",
+            context=(
+                "Never use .now() in test expected values — the value at construction time will "
+                "differ from the runtime value inside the method under test. Options:\n"
+                "1. Use a fixed value: LocalDateTime.of(2024, 1, 15, 10, 30, 0)\n"
+                "2. Use ArgumentCaptor to capture the actual value\n"
+                "3. Use any(LocalDateTime.class) in verify()/when() matchers\n"
+                "4. If the method creates the timestamp internally, verify with ArgumentCaptor"
+            ),
+        )]
+
+    def _strategy_missing_mock_field(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Add missing @Mock fields for service dependencies."""
+        return [RepairInstruction(
+            action=RepairAction.ADD_PATTERN,
+            description="Add missing @Mock fields for all service dependencies",
+            priority=3,
+            category=IssueCategory.MISSING_MOCK_FIELD,
+            context=(
+                "CRITICAL: @InjectMocks will set unmocked dependencies to null, causing NPE. "
+                "List ALL constructor parameters of the service under test and add @Mock for each. "
+                "Check the service source code constructor or @RequiredArgsConstructor fields."
+            ),
+        )]
+
+    def _strategy_raw_value(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Replace raw literals with proper enum constants."""
+        return [RepairInstruction(
+            action=RepairAction.MINOR_FIX,
+            description="Replace raw int/string values with enum constants",
+            priority=20,
+            category=IssueCategory.RAW_VALUE_INSTEAD_OF_ENUM,
+            context=(
+                "If source code uses enum constants like UserStatus.ACTIVE, tests must also use "
+                "UserStatus.ACTIVE — not integer 1 or string 'ACTIVE'. Check all when()/verify() "
+                "arguments and assertEquals() expectations for raw values that should be enums."
+            ),
+        )]
+
+    def _strategy_chained_verify(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Fix verify() calls that chain through static utility methods."""
+        return [RepairInstruction(
+            action=RepairAction.REPLACE_PATTERN,
+            description="Replace chained verify on SecurityContextHolder with direct mock verify",
+            priority=8,
+            category=IssueCategory.CHAINED_VERIFY_ON_STATIC,
+            search_pattern="verify(SecurityContextHolder.getContext().getAuthentication())",
+            replacement="verify(authentication)",
+            context=(
+                "Inside MockedStatic block, verify on the mock variable directly:\n"
+                "  verify(authentication).getName();  // CORRECT\n"
+                "NOT: verify(SecurityContextHolder.getContext().getAuthentication()).getName()  // WRONG\n"
+                "The mock objects (authentication, securityContext) should be declared as local variables "
+                "before the try-with-resources block."
+            ),
+        )]
+
+    def _strategy_domain_guessing(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Fix overly verbose setUp that guesses domain type fields."""
+        return [RepairInstruction(
+            action=RepairAction.RESTRUCTURE,
+            description="Replace guessed domain builders with mock(Type.class) + stub accessors",
+            priority=7,
+            category=IssueCategory.DOMAIN_TYPE_GUESSING,
+            context=(
+                "The setUp method has too many builder/setter calls, suggesting domain type fields "
+                "are being guessed. Replace with:\n"
+                "  User user = mock(User.class);\n"
+                "  when(user.id()).thenReturn(UUID.fromString(userId));\n"
+                "  when(user.email()).thenReturn(email);\n"
+                "Only stub the accessors that the method under test actually calls. "
+                "Move domain object creation inside each test method for self-containment."
+            ),
+        )]
+
+    def _strategy_wrong_construction(
+        self, issue: ValidationIssue, result: ValidationResult
+    ) -> list[RepairInstruction]:
+        """Fix wrong construction pattern (e.g., .builder() on record without @Builder)."""
+        return [RepairInstruction(
+            action=RepairAction.REPLACE,
+            description=issue.suggestion or "Fix construction pattern to match actual class definition",
+            priority=9,  # High priority — causes compilation failure
+            category=IssueCategory.WRONG_CONSTRUCTION_PATTERN,
+            context=(
+                f"COMPILATION ERROR: {issue.message}\n"
+                "The generated code uses a construction pattern that does not exist for this type. "
+                "Check the Domain Types section in context for the exact construction hint.\n"
+                "- Records without @Builder: use new RecordName(field1, field2, ...)\n"
+                "- Records with @Builder: use RecordName.builder().field(value).build()\n"
+                "- If fields are wrong, use ONLY the fields listed in the context.\n"
+                "- If the type source is unknown, use mock(Type.class) + stub accessors."
+            ),
         )]

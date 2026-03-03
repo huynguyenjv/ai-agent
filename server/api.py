@@ -579,6 +579,62 @@ async def get_index_stats():
     return stats.model_dump()
 
 
+@app.get("/index/lookup/{class_name}")
+async def lookup_class(class_name: str):
+    """Diagnostic: check if a class is indexed in Qdrant and what info is stored.
+
+    Usage: GET /index/lookup/UserProfile
+    Returns the full payload stored in Qdrant for that class, including
+    fields, record_components, usage_hint, used_types, has_builder, etc.
+    Useful for debugging why the LLM generates wrong construction patterns.
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    rag = orchestrator.rag
+
+    # Tier 1: metadata scroll (guaranteed find)
+    chunk = rag._scroll_by_class_name(class_name)
+    lookup_method = "scroll"
+
+    # Tier 2: semantic search fallback
+    if not chunk:
+        result = rag.search_by_class(class_name, top_k=1, include_dependencies=False)
+        chunk = result.chunks[0] if result.chunks else None
+        lookup_method = "semantic"
+
+    if not chunk:
+        return {
+            "found": False,
+            "class_name": class_name,
+            "message": f"'{class_name}' NOT found in Qdrant index. Re-index the codebase.",
+        }
+
+    return {
+        "found": True,
+        "lookup_method": lookup_method,
+        "class_name": chunk.class_name,
+        "fully_qualified_name": chunk.fully_qualified_name,
+        "package": chunk.package,
+        "element_type": chunk.element_type,
+        "java_type": chunk.java_type,
+        "is_record": chunk.java_type == "record",
+        "has_builder": chunk.has_builder,
+        "has_data": chunk.has_data,
+        "has_value": chunk.has_value,
+        "record_components": [
+            {"type": rc.type, "name": rc.name} for rc in (chunk.record_components or [])
+        ],
+        "fields": [
+            {"type": f.type, "name": f.name} for f in (chunk.fields or [])
+        ],
+        "used_types": chunk.used_types,
+        "dependencies": chunk.dependencies,
+        "annotations": chunk.annotations,
+        "summary": chunk.summary,
+    }
+
+
 @app.post("/session", response_model=SessionInfo)
 async def create_session():
     """Create a new session."""
