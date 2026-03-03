@@ -4,7 +4,7 @@ vLLM client for OpenAI-compatible API.
 
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Generator
 
 import httpx
 import structlog
@@ -244,10 +244,72 @@ class VLLMClient:
             logger.error("vLLM request failed", error=str(e))
             return GenerationResponse(success=False, error=str(e))
 
-    def health_check(self) -> bool:
-        """Check if vLLM server is healthy."""
+    # -----------------------------------------------------------------
+    # Streaming iterator — yields delta strings for real SSE passthrough
+    # -----------------------------------------------------------------
+
+    def stream_generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Generator[str, None, None]:
+        """Yield content delta strings as they arrive from vLLM.
+
+        Unlike ``generate()`` this does **not** buffer the full response.
+        Each ``yield`` is a small text delta that can be forwarded
+        immediately to an SSE client (Continue / Tabby / etc.).
+
+        Usage::
+
+            for chunk in vllm.stream_generate(sys, usr):
+                send_sse(chunk)
+        """
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature or self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "top_p": self.top_p,
+            "stream": True,
+        }
+
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line or line.startswith(":"):
+                    continue
+
+                if line.startswith("data: "):
+                    data_str = line[6:]
+
+                    if data_str.strip() == "[DONE]":
+                        return
+
+                    try:
+                        data = json.loads(data_str)
+                        choice = data.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+
+                        if "content" in delta and delta["content"]:
+                            yield delta["content"]
+
+                    except json.JSONDecodeError:
+                        continue
+
+    def health_check(self, timeout: float = 5.0) -> bool:
+        """Check if vLLM server is healthy (with short timeout)."""
         try:
-            response = self.client.get(f"{self.base_url}/models")
+            response = self.client.get(f"{self.base_url}/models", timeout=timeout)
             return response.status_code == 200
         except Exception:
             return False

@@ -118,13 +118,120 @@ If record does NOT have @Builder annotation, NEVER use builder pattern.
 Do NOT use new ClassName(...) if class/record has @Builder (use builder pattern instead)
 Do NOT assume .toBuilder() exists unless @Builder(toBuilder=true) is present
 
+IMPORT RULE (CRITICAL — COPY EXACTLY)
+- Copy ALL imports verbatim from the source service code.
+- In particular, check the EXACT package for each type:
+    E.g., if the service imports `vtrip.tech.microservice.core.starter.security.ActorType`,
+    then the test MUST import from `vtrip.tech.microservice.core.starter.security.ActorType`
+    — NOT from a guessed package like `vtrip.app.domain.auth.ActorType`.
+- For EVERY type used in the test that also appears in the service source code,
+  use the EXACT same import statement. Do NOT guess or infer a different package.
+
 STATIC UTILITIES (ONLY IF PRESENT IN SOURCE)
 - If service uses static utilities: mock via Mockito MockedStatic (try-with-resources).
+- SecurityContextHolder, LocalDateTime.now(), UUID.randomUUID() → MUST use MockedStatic.
+  Example (MANDATORY pattern for SecurityContextHolder):
+  ```
+  // Declare mock objects BEFORE the try block
+  Authentication authentication = mock(Authentication.class);
+  SecurityContext securityContext = mock(SecurityContext.class);
+
+  try (MockedStatic<SecurityContextHolder> securityMock =
+           mockStatic(SecurityContextHolder.class)) {
+      securityMock.when(SecurityContextHolder::getContext).thenReturn(securityContext);
+      when(securityContext.getAuthentication()).thenReturn(authentication);
+      when(authentication.getName()).thenReturn("user@example.com");
+      // ... Act & Assert ...
+
+      // VERIFY on the mock object directly:
+      verify(authentication).getName();          // ✅ CORRECT
+      // verify(SecurityContextHolder.getContext().getAuthentication()).getName();  ❌ WRONG
+  }
+  ```
+  NEVER call SecurityContextHolder.setContext() or .getContext() directly in tests.
+  NEVER verify via chained static calls — verify on the mock object variable instead.
+
+INTERMEDIATE MOCK CALLS (CRITICAL)
+- If the source code calls a dependency method and passes the result to another call:
+  ```
+  jwtUseCase.createToken(ActorType.USER_ACTOR, id,
+      jwtUseCase.buildClaims(ActorType.USER_ACTOR, refId, provider));
+  ```
+  You MUST mock BOTH calls:
+  ```
+  Map<String, Object> claims = Map.of("role", "user");
+  when(jwtUseCase.buildClaims(eq(ActorType.USER_ACTOR), eq(refId), eq(provider))).thenReturn(claims);
+  when(jwtUseCase.createToken(eq(ActorType.USER_ACTOR), eq(id), eq(claims))).thenReturn(jwtToken);
+  ```
+  If you skip mocking `buildClaims()`, it returns null, and `createToken()` gets null as argument.
+  Trace EVERY dependency call in order, mock ALL of them.
+
+DOMAIN TYPE SAFETY (CRITICAL)
+- If a domain type (UserProfile, User, etc.) is NOT provided in the Codebase Context section:
+  DO NOT guess its builder fields, constructor args, or accessor methods.
+  Instead:
+  1. Use `mock(ClassName.class)` and stub ONLY the accessors actually called in the method body.
+     Example: if the source calls `user.id()`, `user.email()`, `user.refUserId()`, stub ONLY those:
+     ```
+     User user = mock(User.class);
+     when(user.id()).thenReturn(UUID.fromString(userId));
+     when(user.email()).thenReturn(email);
+     when(user.refUserId()).thenReturn(UUID.fromString(refUserId));
+     ```
+  2. If the domain type IS provided in Context, use ONLY the fields/types shown there.
+  3. NEVER invent builder fields not shown in the source or context.
+- This is especially important for types returned by external APIs (e.g., OpenAPIRepository).
 
 NAMING
 - method_WhenCondition_ShouldExpectedResult (do NOT prefix with "test")
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — ANTI-PATTERNS (MUST AVOID)
+
+1. **IMPORT PACKAGE MISMATCH**: Copy imports exactly from the source code.
+   If source has `import vtrip.tech.microservice.core.starter.security.ActorType`,
+   the test MUST use the same import. Do NOT guess a different package.
+
+2. **INCONSISTENT MOCK VALUES**: If setUp creates `userPassword` with field "encoded-password",
+   then when(encoder.matches(raw, encoded)) MUST use "encoded-password" — NOT a different string.
+   Rule: every literal in when()/verify() MUST match the data used in that test method.
+
+3. **MISSING @Mock DEPENDENCIES**: Count ALL constructor parameters of the service under test.
+   Each one MUST have a corresponding @Mock field. If you miss one, @InjectMocks will fail.
+   BEFORE writing tests, LIST all constructor params and create @Mock for each.
+
+4. **LocalDateTime.now() / Instant.now() IN TEST DATA**: Never construct expected objects
+   with `.now()` — the value at construction time ≠ the value inside the method under test.
+   Instead: use ArgumentCaptor to capture the actual object, OR use any() matcher, OR
+   mock the clock.
+
+5. **OVERLY VERBOSE setUp**: @BeforeEach should initialize ONLY shared data like userId, email.
+   DO NOT pre-build every domain object in setUp — build them inside each test method so
+   each test is self-contained and values are guaranteed consistent.
+   If a domain type source is NOT provided, use mock(Type.class) + stub accessors.
+
+6. **MISSING INTERMEDIATE MOCK CHAINS**: If method calls `dep.foo()` and passes the result
+   to `dep.bar(dep.foo())`, you MUST mock BOTH `dep.foo()` AND `dep.bar()`.
+   Trace the FULL call chain in the method body, mock EVERY dependency call in order.
+   DO NOT rely on `any()` to skip mocking — the unmocked call returns null → NPE.
+
+7. **GUESSING DOMAIN TYPE BUILDERS**: If the exact source code of a domain type is NOT
+   provided in the Codebase Context, DO NOT build it with .builder() or constructor.
+   Use mock(Type.class) + stub the accessors the method actually calls.
+   This prevents type mismatches, wrong field names, and missing fields.
+
+8. **RAW VALUES INSTEAD OF ENUMS**: If source code uses `user.status().ordinal()`, then
+   `status` is an enum — use the enum constant (e.g., UserStatus.ACTIVE), NOT integer 1.
+
+9. **WRONG CONSTRUCTION PATTERN**: DO NOT use .builder() if the class/record has no @Builder.
+   DO NOT use new Constructor() if the class has @Builder. Follow the construction hints
+   provided in the Domain Types section EXACTLY.
+
+10. **VERIFY ON CHAINED STATIC CALLS**: Inside MockedStatic, verify mock objects DIRECTLY:
+    `verify(authentication).getName()` ✅ — NOT `verify(SecurityContextHolder.getContext().getAuthentication()).getName()` ❌
+
 If any required signature is missing, DO NOT INVENT:
+- Use mock(Type.class) + stub accessors for unknown domain types.
 - Write only safe tests + list exactly what missing source is needed to complete.
 
 NOW: analyze and write tests for the following service:
@@ -246,15 +353,30 @@ NOW: analyze and write tests for the following service:
                     if construction:
                         parts.append(construction)
 
-                    # List record components or fields for reference
+                    # List record components or fields — ALL of them, with exact types
                     if (java_type == "record") and getattr(dt, "record_components", None):
                         comp_str = ", ".join(f"{rc.type} {rc.name}" for rc in dt.record_components)
-                        parts.append(f"Record components: `{comp_str}`")
+                        parts.append(f"Record components (EXACT — do not add/change): `{comp_str}`")
                     elif getattr(dt, "fields", None):
-                        field_str = ", ".join(f"{f.type} {f.name}" for f in dt.fields[:15])
-                        parts.append(f"Fields: `{field_str}`")
+                        # Show ALL fields, not truncated — exact types matter
+                        field_str = ", ".join(f"{f.type} {f.name}" for f in dt.fields)
+                        parts.append(f"Fields (EXACT — do not add/change): `{field_str}`")
 
                     parts.append(f"```\n{dt.summary}\n```")
+
+            # ── Unfound domain types: explicitly instruct LLM to mock ──
+            unfound = getattr(main_class, "unfound_types", []) if main_class else []
+            if unfound:
+                parts.append("\n### ⚠️ Domain Types NOT FOUND in Codebase Index")
+                parts.append(
+                    "The following types are referenced by imports/dependencies but "
+                    "their source code is NOT available. **DO NOT guess their fields, "
+                    "constructors, or builder patterns.** Use `mock(Type.class)` and "
+                    "stub ONLY the accessors actually called in the method body.\n"
+                )
+                for uf in unfound:
+                    parts.append(f"- **{uf}** → `{uf} obj = mock({uf}.class);` then `when(obj.field()).thenReturn(value);`")
+                parts.append("")
 
             # Service dependencies (truncated)
             if dependencies:
@@ -300,8 +422,16 @@ NOW: analyze and write tests for the following service:
 3. Include @DisplayName for all tests
 4. Verify all mock interactions
 5. Test ONLY behaviors visible in the source code — do NOT invent exceptions
-6. Generate complete, compilable code with imports
-7. If method just delegates, test delegation only (no failure path)""")
+6. Generate complete, compilable code with correct imports (COPY imports from source)
+7. If method just delegates, test delegation only (no failure path)
+8. ALL constructor dependencies MUST have @Mock — count them before writing
+9. SecurityContextHolder / static utilities → MUST use MockedStatic with try-with-resources
+10. NEVER use LocalDateTime.now() in expected test data — use ArgumentCaptor or any()
+11. Keep literal values consistent: same value in setUp/when/verify/assertEquals
+12. If domain type source NOT provided → use mock(Type.class) + stub only accessed fields
+13. Mock ALL intermediate dependency calls (e.g., buildClaims before createToken)
+14. Verify MockedStatic via mock object variables, NOT chained static calls
+15. Use enum constants from source, NOT raw int/string equivalents""")
 
         return "\n".join(parts)
 

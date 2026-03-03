@@ -76,8 +76,15 @@ if DISABLE_SSL_VERIFY:
 # =============================================================================
 
 import structlog
+import logging
 import uvicorn
 from dotenv import load_dotenv
+
+# Set root logger level from env (defaults to INFO — silences DEBUG from httpx, urllib3, etc.)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(message)s")
+# Quiet noisy third-party loggers
+for _name in ("httpx", "httpcore", "urllib3", "sentence_transformers"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 # Configure structured logging
 structlog.configure(
