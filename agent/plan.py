@@ -18,6 +18,7 @@ class TaskType(str, Enum):
     TEST_GENERATION = "test_generation"
     REFINEMENT = "refinement"
     GENERAL_CHAT = "general_chat"
+    INCREMENTAL_UPDATE = "incremental_update"
 
 
 class StepAction(str, Enum):
@@ -31,6 +32,8 @@ class StepAction(str, Enum):
     EXTRACT_CODE = "extract_code"
     RECORD_SESSION = "record_session"
     REPAIR_CODE = "repair_code"
+    ANALYZE_EXISTING_TEST = "analyze_existing_test"
+    MERGE_TESTS = "merge_tests"
 
 
 class StepStatus(str, Enum):

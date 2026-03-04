@@ -50,7 +50,7 @@ session_manager: SessionManager = SessionManager()
 # Thread pool for running blocking operations
 # Use limited workers to prevent resource exhaustion
 _executor: Optional[ThreadPoolExecutor] = None
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 
 # Rate limiting configuration
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))  # requests per window
@@ -325,20 +325,46 @@ async def _periodic_session_cleanup():
             logger.error("Session cleanup failed", error=str(e))
 
 
+# Track active executor tasks for observability
+_active_tasks: int = 0
+_active_tasks_lock = __import__("threading").Lock()
+
+
 async def run_in_executor(func, *args):
     """Run a blocking function in the thread pool with timeout."""
+    global _active_tasks
     loop = asyncio.get_event_loop()
+
+    with _active_tasks_lock:
+        _active_tasks += 1
+        current = _active_tasks
+
+    logger.debug(
+        "Submitting task to executor",
+        func=func.__name__,
+        active_tasks=current,
+        max_workers=MAX_WORKERS,
+    )
+
     try:
         return await asyncio.wait_for(
             loop.run_in_executor(_executor, func, *args),
             timeout=REQUEST_TIMEOUT
         )
     except asyncio.TimeoutError:
-        logger.error("Request timed out", timeout=REQUEST_TIMEOUT)
+        logger.error(
+            "Request timed out",
+            func=func.__name__,
+            timeout=REQUEST_TIMEOUT,
+            active_tasks=_active_tasks,
+        )
         raise HTTPException(
             status_code=504,
             detail=f"Request timed out after {REQUEST_TIMEOUT} seconds"
         )
+    finally:
+        with _active_tasks_lock:
+            _active_tasks -= 1
 
 
 def check_rate_limit(client_ip: str) -> bool:
@@ -464,14 +490,18 @@ async def health_check():
     )
 
 
-@app.post("/generate-test", response_model=GenerateTestResponse)
+@app.post("/generate-test", response_model=GenerateTestResponse, deprecated=True)
 async def generate_test(request: GenerateTestRequest):
     """Generate unit tests for a Java class.
+
+    .. deprecated::
+        Use ``POST /pipeline/generate`` instead for CI/CD integration.
+        This endpoint is kept for backward compatibility.
 
     Request body::
 
         {
-            "file_path": "C:\\path\\to\\MyService.java",
+            "file_path": "C:\\\\path\\\\to\\\\MyService.java",
             "task_description": "Generate comprehensive unit tests covering all public methods"
         }
 
@@ -661,6 +691,253 @@ async def delete_session(session_id: str):
 async def list_sessions():
     """List all active sessions."""
     return session_manager.list_sessions()
+
+
+# ============================================================================
+# Pipeline API — CI/CD Integration (GitLab, Jenkins, etc.)
+# ============================================================================
+
+class PipelineGenerateRequest(BaseModel):
+    """Request for pipeline-driven test generation.
+
+    The CI script handles:
+      - git diff to find changed files
+      - detecting existing test files
+      - reading source code from disk
+
+    The agent only receives explicit inputs — no auto-detection.
+    """
+
+    file_path: str = Field(..., description="Path to the Java source file")
+    class_name: Optional[str] = Field(
+        None, description="Class name (auto-extracted from file_path if absent)"
+    )
+    task_description: Optional[str] = Field(
+        "Generate comprehensive unit tests covering all public methods",
+        description="What to generate",
+    )
+    mode: Literal["full", "incremental"] = Field(
+        "full",
+        description=(
+            "'full' = generate complete test class from scratch; "
+            "'incremental' = add tests for new/changed methods only"
+        ),
+    )
+    existing_test_code: Optional[str] = Field(
+        None,
+        description="Content of the existing test file (required for mode='incremental')",
+    )
+    changed_methods: Optional[list[str]] = Field(
+        None,
+        description="List of changed/added method names (optional, for incremental mode)",
+    )
+
+
+class PipelineGenerateResponse(BaseModel):
+    """Response from pipeline test generation."""
+
+    success: bool
+    test_code: Optional[str] = None
+    class_name: str = ""
+    file_path: str = ""
+    mode: str = "full"
+    validation_passed: bool = True
+    validation_issues: list[str] = Field(default_factory=list)
+    error: Optional[str] = None
+    rag_chunks_used: int = 0
+    tokens_used: int = 0
+    repair_attempts: int = 0
+
+
+class PipelineBatchRequest(BaseModel):
+    """Batch request for generating tests for multiple files."""
+
+    files: list[PipelineGenerateRequest] = Field(
+        ..., description="List of files to generate tests for", min_length=1
+    )
+
+
+class PipelineBatchItemResult(BaseModel):
+    """Result for a single file in a batch."""
+
+    file_path: str
+    class_name: str = ""
+    success: bool
+    test_code: Optional[str] = None
+    mode: str = "full"
+    validation_passed: bool = True
+    validation_issues: list[str] = Field(default_factory=list)
+    error: Optional[str] = None
+    tokens_used: int = 0
+    repair_attempts: int = 0
+
+
+class PipelineBatchResponse(BaseModel):
+    """Response from batch test generation."""
+
+    total: int
+    succeeded: int
+    failed: int
+    results: list[PipelineBatchItemResult]
+
+
+@app.post("/pipeline/generate", response_model=PipelineGenerateResponse)
+async def pipeline_generate(request: PipelineGenerateRequest):
+    """Generate unit tests for a single Java class (CI/CD pipeline).
+
+    Supports two modes:
+      - ``full``: Generate a complete test class from scratch.
+      - ``incremental``: Add tests for new/changed methods to an existing test file.
+        Requires ``existing_test_code``.
+
+    Example (full)::
+
+        POST /pipeline/generate
+        {
+            "file_path": "src/main/java/com/example/UserService.java",
+            "mode": "full"
+        }
+
+    Example (incremental)::
+
+        POST /pipeline/generate
+        {
+            "file_path": "src/main/java/com/example/UserService.java",
+            "mode": "incremental",
+            "existing_test_code": "package com.example; ... existing test class ...",
+            "changed_methods": ["createUser", "updateEmail"]
+        }
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Validate incremental mode requirements
+    if request.mode == "incremental" and not request.existing_test_code:
+        raise HTTPException(
+            status_code=400,
+            detail="existing_test_code is required when mode='incremental'",
+        )
+
+    gen_request = GenerationRequest(
+        file_path=request.file_path,
+        class_name=request.class_name,
+        task_description=request.task_description
+            or "Generate comprehensive unit tests covering all public methods",
+        existing_test_code=request.existing_test_code if request.mode == "incremental" else None,
+        changed_methods=request.changed_methods if request.mode == "incremental" else None,
+    )
+
+    result = await run_in_executor(orchestrator.generate_test, gen_request)
+
+    return PipelineGenerateResponse(
+        success=result.success,
+        test_code=result.test_code,
+        class_name=result.class_name,
+        file_path=request.file_path,
+        mode=request.mode,
+        validation_passed=result.validation_passed,
+        validation_issues=result.validation_issues,
+        error=result.error,
+        rag_chunks_used=result.rag_chunks_used,
+        tokens_used=result.tokens_used,
+        repair_attempts=result.repair_attempts,
+    )
+
+
+@app.post("/pipeline/generate-batch", response_model=PipelineBatchResponse)
+async def pipeline_generate_batch(request: PipelineBatchRequest):
+    """Generate unit tests for multiple Java classes in a single request.
+
+    Designed for CI/CD pipelines processing an MR with multiple changed files.
+    Each file is processed sequentially (to avoid overloading the LLM).
+
+    Example::
+
+        POST /pipeline/generate-batch
+        {
+            "files": [
+                {
+                    "file_path": "src/main/java/com/example/UserService.java",
+                    "mode": "full"
+                },
+                {
+                    "file_path": "src/main/java/com/example/OrderService.java",
+                    "mode": "incremental",
+                    "existing_test_code": "... existing test ...",
+                    "changed_methods": ["placeOrder"]
+                }
+            ]
+        }
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    results: list[PipelineBatchItemResult] = []
+    succeeded = 0
+    failed = 0
+
+    for file_req in request.files:
+        try:
+            # Validate incremental mode requirements
+            if file_req.mode == "incremental" and not file_req.existing_test_code:
+                results.append(PipelineBatchItemResult(
+                    file_path=file_req.file_path,
+                    success=False,
+                    error="existing_test_code is required when mode='incremental'",
+                    mode=file_req.mode,
+                ))
+                failed += 1
+                continue
+
+            gen_request = GenerationRequest(
+                file_path=file_req.file_path,
+                class_name=file_req.class_name,
+                task_description=file_req.task_description
+                    or "Generate comprehensive unit tests covering all public methods",
+                existing_test_code=file_req.existing_test_code if file_req.mode == "incremental" else None,
+                changed_methods=file_req.changed_methods if file_req.mode == "incremental" else None,
+            )
+
+            result = await run_in_executor(orchestrator.generate_test, gen_request)
+
+            results.append(PipelineBatchItemResult(
+                file_path=file_req.file_path,
+                class_name=result.class_name,
+                success=result.success,
+                test_code=result.test_code,
+                mode=file_req.mode,
+                validation_passed=result.validation_passed,
+                validation_issues=result.validation_issues,
+                error=result.error,
+                tokens_used=result.tokens_used,
+                repair_attempts=result.repair_attempts,
+            ))
+
+            if result.success:
+                succeeded += 1
+            else:
+                failed += 1
+
+        except Exception as e:
+            logger.error(
+                "Batch item failed",
+                file_path=file_req.file_path,
+                error=str(e),
+            )
+            results.append(PipelineBatchItemResult(
+                file_path=file_req.file_path,
+                success=False,
+                error=str(e),
+                mode=file_req.mode,
+            ))
+            failed += 1
+
+    return PipelineBatchResponse(
+        total=len(request.files),
+        succeeded=succeeded,
+        failed=failed,
+        results=results,
+    )
 
 
 # ============================================================================
