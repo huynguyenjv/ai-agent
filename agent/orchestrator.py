@@ -48,6 +48,8 @@ class GenerationRequest:
     class_name: Optional[str] = None
     task_description: Optional[str] = None
     session_id: Optional[str] = None
+    existing_test_code: Optional[str] = None
+    changed_methods: Optional[list[str]] = None
 
 
 @dataclass
@@ -164,13 +166,25 @@ class AgentOrchestrator:
             # ── IDLE → PLANNING ──────────────────────────────────────
             sm.transition_to(AgentState.PLANNING, request_file=request.file_path)
 
-            plan = self.planner.plan_test_generation(
-                file_path=request.file_path,
-                class_name=request.class_name,
-                task_description=request.task_description,
-                session_id=request.session_id,
-                max_repair_attempts=self.max_repair_attempts,
-            )
+            # Choose plan based on whether existing test code is provided
+            if request.existing_test_code:
+                plan = self.planner.plan_incremental_update(
+                    file_path=request.file_path,
+                    existing_test_code=request.existing_test_code,
+                    class_name=request.class_name,
+                    task_description=request.task_description,
+                    changed_methods=request.changed_methods,
+                    session_id=request.session_id,
+                    max_repair_attempts=self.max_repair_attempts,
+                )
+            else:
+                plan = self.planner.plan_test_generation(
+                    file_path=request.file_path,
+                    class_name=request.class_name,
+                    task_description=request.task_description,
+                    session_id=request.session_id,
+                    max_repair_attempts=self.max_repair_attempts,
+                )
             sm.plan = plan
 
             # Phase 4: Publish plan created + generation started events
@@ -726,6 +740,12 @@ class AgentOrchestrator:
         elif action == StepAction.REPAIR_CODE:
             self._step_repair_code(sm, plan, step, ctx)
 
+        elif action == StepAction.ANALYZE_EXISTING_TEST:
+            self._step_analyze_existing_test(sm, plan, step, ctx)
+
+        elif action == StepAction.MERGE_TESTS:
+            self._step_merge_tests(sm, plan, step, ctx)
+
         else:
             raise ValueError(f"Unknown step action: {action}")
 
@@ -832,6 +852,17 @@ class AgentOrchestrator:
                 feedback=feedback,
                 validation_issues=issues,
                 rag_chunks=ctx.get("rag_chunks", []),
+            )
+        elif plan.task_type == TaskType.INCREMENTAL_UPDATE:
+            ctx["system_prompt"] = self.prompt_builder.build_system_prompt()
+            ctx["user_prompt"] = self.prompt_builder.build_incremental_update_prompt(
+                class_name=ctx["class_name"],
+                file_path=ctx.get("file_path", plan.file_path),
+                rag_chunks=ctx.get("rag_chunks", []),
+                existing_test_code=plan.metadata.get("existing_test_code", ""),
+                tested_methods=ctx.get("tested_methods", []),
+                changed_methods=plan.metadata.get("changed_methods", []),
+                task_description=plan.metadata.get("task_description"),
             )
         else:
             ctx["system_prompt"] = self.prompt_builder.build_system_prompt()
@@ -999,6 +1030,103 @@ class AgentOrchestrator:
             validation_issues=issues,
             rag_chunks=ctx.get("rag_chunks", []),
         )
+
+    # =====================================================================
+    # New step executors for incremental update
+    # =====================================================================
+
+    def _step_analyze_existing_test(
+        self, sm: StateMachine, plan: ExecutionPlan, step: PlanStep, ctx: dict
+    ) -> None:
+        """Parse existing test code to find which methods are already tested."""
+        existing_code = step.params.get("existing_test_code", "")
+        if not existing_code:
+            ctx["tested_methods"] = []
+            step.result = {"tested_methods": []}
+            return
+
+        tested = self._extract_tested_methods(existing_code)
+        ctx["tested_methods"] = tested
+        step.result = {"tested_methods": tested}
+        logger.info(
+            "Analyzed existing test",
+            class_name=ctx.get("class_name"),
+            tested_methods=tested,
+        )
+
+    def _step_merge_tests(
+        self, sm: StateMachine, plan: ExecutionPlan, step: PlanStep, ctx: dict
+    ) -> None:
+        """Merge newly generated tests into existing test class.
+
+        Strategy: The LLM is instructed to output ONLY new test methods
+        (not the full class), so we insert them into the existing class body.
+        If the LLM returns a full class, we use it as-is (full replacement).
+        """
+        existing_code = step.params.get("existing_test_code", "")
+        new_code = ctx.get("extracted_code", "")
+
+        if not existing_code or not new_code:
+            # Nothing to merge — use generated code as-is
+            step.result = {"merged": False}
+            return
+
+        # Check if LLM returned a full class (has class declaration)
+        if re.search(r'class\s+\w+Test\s*\{', new_code):
+            # Full class returned — use as-is (full replacement)
+            step.result = {"merged": False, "strategy": "full_replacement"}
+            return
+
+        # LLM returned only test methods — merge into existing class
+        merged = self._merge_test_methods(existing_code, new_code)
+        if merged:
+            ctx["extracted_code"] = merged
+            ctx["full_response"] = merged
+            step.result = {"merged": True, "strategy": "method_insert"}
+        else:
+            step.result = {"merged": False, "strategy": "fallback"}
+
+    @staticmethod
+    def _extract_tested_methods(test_code: str) -> list[str]:
+        """Extract method names being tested from test method names.
+
+        Convention: testMethodName_WhenX_ShouldY or methodName_WhenX_ShouldY
+        """
+        tested = set()
+        # Match @Test method names
+        for match in re.finditer(
+            r'(?:@Test|@DisplayName)\s*(?:\([^)]*\))?\s*\n\s*(?:public\s+|private\s+|protected\s+)?void\s+(\w+)',
+            test_code,
+        ):
+            method_name = match.group(1)
+            # Strip test prefix if present
+            if method_name.startswith("test"):
+                method_name = method_name[4:]
+                if method_name:
+                    method_name = method_name[0].lower() + method_name[1:]
+            # Extract the base method name (before _When or _Should)
+            base = method_name.split("_")[0] if "_" in method_name else method_name
+            if base:
+                tested.add(base)
+        return sorted(tested)
+
+    @staticmethod
+    def _merge_test_methods(existing_code: str, new_methods: str) -> Optional[str]:
+        """Insert new test methods into existing test class body."""
+        # Find the last closing brace of the class
+        last_brace = existing_code.rfind("}")
+        if last_brace == -1:
+            return None
+
+        # Insert new methods before the final closing brace
+        merged = (
+            existing_code[:last_brace].rstrip()
+            + "\n\n    // ── Incrementally generated tests ──────────────────────\n\n"
+            + new_methods.strip()
+            + "\n"
+            + existing_code[last_brace:]
+        )
+        return merged
 
     # =====================================================================
     # Helpers (preserved from original orchestrator)
