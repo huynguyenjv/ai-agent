@@ -27,7 +27,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from collections import defaultdict
 
-from agent.orchestrator import AgentOrchestrator, GenerationRequest
+from agent.orchestrator import AgentOrchestrator, GenerationRequest, StreamEvent, StreamPhase
 from agent.events import get_event_bus, Event, EventType
 from agent.metrics import MetricsCollector
 from indexer.build_index import IndexBuilder
@@ -764,8 +764,7 @@ async def chat_completions(request: ChatCompletionRequest):
     created_time = int(time.time())
 
     # ═════════════════════════════════════════════════════════════════
-    # PATH 1: Test generation (full pipeline — always buffered because
-    #         the output needs validation + repair before sending)
+    # PATH 1: Test generation pipeline
     # ═════════════════════════════════════════════════════════════════
     if is_test_request and file_path:
         logger.info("Using test generation pipeline", file_path=file_path)
@@ -773,6 +772,14 @@ async def chat_completions(request: ChatCompletionRequest):
             file_path=file_path,
             task_description=user_content,
         )
+
+        # ── REAL STREAMING: progress phases + token-by-token code ────
+        if request.stream:
+            return _stream_test_generation(
+                response_id, created_time, request.model, gen_request,
+            )
+
+        # ── Non-streaming: run full pipeline, return complete result ─
         result = await run_in_executor(orchestrator.generate_test, gen_request)
 
         if result.success:
@@ -782,14 +789,8 @@ async def chat_completions(request: ChatCompletionRequest):
             response_content = f"Error generating test: {result.error}"
             tokens_used = 0
 
-        # ── Enriched metadata (Fix C) ────────────────────────────────
-        # Append a summary block so Continue / the user can see
-        # validation results without needing a separate API call.
         meta_block = _build_metadata_block(result)
         full_content = f"{response_content}\n\n{meta_block}" if meta_block else response_content
-
-        if request.stream:
-            return _stream_buffered(response_id, created_time, request.model, full_content)
 
         return _non_streaming_response(
             response_id, created_time, request.model,
@@ -884,6 +885,93 @@ def _stream_buffered(
         for i in range(0, len(content), chunk_size):
             yield _sse_chunk(response_id, created_time, model,
                              delta={"content": content[i:i + chunk_size]})
+        # Finish
+        yield _sse_chunk(response_id, created_time, model,
+                         delta={}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+def _stream_test_generation(
+    response_id: str,
+    created_time: int,
+    model: str,
+    gen_request: GenerationRequest,
+) -> StreamingResponse:
+    """Stream test generation with progress phases + token-by-token code.
+
+    Pipes ``orchestrator.generate_test_streaming()`` events directly as SSE:
+    - Phase status messages (planning, retrieving, validating) → full text deltas
+    - Code tokens (generating) → individual token deltas
+    - Done/Error → finish reason
+
+    The client sees output appear progressively, just like Claude or Copilot.
+    """
+
+    async def _generate():
+        # Role chunk
+        yield _sse_chunk(response_id, created_time, model,
+                         delta={"role": "assistant", "content": ""})
+
+        # Run the sync generator in a thread, ferry events via asyncio.Queue
+        queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
+
+        def _run_sync():
+            try:
+                for event in orchestrator.generate_test_streaming(gen_request):
+                    queue.put_nowait(event)
+            except Exception as exc:
+                queue.put_nowait(StreamEvent(
+                    phase=StreamPhase.ERROR,
+                    content=f"Error: {exc}",
+                ))
+            finally:
+                queue.put_nowait(None)  # sentinel
+
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _run_sync)
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+
+            if event.phase == StreamPhase.ERROR:
+                yield _sse_chunk(response_id, created_time, model,
+                                 delta={"content": f"\n\n❌ {event.content}"})
+                break
+
+            if event.phase == StreamPhase.DONE:
+                # Append metadata block
+                meta = event.metadata
+                meta_lines = ["\n\n---"]
+                meta_lines.append(
+                    f"**Validation:** {'✅ passed' if meta.get('validation_passed') else '❌ failed'}"
+                )
+                issues = meta.get("validation_issues", [])
+                if issues:
+                    meta_lines.append(f"**Issues:** {', '.join(issues[:5])}")
+                meta_lines.append(f"**RAG context chunks:** {meta.get('rag_chunks_used', 0)}")
+                meta_lines.append(f"**Tokens used:** {meta.get('tokens_used', 0)}")
+                meta_block = "\n".join(meta_lines)
+                yield _sse_chunk(response_id, created_time, model,
+                                 delta={"content": meta_block})
+                break
+
+            if event.delta:
+                # Token-by-token code delta — forward directly
+                yield _sse_chunk(response_id, created_time, model,
+                                 delta={"content": event.content})
+            else:
+                # Phase status message — send as full content chunk
+                yield _sse_chunk(response_id, created_time, model,
+                                 delta={"content": event.content + "\n"})
+
         # Finish
         yield _sse_chunk(response_id, created_time, model,
                          delta={}, finish_reason="stop")
