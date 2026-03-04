@@ -8,9 +8,10 @@ so the server layer requires zero modifications.
 """
 
 import re
-from typing import Optional
+from typing import Optional, Generator
+from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import structlog
 
@@ -68,6 +69,32 @@ class GenerationResult:
     def __post_init__(self):
         if self.validation_issues is None:
             self.validation_issues = []
+
+
+class StreamPhase(str, Enum):
+    """Phases emitted during streaming test generation."""
+    PLANNING = "planning"
+    RETRIEVING = "retrieving"
+    GENERATING = "generating"
+    VALIDATING = "validating"
+    REPAIRING = "repairing"
+    DONE = "done"
+    ERROR = "error"
+
+
+@dataclass
+class StreamEvent:
+    """A single event in the streaming test generation pipeline.
+
+    - ``phase`` — current pipeline phase
+    - ``content`` — text content (delta for GENERATING, full msg for others)
+    - ``delta`` — True if ``content`` is an incremental token (GENERATING phase)
+    - ``metadata`` — extra info (chunk count, validation result, etc.)
+    """
+    phase: StreamPhase
+    content: str = ""
+    delta: bool = False
+    metadata: dict = field(default_factory=dict)
 
 
 class AgentOrchestrator:
@@ -199,6 +226,271 @@ class AgentOrchestrator:
             if not sm.is_terminal:
                 sm.fail(error=str(e))
             return GenerationResult(success=False, error=str(e))
+
+    # =====================================================================
+    # Streaming API  (progress phases + token-by-token code gen)
+    # =====================================================================
+
+    def generate_test_streaming(
+        self, request: GenerationRequest
+    ) -> Generator[StreamEvent, None, None]:
+        """Generate unit tests with real-time streaming.
+
+        Yields ``StreamEvent`` objects for each phase:
+          PLANNING    → "Planning test generation…"
+          RETRIEVING  → "Searching codebase context…" + chunk count
+          GENERATING  → token-by-token code deltas from vLLM
+          VALIDATING  → "Validating generated code…" + result
+          REPAIRING   → (if needed) "Repairing code…" + re-generate stream
+          DONE        → final metadata (validation summary, tokens)
+          ERROR       → error message
+
+        Usage in API layer::
+
+            for event in orchestrator.generate_test_streaming(req):
+                if event.delta:
+                    send_sse(event.content)  # token delta
+                else:
+                    send_sse_status(event)   # phase update
+        """
+        try:
+            # ── PLANNING ─────────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.PLANNING,
+                content=f"📋 Planning test generation for `{request.file_path}`…",
+            )
+
+            plan = self.planner.plan_test_generation(
+                file_path=request.file_path,
+                class_name=request.class_name,
+                task_description=request.task_description,
+                session_id=request.session_id,
+                max_repair_attempts=self.max_repair_attempts,
+            )
+
+            class_name = plan.class_name
+            if not class_name:
+                yield StreamEvent(
+                    phase=StreamPhase.ERROR,
+                    content="Could not determine class name from file path",
+                )
+                return
+
+            # ── RETRIEVING ───────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.RETRIEVING,
+                content=f"🔍 Searching codebase context for `{class_name}`…",
+            )
+
+            # Resolve session
+            session = None
+            session_id = request.session_id
+            if session_id:
+                session = self.memory_manager.get_or_create_session(session_id)
+                session.set_context(class_name=class_name, file_path=request.file_path)
+
+            # Retrieve RAG context (same logic as _step_retrieve_context)
+            rag_chunks: list[CodeChunk] = []
+            if self.context_builder:
+                try:
+                    context_result = self.context_builder.build_context(
+                        class_name=class_name,
+                        file_path=request.file_path,
+                        session=session,
+                        top_k=self.top_k,
+                    )
+                    rag_chunks = context_result.rag_chunks
+                except Exception:
+                    rag_chunks = self._get_rag_context(
+                        class_name=class_name,
+                        file_path=request.file_path,
+                        session=session,
+                    )
+            else:
+                rag_chunks = self._get_rag_context(
+                    class_name=class_name,
+                    file_path=request.file_path,
+                    session=session,
+                )
+
+            yield StreamEvent(
+                phase=StreamPhase.RETRIEVING,
+                content=f"✅ Found {len(rag_chunks)} context chunks",
+                metadata={"chunks_count": len(rag_chunks)},
+            )
+
+            # ── Build prompt ─────────────────────────────────────────
+            system_prompt = self.prompt_builder.build_system_prompt()
+            user_prompt = self.prompt_builder.build_test_generation_prompt(
+                class_name=class_name,
+                file_path=request.file_path,
+                rag_chunks=rag_chunks,
+                task_description=request.task_description,
+                session=session,
+            )
+
+            # ── GENERATING (stream tokens) ───────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.GENERATING,
+                content=f"⚡ Generating tests for `{class_name}`…\n\n",
+            )
+
+            # Accumulate full response while streaming
+            code_parts: list[str] = []
+            for delta_token in self.vllm.stream_generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            ):
+                code_parts.append(delta_token)
+                yield StreamEvent(
+                    phase=StreamPhase.GENERATING,
+                    content=delta_token,
+                    delta=True,
+                )
+
+            full_response = "".join(code_parts)
+            extracted_code = self._extract_code(full_response)
+
+            # ── VALIDATING ───────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.VALIDATING,
+                content="\n\n🔎 Validating generated code…",
+            )
+
+            validation_result = self.validator.validate(
+                extracted_code, rag_chunks=rag_chunks,
+            )
+
+            tokens_used = len(full_response) // 4  # rough estimate
+
+            if validation_result.passed:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content=f"✅ Validation passed ({validation_result.test_count} test(s), 0 errors)",
+                    metadata={"passed": True, **validation_result.get_summary()},
+                )
+            else:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content=(
+                        f"⚠️ Validation: {len(validation_result.errors)} errors, "
+                        f"{len(validation_result.warnings)} warnings"
+                    ),
+                    metadata={"passed": False, **validation_result.get_summary()},
+                )
+
+                # ── REPAIRING ────────────────────────────────────────
+                for attempt in range(1, self.max_repair_attempts + 1):
+                    yield StreamEvent(
+                        phase=StreamPhase.REPAIRING,
+                        content=f"\n\n🔧 Repair attempt {attempt}/{self.max_repair_attempts}…",
+                        metadata={"attempt": attempt},
+                    )
+
+                    # Build repair prompt
+                    repair_plan = self.repair_selector.build_repair_plan(
+                        validation_result=validation_result,
+                        attempt_number=attempt,
+                        max_attempts=self.max_repair_attempts,
+                    )
+                    repair_section = repair_plan.get_repair_prompt_section()
+                    feedback = (
+                        f"{repair_section}\n\n"
+                        f"Auto-repair attempt {attempt}: fix the following validation issues: "
+                        f"{', '.join(validation_result.error_messages)}"
+                    )
+
+                    repair_system = self.prompt_builder.build_system_prompt()
+                    repair_user = self.prompt_builder.build_refinement_prompt(
+                        original_code=extracted_code,
+                        feedback=feedback,
+                        validation_issues=validation_result.error_messages,
+                        rag_chunks=rag_chunks,
+                    )
+
+                    # Stream repair generation
+                    yield StreamEvent(
+                        phase=StreamPhase.GENERATING,
+                        content=f"\n\n⚡ Re-generating (repair {attempt})…\n\n",
+                    )
+
+                    repair_parts: list[str] = []
+                    for delta_token in self.vllm.stream_generate(
+                        system_prompt=repair_system,
+                        user_prompt=repair_user,
+                    ):
+                        repair_parts.append(delta_token)
+                        yield StreamEvent(
+                            phase=StreamPhase.GENERATING,
+                            content=delta_token,
+                            delta=True,
+                        )
+
+                    full_response = "".join(repair_parts)
+                    extracted_code = self._extract_code(full_response)
+
+                    # Re-validate
+                    yield StreamEvent(
+                        phase=StreamPhase.VALIDATING,
+                        content="\n\n🔎 Re-validating…",
+                    )
+                    validation_result = self.validator.validate(
+                        extracted_code, rag_chunks=rag_chunks,
+                    )
+
+                    if validation_result.passed:
+                        yield StreamEvent(
+                            phase=StreamPhase.VALIDATING,
+                            content=f"✅ Validation passed after repair {attempt}",
+                            metadata={"passed": True, **validation_result.get_summary()},
+                        )
+                        break
+                    else:
+                        yield StreamEvent(
+                            phase=StreamPhase.VALIDATING,
+                            content=(
+                                f"⚠️ Still {len(validation_result.errors)} errors "
+                                f"after repair {attempt}"
+                            ),
+                            metadata={"passed": False, **validation_result.get_summary()},
+                        )
+
+            # Record in session
+            if session:
+                session.add_user_message(
+                    request.task_description or f"Generate tests for {class_name}",
+                    metadata={"file_path": request.file_path},
+                )
+                session.add_assistant_message(
+                    extracted_code,
+                    metadata={"validation_passed": validation_result.passed},
+                )
+                session.record_generated_test(
+                    class_name=class_name,
+                    test_code=extracted_code,
+                    success=validation_result.passed,
+                )
+
+            # ── DONE ─────────────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.DONE,
+                content="",
+                metadata={
+                    "success": True,
+                    "class_name": class_name,
+                    "validation_passed": validation_result.passed,
+                    "validation_issues": validation_result.error_messages,
+                    "tokens_used": tokens_used,
+                    "rag_chunks_used": len(rag_chunks),
+                },
+            )
+
+        except Exception as e:
+            logger.error("Streaming test generation failed", error=str(e))
+            yield StreamEvent(
+                phase=StreamPhase.ERROR,
+                content=f"Error: {e}",
+            )
 
     def refine_test(
         self,
