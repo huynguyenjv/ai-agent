@@ -163,12 +163,21 @@ class ModelsResponse(BaseModel):
 # ============================================================================
 
 class GenerateTestRequest(BaseModel):
-    """Request model for test generation."""
+    """Request model for test generation.
+
+    Example::
+
+        {
+            "file_path": "C:\\path\\to\\MyService.java",
+            "task_description": "Generate comprehensive unit tests covering all public methods"
+        }
+    """
 
     file_path: str = Field(..., description="Path to the Java source file")
-    class_name: Optional[str] = Field(None, description="Class name (auto-detected if not provided)")
-    task_description: Optional[str] = Field(None, description="Additional task description")
-    session_id: Optional[str] = Field(None, description="Session ID for context continuity")
+    task_description: Optional[str] = Field(
+        "Generate comprehensive unit tests covering all public methods",
+        description="What to generate / additional task description",
+    )
 
 
 class GenerateTestResponse(BaseModel):
@@ -180,7 +189,6 @@ class GenerateTestResponse(BaseModel):
     validation_passed: bool = True
     validation_issues: list[str] = Field(default_factory=list)
     error: Optional[str] = None
-    session_id: Optional[str] = None
     rag_chunks_used: int = 0
     tokens_used: int = 0
 
@@ -458,35 +466,27 @@ async def health_check():
 
 @app.post("/generate-test", response_model=GenerateTestResponse)
 async def generate_test(request: GenerateTestRequest):
-    """Generate unit tests for a Java class."""
+    """Generate unit tests for a Java class.
+
+    Request body::
+
+        {
+            "file_path": "C:\\path\\to\\MyService.java",
+            "task_description": "Generate comprehensive unit tests covering all public methods"
+        }
+
+    Returns generated test code with validation results.
+    """
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    # Create session if not provided
-    session_id = request.session_id
-    if not session_id:
-        session = session_manager.create_session()
-        session_id = session.session_id
-
-    # Generate test
     gen_request = GenerationRequest(
         file_path=request.file_path,
-        class_name=request.class_name,
-        task_description=request.task_description,
-        session_id=session_id,
+        task_description=request.task_description
+            or "Generate comprehensive unit tests covering all public methods",
     )
 
-    # Run blocking operation in thread pool to avoid blocking event loop
     result = await run_in_executor(orchestrator.generate_test, gen_request)
-
-    # Update session
-    if result.success:
-        session_manager.update_session(
-            session_id=session_id,
-            current_class=result.class_name,
-            current_file=request.file_path,
-            increment_tests=True,
-        )
 
     return GenerateTestResponse(
         success=result.success,
@@ -495,7 +495,6 @@ async def generate_test(request: GenerateTestRequest):
         validation_passed=result.validation_passed,
         validation_issues=result.validation_issues,
         error=result.error,
-        session_id=session_id,
         rag_chunks_used=result.rag_chunks_used,
         tokens_used=result.tokens_used,
     )
