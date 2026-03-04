@@ -11,7 +11,7 @@ Architecture (Phase 1-4):
   - MetricsCollector   — observability (timing, counters, rates)
 """
 
-from .orchestrator import AgentOrchestrator, GenerationRequest, GenerationResult
+from .orchestrator import AgentOrchestrator, GenerationRequest, GenerationResult, StreamEvent, StreamPhase
 from .plan import ExecutionPlan, PlanStep, StepAction, TaskType
 from .planner import Planner
 from .prompt import PromptBuilder
@@ -29,6 +29,8 @@ __all__ = [
     "AgentOrchestrator",
     "GenerationRequest",
     "GenerationResult",
+    "StreamEvent",
+    "StreamPhase",
     # Phase 1: State machine + Planner
     "AgentState",
     "StateMachine",
