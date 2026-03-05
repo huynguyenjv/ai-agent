@@ -480,10 +480,43 @@ async def generate_test(request: GenerateTestRequest):
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
+    task_desc = (
+        request.task_description
+        or "Generate comprehensive unit tests covering all public methods"
+    )
+
+    # ── Read actual source file from disk ────────────────────────────
+    # This is critical: without the real source code in the prompt, the LLM
+    # relies only on RAG summaries which may be stale (e.g. after method renames).
+    # We embed the source as a code block — same format Continue IDE uses —
+    # so build_test_generation_prompt() can extract it via regex.
+    file_path = request.file_path
+    if file_path and os.path.isfile(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                source_code = f.read()
+            task_desc = f"{task_desc}\n\n```java\n{source_code}\n```"
+            logger.info(
+                "Source file embedded in prompt",
+                file_path=file_path,
+                source_lines=source_code.count("\n") + 1,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not read source file — falling back to RAG-only context",
+                file_path=file_path,
+                error=str(e),
+            )
+    else:
+        logger.warning(
+            "Source file not found on disk — LLM will rely on RAG summaries only",
+            file_path=file_path,
+        )
+    # ─────────────────────────────────────────────────────────────────
+
     gen_request = GenerationRequest(
-        file_path=request.file_path,
-        task_description=request.task_description
-            or "Generate comprehensive unit tests covering all public methods",
+        file_path=file_path,
+        task_description=task_desc,
     )
 
     result = await run_in_executor(orchestrator.generate_test, gen_request)
