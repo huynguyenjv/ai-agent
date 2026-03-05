@@ -6,7 +6,7 @@ pydantic-settings==2.1.0
 python-dotenv==1.0.1
 
 # Vector database
-qdrant-client==1.7.3
+qdrant-client==1.9.0
 
 # Redis (Session Memory Store - optional for production)
 redis==5.0.1
@@ -20,7 +20,7 @@ tree-sitter-java==0.21.0
 
 # HTTP client
 httpx==0.26.0
-aiohttp==3.9.3
+aiohttp==3.13.3
 
 # Configuration
 pyyaml==6.0.1
