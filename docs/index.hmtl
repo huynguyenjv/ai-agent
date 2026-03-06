@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Agent — Deep Architecture Analysis</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Syne:wght@400;600;700;800&family=Lora:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #0b0e14;
+    --bg2: #111520;
+    --bg3: #181d2b;
+    --border: #1f2740;
+    --accent: #4f8ef7;
+    --accent2: #7ee8b2;
+    --accent3: #f7c84f;
+    --accent4: #f76f8e;
+    --text: #c8d4f0;
+    --text-dim: #5e6e99;
+    --text-bright: #eef2ff;
+    --mono: 'DM Mono', monospace;
+    --sans: 'Syne', sans-serif;
+    --serif: 'Lora', serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--serif);
+    font-size: 16px;
+    line-height: 1.75;
+    overflow-x: hidden;
+  }
+
+  /* ── HERO ── */
+  .hero {
+    position: relative;
+    padding: 80px 48px 64px;
+    border-bottom: 1px solid var(--border);
+    background:
+      radial-gradient(ellipse 80% 50% at 60% -10%, rgba(79,142,247,0.12) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 40% at 90% 80%, rgba(126,232,178,0.07) 0%, transparent 60%),
+      var(--bg);
+  }
+  .hero-tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+  .hero h1 {
+    font-family: var(--sans);
+    font-size: clamp(2.2rem, 5vw, 3.8rem);
+    font-weight: 800;
+    color: var(--text-bright);
+    line-height: 1.1;
+    max-width: 820px;
+    margin-bottom: 20px;
+  }
+  .hero h1 span { color: var(--accent); }
+  .hero-sub {
+    font-family: var(--serif);
+    font-style: italic;
+    color: var(--text-dim);
+    font-size: 1.05rem;
+    max-width: 600px;
+  }
+  .badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 32px;
+  }
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 14px;
+    border-radius: 3px;
+    border: 1px solid;
+    letter-spacing: 0.08em;
+  }
+  .badge-blue { border-color: var(--accent); color: var(--accent); }
+  .badge-green { border-color: var(--accent2); color: var(--accent2); }
+  .badge-yellow { border-color: var(--accent3); color: var(--accent3); }
+  .badge-red { border-color: var(--accent4); color: var(--accent4); }
+
+  /* ── LAYOUT ── */
+  .layout {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    min-height: 100vh;
+  }
+
+  /* ── SIDEBAR ── */
+  .sidebar {
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    padding: 40px 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  .sidebar-section-title {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.2em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    padding: 0 24px;
+    margin-bottom: 10px;
+    margin-top: 28px;
+  }
+  .sidebar a {
+    display: block;
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 7px 24px;
+    transition: all 0.15s;
+    border-left: 2px solid transparent;
+  }
+  .sidebar a:hover {
+    color: var(--accent);
+    border-left-color: var(--accent);
+    background: rgba(79,142,247,0.06);
+  }
+
+  /* ── MAIN CONTENT ── */
+  .main {
+    padding: 64px 60px;
+    max-width: 960px;
+  }
+
+  /* ── SECTION ── */
+  .section {
+    margin-bottom: 80px;
+    animation: fadeUp 0.4s ease both;
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .section-number {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .section h2 {
+    font-family: var(--sans);
+    font-size: 1.7rem;
+    font-weight: 700;
+    color: var(--text-bright);
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section h3 {
+    font-family: var(--sans);
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--accent2);
+    margin: 28px 0 10px;
+    letter-spacing: 0.02em;
+  }
+  .section p { margin-bottom: 14px; color: var(--text); }
+  .section ul, .section ol {
+    padding-left: 20px;
+    margin-bottom: 14px;
+  }
+  .section li { margin-bottom: 8px; }
+
+  /* ── CODE BLOCK ── */
+  pre {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 24px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.65;
+    color: #a8c0e8;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: 0.85em;
+    background: rgba(79,142,247,0.12);
+    color: var(--accent);
+    padding: 2px 7px;
+    border-radius: 3px;
+  }
+  pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+
+  /* ── CALLOUT ── */
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: rgba(79,142,247,0.06);
+    padding: 16px 20px;
+    margin: 20px 0;
+    border-radius: 0 6px 6px 0;
+  }
+  .callout.warn { border-color: var(--accent3); background: rgba(247,200,79,0.06); }
+  .callout.danger { border-color: var(--accent4); background: rgba(247,111,142,0.06); }
+  .callout.success { border-color: var(--accent2); background: rgba(126,232,178,0.06); }
+  .callout-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    color: var(--accent);
+  }
+  .callout.warn .callout-label { color: var(--accent3); }
+  .callout.danger .callout-label { color: var(--accent4); }
+  .callout.success .callout-label { color: var(--accent2); }
+
+  /* ── TABLE ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 24px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  th {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    padding: 10px 14px;
+    text-align: left;
+    color: var(--accent2);
+    font-weight: 500;
+    letter-spacing: 0.05em;
+  }
+  td {
+    border: 1px solid var(--border);
+    padding: 9px 14px;
+    color: var(--text);
+  }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.018); }
+
+  /* ── FLOW DIAGRAM ── */
+  .flow {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin: 24px 0;
+    max-width: 560px;
+  }
+  .flow-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .flow-line {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex-shrink: 0;
+    width: 36px;
+  }
+  .flow-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--bg);
+    box-shadow: 0 0 0 2px var(--accent);
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .flow-dot.green { background: var(--accent2); box-shadow: 0 0 0 2px var(--accent2); }
+  .flow-dot.yellow { background: var(--accent3); box-shadow: 0 0 0 2px var(--accent3); }
+  .flow-dot.red { background: var(--accent4); box-shadow: 0 0 0 2px var(--accent4); }
+  .flow-connector {
+    width: 2px;
+    flex: 1;
+    background: var(--border);
+    min-height: 28px;
+    margin: 2px 0;
+  }
+  .flow-content {
+    padding-bottom: 28px;
+  }
+  .flow-title {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-bright);
+    margin-bottom: 3px;
+  }
+  .flow-desc {
+    font-family: var(--serif);
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.5;
+  }
+
+  /* ── ARCH GRID ── */
+  .arch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 14px;
+    margin: 20px 0;
+  }
+  .arch-card {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 16px;
+    transition: border-color 0.15s;
+  }
+  .arch-card:hover { border-color: var(--accent); }
+  .arch-card-icon {
+    font-size: 22px;
+    margin-bottom: 8px;
+  }
+  .arch-card-name {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent2);
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+  }
+  .arch-card-desc {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    font-family: var(--sans);
+  }
+
+  /* ── AGENT LOOP ── */
+  .loop-diagram {
+    position: relative;
+    margin: 32px auto;
+    width: 360px;
+    height: 360px;
+  }
+  .loop-center {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    width: 110px; height: 110px;
+    border-radius: 50%;
+    background: var(--bg3);
+    border: 2px solid var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    text-align: center;
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent);
+    box-shadow: 0 0 32px rgba(79,142,247,0.2);
+    z-index: 2;
+  }
+  .loop-node {
+    position: absolute;
+    width: 90px; height: 90px;
+    border-radius: 12px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    text-align: center;
+    gap: 4px;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    transition: border-color 0.2s;
+  }
+  .loop-node:hover { border-color: var(--accent); }
+  .loop-node .icon { font-size: 20px; }
+  .loop-node.n1 { top: 8px; left: 50%; transform: translateX(-50%); color: var(--accent); border-color: rgba(79,142,247,0.4); }
+  .loop-node.n2 { top: 50%; right: 8px; transform: translateY(-50%); color: var(--accent3); border-color: rgba(247,200,79,0.4); }
+  .loop-node.n3 { bottom: 8px; left: 50%; transform: translateX(-50%); color: var(--accent2); border-color: rgba(126,232,178,0.4); }
+  .loop-node.n4 { top: 50%; left: 8px; transform: translateY(-50%); color: var(--accent4); border-color: rgba(247,111,142,0.4); }
+
+  /* ── PROBLEM BADGE ── */
+  .problem-list { display: flex; flex-direction: column; gap: 12px; margin: 16px 0; }
+  .problem-item {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .problem-severity {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .sev-high { background: rgba(247,111,142,0.15); color: var(--accent4); border: 1px solid rgba(247,111,142,0.3); }
+  .sev-med { background: rgba(247,200,79,0.12); color: var(--accent3); border: 1px solid rgba(247,200,79,0.3); }
+  .sev-low { background: rgba(79,142,247,0.1); color: var(--accent); border: 1px solid rgba(79,142,247,0.3); }
+  .problem-text {
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text);
+  }
+  .problem-text strong { color: var(--text-bright); }
+
+  /* ── IMPROVEMENT CARDS ── */
+  .improve-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+  .improve-card {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+  }
+  .improve-card h4 {
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent2);
+    margin-bottom: 7px;
+    letter-spacing: 0.04em;
+  }
+  .improve-card p {
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin: 0;
+  }
+
+  /* ── SVG ARCHITECTURE DIAGRAM ── */
+  .diagram-wrap {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px;
+    margin: 24px 0;
+    overflow-x: auto;
+  }
+  svg text { font-family: 'DM Mono', monospace; }
+
+  /* ── SCROLLBAR ── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg2); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* ── FOOTER ── */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 32px 60px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    text-align: center;
+    letter-spacing: 0.06em;
+    margin-left: 220px;
+  }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+    .main { padding: 32px 24px; }
+    footer { margin-left: 0; }
+    .improve-grid { grid-template-columns: 1fr; }
+    .loop-diagram { width: 280px; height: 280px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-tag">// Repository Deep Dive · huynguyenjv/ai-agent</div>
+  <h1>AI <span>Coding Agent</span><br>Architecture Analysis</h1>
+  <p class="hero-sub">A complete technical breakdown of the RAG-powered JUnit test generation system — from ingestion to inference.</p>
+  <div class="badges">
+    <span class="badge badge-blue">RAG System</span>
+    <span class="badge badge-blue">Tool-Using Agent</span>
+    <span class="badge badge-green">Python · FastAPI</span>
+    <span class="badge badge-green">Qdrant · vLLM</span>
+    <span class="badge badge-yellow">Qwen2.5-Coder-7B</span>
+    <span class="badge badge-red">Self-Hosted</span>
+  </div>
+</div>
+
+<div class="layout">
+
+<!-- SIDEBAR -->
+<nav class="sidebar">
+  <div class="sidebar-section-title">Analysis</div>
+  <a href="#s1">1. Overview</a>
+  <a href="#s2">2. Project Structure</a>
+  <a href="#s3">3. Execution Flow</a>
+  <a href="#s4">4. Agent Loop</a>
+  <a href="#s5">5. Model Integration</a>
+  <a href="#s6">6. Tool System</a>
+  <a href="#s7">7. Memory System</a>
+  <a href="#s8">8. Data Flow</a>
+  <div class="sidebar-section-title">Review</div>
+  <a href="#s9">9. Problems</a>
+  <a href="#s10">10. Code Quality</a>
+  <a href="#s11">11. Simple Explanation</a>
+  <a href="#s12">12. Improvements</a>
+  <a href="#s13">13. Diagrams</a>
+</nav>
+
+<!-- MAIN -->
+<main class="main">
+
+<!-- ── SECTION 1 ── -->
+<section class="section" id="s1">
+  <div class="section-number">// 01</div>
+  <h2>Repository Overview</h2>
+
+  <h3>What It's Built For</h3>
+  <p>This is a <strong>self-hosted AI coding agent</strong> designed specifically to automate the generation of <strong>JUnit 5 + Mockito unit tests</strong> for large Java repositories structured according to <strong>Domain-Driven Design (DDD)</strong>. The core problem it solves is: Java DDD codebases are large, layered, and complex — manually writing tests for every service, repository, and domain object is time-consuming. This agent automates it with semantic understanding of the codebase.</p>
+
+  <h3>Main Capabilities</h3>
+  <ul>
+    <li><strong>Semantic code indexing</strong> — Parses Java source with tree-sitter and stores structured embeddings in Qdrant</li>
+    <li><strong>RAG-powered context retrieval</strong> — Fetches only the relevant code chunks for each test generation task</li>
+    <li><strong>LLM test generation</strong> — Uses a local Qwen2.5-Coder model via vLLM to write JUnit 5 tests</li>
+    <li><strong>Rule enforcement</strong> — Enforces AAA pattern, no Spring context, Mockito-only mocking</li>
+    <li><strong>Session memory</strong> — Maintains conversation history across refinement turns</li>
+    <li><strong>IDE integration</strong> — Exposes an OpenAI-compatible API endpoint consumed by Tabby IDE plugin</li>
+    <li><strong>Test refinement</strong> — Accepts feedback to iteratively improve generated tests</li>
+  </ul>
+
+  <h3>Overall Architecture Type</h3>
+  <div class="callout">
+    <div class="callout-label">Architecture Classification</div>
+    This is a <strong>RAG-augmented, tool-using coding agent</strong>. It is not a multi-agent system. There is one orchestrator that coordinates a RAG retrieval step, a prompt construction step, and an LLM call. The "agent" aspect is that it can iteratively refine outputs based on feedback and maintains session state across multiple interactions.
+  </div>
+
+  <p>The high-level pipeline is:</p>
+  <pre>Tabby IDE / curl → FastAPI Server → Agent Orchestrator → RAG (Qdrant) → vLLM (Qwen2.5) → Response</pre>
+</section>
+
+<!-- ── SECTION 2 ── -->
+<section class="section" id="s2">
+  <div class="section-number">// 02</div>
+  <h2>Project Structure</h2>
+
+  <div class="arch-grid">
+    <div class="arch-card">
+      <div class="arch-card-icon">🌐</div>
+      <div class="arch-card-name">server/</div>
+      <div class="arch-card-desc"><strong>api.py</strong> — FastAPI app with all HTTP endpoints (OpenAI-compatible + native). <strong>session.py</strong> — Session lifecycle manager (create/get/delete).</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">🧠</div>
+      <div class="arch-card-name">agent/</div>
+      <div class="arch-card-desc"><strong>orchestrator.py</strong> — Core workflow coordinator. <strong>prompt.py</strong> — Prompt builder. <strong>rules.py</strong> — JUnit/Mockito rules. <strong>memory.py</strong> — Session memory store.</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">🗂️</div>
+      <div class="arch-card-name">indexer/</div>
+      <div class="arch-card-desc"><strong>parse_java.py</strong> — tree-sitter Java AST parser. <strong>summarize.py</strong> — Code chunk summarizer. <strong>build_index.py</strong> — Qdrant upsertion logic.</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">🔍</div>
+      <div class="arch-card-name">rag/</div>
+      <div class="arch-card-desc"><strong>client.py</strong> — Embeds query, searches Qdrant, returns ranked chunks. <strong>schema.py</strong> — Pydantic data models for RAG payloads.</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">⚡</div>
+      <div class="arch-card-name">vllm/</div>
+      <div class="arch-card-desc"><strong>client.py</strong> — HTTP client wrapping the vLLM OpenAI-compatible API. Sends prompts, receives completions.</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">⚙️</div>
+      <div class="arch-card-name">config/</div>
+      <div class="arch-card-desc"><strong>agent.yaml</strong>, <strong>rag.yaml</strong>, <strong>vllm.yaml</strong> — YAML configs for each subsystem. Augmented by <code>.env</code> variables.</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">🐳</div>
+      <div class="arch-card-name">Root Files</div>
+      <div class="arch-card-desc"><strong>main.py</strong> — Starts uvicorn server. <strong>docker-compose.yml</strong> — Runs Qdrant. <strong>benchmark.py</strong> — Performance testing. <strong>download_model.py</strong> — Model download helper.</div>
+    </div>
+    <div class="arch-card">
+      <div class="arch-card-icon">📄</div>
+      <div class="arch-card-name">TABBY_SETUP.md</div>
+      <div class="arch-card-desc">Step-by-step guide for configuring the Tabby IDE plugin to use this agent as its completion backend.</div>
+    </div>
+  </div>
+
+  <h3>How Components Interact</h3>
+  <p>The <code>server/api.py</code> is the boundary layer — it owns HTTP routing and delegates everything to <code>agent/orchestrator.py</code>. The orchestrator calls <code>rag/client.py</code> to retrieve context, calls <code>agent/prompt.py</code> to build the final prompt (applying rules from <code>agent/rules.py</code>), then calls <code>vllm/client.py</code> to invoke the LLM. Session state is passed between turns via <code>agent/memory.py</code> and <code>server/session.py</code>.</p>
+</section>
+
+<!-- ── SECTION 3 ── -->
+<section class="section" id="s3">
+  <div class="section-number">// 03</div>
+  <h2>Agent Execution Flow</h2>
+
+  <p>There are two distinct workflows: <strong>Indexing</strong> (offline preprocessing) and <strong>Test Generation</strong> (online inference). Here is the full trace for each.</p>
+
+  <h3>A — Indexing Flow (run once per repo)</h3>
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">POST /reindex</div>
+        <div class="flow-desc">API receives <code>repo_path</code>. Delegates to build_index module.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot green"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">parse_java.py — AST Parsing</div>
+        <div class="flow-desc">tree-sitter walks all <code>.java</code> files. Extracts classes, methods, fields, DDD layer labels (application/domain/infra).</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot yellow"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">summarize.py — Chunk Summarization</div>
+        <div class="flow-desc">Each parsed chunk gets a human-readable summary (optionally via LLM). Chunks tagged with metadata: file path, class name, DDD layer, method signatures.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">Embedding Generation</div>
+        <div class="flow-desc"><code>sentence-transformers/all-MiniLM-L6-v2</code> encodes each chunk into a 384-dim dense vector.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot green"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">Qdrant Upsert</div>
+        <div class="flow-desc">Vectors + payloads upserted to the <code>java_codebase</code> collection. Index is ready for querying.</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>B — Test Generation Flow (per request)</h3>
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">POST /generate-test or /v1/chat/completions</div>
+        <div class="flow-desc">User provides <code>file_path</code>, optional <code>class_name</code>, <code>task_description</code>, and <code>session_id</code>.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot green"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">Session Lookup / Creation</div>
+        <div class="flow-desc"><code>server/session.py</code> fetches or creates session. Prior conversation turns loaded from <code>agent/memory.py</code>.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot yellow"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">RAG Retrieval</div>
+        <div class="flow-desc"><code>rag/client.py</code> embeds the query (class name + task description), searches Qdrant for top-k semantically similar chunks.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">Prompt Construction</div>
+        <div class="flow-desc"><code>agent/prompt.py</code> assembles: system prompt + rules (from <code>rules.py</code>) + RAG chunks + session history + user task.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot red"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">LLM Inference — vLLM</div>
+        <div class="flow-desc"><code>vllm/client.py</code> POSTs to the OpenAI-compatible endpoint. Qwen2.5-Coder-7B-Instruct generates test code.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot green"></div><div class="flow-connector"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">Validation</div>
+        <div class="flow-desc">Orchestrator checks the output against rules: JUnit5 imports present, no Spring annotations, AAA comments, etc.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-line"><div class="flow-dot"></div></div>
+      <div class="flow-content">
+        <div class="flow-title">Response + Memory Update</div>
+        <div class="flow-desc">Result stored in session memory. Response returned with: <code>test_code</code>, <code>validation_passed</code>, <code>rag_chunks_used</code>, <code>tokens_used</code>.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── SECTION 4 ── -->
+<section class="section" id="s4">
+  <div class="section-number">// 04</div>
+  <h2>Agent Loop</h2>
+
+  <p>This system implements a <strong>lightweight, human-in-the-loop refinement loop</strong> rather than a fully autonomous ReAct-style loop. The loop is:</p>
+
+  <pre>
+  User submits task
+       ↓
+  [Retrieve] — RAG fetches relevant code context
+       ↓
+  [Reason]   — LLM generates test code with rules in mind
+       ↓
+  [Validate] — Orchestrator checks rule compliance
+       ↓
+  [Respond]  — Return test to user + store in session
+       ↓
+  [Human Feedback?] → POST /refine-test
+       ↓
+  [Retrieve] — Load session history + new feedback
+       ↓
+  [Reason]   — LLM refines the test
+       ↓
+  Repeat until user is satisfied
+  </pre>
+
+  <div class="callout warn">
+    <div class="callout-label">⚠ No Autonomous Tool Loop</div>
+    The system does NOT run an autonomous agent loop (like ReAct or MRKL). It does not call tools mid-generation — the retrieval always happens before the LLM call. The "agentic" quality comes from multi-turn refinement driven by human feedback, not self-directed tool use.
+  </div>
+
+  <h3>Planning</h3>
+  <p>There is no explicit planner. The orchestrator has a fixed pipeline: retrieve → prompt → generate → validate. The LLM itself implicitly plans test structure inside the generation step.</p>
+
+  <h3>Memory Update</h3>
+  <p>After each turn, the orchestrator appends the user message and the generated test to the session's message history. On the next turn, this history is included in the prompt so the LLM can see what it previously generated and what feedback it received.</p>
+
+  <h3>Validation / Observation</h3>
+  <p>The orchestrator acts as its own "observer" — after generation it checks the output against rules from <code>agent/rules.py</code> (e.g., string-matching for <code>@Test</code>, absence of <code>@SpringBootTest</code>). Validation issues are returned to the caller but the agent does not automatically retry — that is left to the user via <code>/refine-test</code>.</p>
+</section>
+
+<!-- ── SECTION 5 ── -->
+<section class="section" id="s5">
+  <div class="section-number">// 05</div>
+  <h2>Model Integration</h2>
+
+  <h3>LLM Used</h3>
+  <table>
+    <tr><th>Model</th><th>Size</th><th>Role</th><th>Access Method</th></tr>
+    <tr><td>Qwen/Qwen2.5-Coder-7B-Instruct</td><td>7B</td><td>Test generation</td><td>vLLM OpenAI-compat API</td></tr>
+    <tr><td>sentence-transformers/all-MiniLM-L6-v2</td><td>22M</td><td>Embedding for RAG</td><td>Local Python (SentenceTransformers)</td></tr>
+  </table>
+
+  <h3>Where Models Are Initialized</h3>
+  <ul>
+    <li><strong>vLLM</strong>: External server, started independently. The agent only holds a configured HTTP client in <code>vllm/client.py</code>. Connection settings come from <code>config/vllm.yaml</code> and <code>.env</code>.</li>
+    <li><strong>Embedding model</strong>: Loaded in-process (likely in <code>indexer/build_index.py</code> or <code>rag/client.py</code>) using the <code>sentence-transformers</code> library. This means the embedding model is loaded into the FastAPI process on startup.</li>
+  </ul>
+
+  <h3>Prompt Construction</h3>
+  <p><code>agent/prompt.py</code> assembles a multi-part prompt. The inferred structure is:</p>
+  <pre>
+[SYSTEM]
+You are an expert Java test engineer.
+{rules_text from agent/rules.py}
+
+[CONTEXT — RAG chunks]
+// Class: UserService (src/main/java/.../service/UserService.java)
+// Layer: application
+{raw code chunk}
+...
+
+[HISTORY — if session has prior turns]
+User: Generate test for UserService
+Assistant: {previous_test_code}
+User: Add null checks
+
+[USER]
+{task_description}
+File: {file_path}
+  </pre>
+
+  <h3>Response Parsing</h3>
+  <p>The response from vLLM is a standard OpenAI chat completion JSON. The orchestrator extracts <code>choices[0].message.content</code> and applies rule-based validation checks on the raw string. There is no structured output / JSON mode — the LLM is expected to return raw Java code directly.</p>
+</section>
+
+<!-- ── SECTION 6 ── -->
+<section class="section" id="s6">
+  <div class="section-number">// 06</div>
+  <h2>Tool System</h2>
+
+  <div class="callout">
+    <div class="callout-label">Note</div>
+    This agent does not have a traditional dynamic tool-calling system (like OpenAI function calling or LangChain tools). Instead, the "tools" are fixed pipeline stages called deterministically by the orchestrator.
+  </div>
+
+  <h3>Effective Tools (Fixed Pipeline)</h3>
+  <table>
+    <tr><th>Tool</th><th>Module</th><th>When Called</th></tr>
+    <tr><td>Java AST Parser</td><td>indexer/parse_java.py</td><td>At indexing time only</td></tr>
+    <tr><td>Code Summarizer</td><td>indexer/summarize.py</td><td>At indexing time only</td></tr>
+    <tr><td>RAG Retriever</td><td>rag/client.py</td><td>Before every LLM call</td></tr>
+    <tr><td>vLLM Client</td><td>vllm/client.py</td><td>For every generation request</td></tr>
+    <tr><td>Rule Validator</td><td>agent/rules.py</td><td>After every generation</td></tr>
+  </table>
+
+  <h3>Tool Registration</h3>
+  <p>Tools are not registered dynamically. They are imported and called directly inside <code>agent/orchestrator.py</code>. There is no tool registry, no tool schema, and no LLM-driven tool selection.</p>
+
+  <h3>How the Agent Decides to Call Tools</h3>
+  <p>The orchestrator always follows the same sequence — it does not give the LLM the ability to decide which tools to call. Tool invocation is hardcoded in the orchestrator's pipeline function.</p>
+</section>
+
+<!-- ── SECTION 7 ── -->
+<section class="section" id="s7">
+  <div class="section-number">// 07</div>
+  <h2>Memory System</h2>
+
+  <h3>Conversation Memory (Short-Term)</h3>
+  <p>Implemented via <code>agent/memory.py</code> and <code>server/session.py</code>. Each session has a unique UUID and stores a list of message dicts (role + content) in-process (likely a Python dict). Memory is injected into the prompt on each subsequent turn, giving the LLM context about what was previously generated and what feedback was given.</p>
+
+  <h3>Vector Memory (Long-Term Code Index)</h3>
+  <p>Qdrant serves as the persistent semantic memory of the Java codebase. Once indexed, this persists across server restarts (Qdrant stores data on disk). Each chunk has: the raw code text, its embedding vector, and metadata (file path, class name, DDD layer, method names).</p>
+
+  <h3>Long-Term User Memory</h3>
+  <p>There is no long-term user-level memory. Session data appears to be in-memory only, which means it is lost when the server restarts. There is no database persistence for sessions.</p>
+
+  <table>
+    <tr><th>Memory Type</th><th>Storage</th><th>Scope</th><th>Persists?</th></tr>
+    <tr><td>Session conversation</td><td>Python dict in-process</td><td>Per session UUID</td><td>❌ Lost on restart</td></tr>
+    <tr><td>Code index (RAG)</td><td>Qdrant (disk-backed)</td><td>Entire Java repo</td><td>✅ Yes</td></tr>
+    <tr><td>Generated tests</td><td>Response body only</td><td>N/A</td><td>❌ Not stored</td></tr>
+  </table>
+</section>
+
+<!-- ── SECTION 8 ── -->
+<section class="section" id="s8">
+  <div class="section-number">// 08</div>
+  <h2>Data Flow</h2>
+
+  <h3>Indexing Data Flow</h3>
+  <pre>
+Java Repo on disk
+  → tree-sitter (parse_java.py)
+  → Structured chunks {class, methods, code, layer}
+  → summarize.py (optional LLM summarization)
+  → sentence-transformers (MiniLM-L6-v2)
+  → 384-dim embedding vectors
+  → Qdrant upsert (java_codebase collection)
+  </pre>
+
+  <h3>Generation Data Flow</h3>
+  <pre>
+HTTP Request {file_path, task_description, session_id}
+  → server/api.py
+  → server/session.py (load/create session)
+  → agent/orchestrator.py
+      → rag/client.py
+          → embed query (MiniLM)
+          → Qdrant search (cosine similarity, top-k chunks)
+          → return List[CodeChunk]
+      → agent/prompt.py
+          → load rules (agent/rules.py)
+          → load session history (agent/memory.py)
+          → build messages[] array
+      → vllm/client.py
+          → POST to http://localhost:8000/v1/chat/completions
+          → return completion text
+      → validate against rules
+      → update session memory
+  → HTTP Response {test_code, validation_passed, rag_chunks_used, tokens_used}
+  </pre>
+
+  <h3>Refinement Data Flow</h3>
+  <pre>
+POST /refine-test {session_id, feedback}
+  → load existing session (has prior test_code in history)
+  → orchestrator re-runs with feedback appended to history
+  → same RAG + prompt + LLM pipeline
+  → returns refined test
+  </pre>
+</section>
+
+<!-- ── SECTION 9 ── -->
+<section class="section" id="s9">
+  <div class="section-number">// 09</div>
+  <h2>Architecture Problems</h2>
+
+  <div class="problem-list">
+    <div class="problem-item">
+      <span class="problem-severity sev-high">HIGH</span>
+      <div class="problem-text"><strong>In-memory session storage:</strong> Sessions are stored in a Python dict inside the running process. Any server restart wipes all active sessions. This makes the system stateless in practice and breaks multi-turn workflows across deployments. A Redis or SQLite backend is needed.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-high">HIGH</span>
+      <div class="problem-text"><strong>Embedding model loaded in FastAPI process:</strong> The SentenceTransformer model loads into the main API process on startup, consuming significant RAM (even though inference is rare). This should be isolated into a dedicated microservice or loaded lazily.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-high">HIGH</span>
+      <div class="problem-text"><strong>No autonomous retry loop:</strong> If the LLM produces invalid output (fails validation), the orchestrator does not retry automatically. It just returns <code>validation_passed: false</code>. The user must manually call <code>/refine-test</code>. A retry-with-feedback loop inside the orchestrator would be more robust.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-med">MED</span>
+      <div class="problem-text"><strong>Tight coupling — orchestrator does everything:</strong> <code>agent/orchestrator.py</code> directly imports and calls RAG, prompt builder, memory, and vLLM client. There are no abstraction interfaces. If you want to swap the vector DB or LLM backend, you must modify the orchestrator directly.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-med">MED</span>
+      <div class="problem-text"><strong>Rule validation is string-matching only:</strong> <code>agent/rules.py</code> likely uses regex or substring checks on the raw output. This is brittle — a valid test could fail validation, or a malformed test could pass. A proper Java AST parser should be used for validation too.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-med">MED</span>
+      <div class="problem-text"><strong>No rate limiting or authentication:</strong> The API is completely open. Any client can call <code>/reindex</code> (a destructive operation) or consume <code>/generate-test</code> without any auth. Exposing this to a network requires at minimum an API key middleware.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-med">MED</span>
+      <div class="problem-text"><strong>Hardcoded <code>localhost:8000</code> for vLLM:</strong> The vLLM URL is configured but the assumption of a port-forwarded localhost vLLM is fragile in production. No health check or circuit breaker exists if vLLM goes down.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-low">LOW</span>
+      <div class="problem-text"><strong>No observability:</strong> There is no structured logging, tracing, or metrics. Token usage is returned in the response body but not logged or aggregated. It's impossible to debug failed generations in production.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-low">LOW</span>
+      <div class="problem-text"><strong>Generated tests are not persisted:</strong> The system generates tests but never saves them to disk or a database. Users must copy the API response manually. An option to write directly to the test source tree would complete the workflow.</div>
+    </div>
+    <div class="problem-item">
+      <span class="problem-severity sev-low">LOW</span>
+      <div class="problem-text"><strong>No async indexing:</strong> The <code>/reindex</code> endpoint is synchronous. Indexing a large Java repo could take minutes, blocking the HTTP connection. This should be a background job with a status endpoint.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── SECTION 10 ── -->
+<section class="section" id="s10">
+  <div class="section-number">// 10</div>
+  <h2>Code Quality</h2>
+
+  <h3>Structure</h3>
+  <p>The module breakdown is sensible and follows separation of concerns at the folder level: <code>server</code>, <code>agent</code>, <code>rag</code>, <code>indexer</code>, <code>vllm</code>. This makes it easy to navigate for a first-time reader.</p>
+
+  <h3>Modularity</h3>
+  <p>Moderate. The folders are well-named but the internal cohesion is undermined by the orchestrator directly importing from all other modules. True modularity would use dependency injection or abstract base classes so components are swappable.</p>
+
+  <h3>Readability & Naming</h3>
+  <p>File and module names are excellent: <code>parse_java.py</code>, <code>build_index.py</code>, <code>orchestrator.py</code> — all self-documenting. This is one of the repo's strengths.</p>
+
+  <h3>Configuration Management</h3>
+  <p>Good pattern: YAML files in <code>config/</code> with <code>.env</code> overrides and <code>env.example</code> for onboarding. The <code>requirements.txt</code> approach is standard but a <code>pyproject.toml</code> with pinned deps would be more reproducible.</p>
+
+  <h3>Testing</h3>
+  <div class="callout danger">
+    <div class="callout-label">❌ Critical Gap</div>
+    There are no unit tests in the repo. The README says "run tests (if you add them)". A system that generates tests for others has no tests for itself. This is ironic and also a real reliability risk.
+  </div>
+
+  <h3>Documentation</h3>
+  <p>The README is thorough and developer-friendly. It covers quickstart, all API endpoints with request/response examples, and all config variables. The <code>TABBY_SETUP.md</code> is a bonus for IDE integration. Inline code documentation is unknown (not publicly visible in the file listing).</p>
+
+  <h3>Overall Grade</h3>
+  <table>
+    <tr><th>Dimension</th><th>Score</th><th>Notes</th></tr>
+    <tr><td>Structure</td><td>⭐⭐⭐⭐</td><td>Clear folder organization</td></tr>
+    <tr><td>Modularity</td><td>⭐⭐⭐</td><td>Good separation, some tight coupling</td></tr>
+    <tr><td>Naming</td><td>⭐⭐⭐⭐⭐</td><td>Excellent, self-documenting</td></tr>
+    <tr><td>Testing</td><td>⭐</td><td>No tests at all</td></tr>
+    <tr><td>Documentation</td><td>⭐⭐⭐⭐</td><td>Strong README</td></tr>
+    <tr><td>Security</td><td>⭐⭐</td><td>No auth, .env exposed in repo</td></tr>
+    <tr><td>Observability</td><td>⭐⭐</td><td>No logs, no tracing</td></tr>
+  </table>
+</section>
+
+<!-- ── SECTION 11 ── -->
+<section class="section" id="s11">
+  <div class="section-number">// 11</div>
+  <h2>Simplified Explanation</h2>
+
+  <div class="callout success">
+    <div class="callout-label">For New Developers</div>
+    Think of this system like a very smart autocomplete that specializes in writing Java unit tests.
+  </div>
+
+  <p>Imagine you work on a big Java project with hundreds of classes and services. Writing unit tests for each one is tedious and repetitive. This system automates that by doing three things:</p>
+
+  <p><strong>1. It reads and understands your Java code.</strong> When you point it at your project folder, it reads every Java file, breaks them into logical chunks (a class here, a method there), and converts each chunk into a mathematical "fingerprint" (an embedding vector). These fingerprints are stored in a special database called Qdrant — think of it as a smart filing cabinet that understands meaning, not just keywords.</p>
+
+  <p><strong>2. When you ask it to write a test, it looks up what's relevant.</strong> If you say "write a test for UserService", it converts that request into a fingerprint too, then searches the filing cabinet for the most similar Java code. This gives the AI model exactly the right context — the actual implementation — instead of trying to load your entire codebase.</p>
+
+  <p><strong>3. It asks the AI to write the test, following strict rules.</strong> The retrieved code + your request + a list of rules ("only use JUnit 5, never use @SpringBootTest, always follow Arrange-Act-Assert") are bundled into a prompt and sent to a local AI model (Qwen2.5-Coder running on your own machine via vLLM). The model generates the test. The system checks it follows the rules and sends it back to you.</p>
+
+  <p><strong>You can also give feedback.</strong> If the test is missing edge cases, you say so via the refine API, and the system remembers the conversation and improves the test. This back-and-forth is stored in a "session".</p>
+
+  <p><strong>From the IDE's perspective</strong>, it looks like a regular OpenAI API — Tabby IDE just thinks it's talking to GPT-4. All the complexity is hidden behind the <code>/v1/chat/completions</code> endpoint.</p>
+</section>
+
+<!-- ── SECTION 12 ── -->
+<section class="section" id="s12">
+  <div class="section-number">// 12</div>
+  <h2>Suggested Improvements</h2>
+
+  <div class="improve-grid">
+    <div class="improve-card">
+      <h4>🔄 Autonomous Retry Loop</h4>
+      <p>If validation fails, automatically re-prompt the LLM with the validation errors included as feedback. Cap at 3 retries. This turns it into a true agentic loop.</p>
+    </div>
+    <div class="improve-card">
+      <h4>💾 Persistent Session Storage</h4>
+      <p>Replace the in-memory dict with Redis or SQLite. Sessions survive server restarts and can be distributed across multiple workers.</p>
+    </div>
+    <div class="improve-card">
+      <h4>🔌 Dependency Injection / Abstraction Layer</h4>
+      <p>Define <code>VectorStore</code>, <code>LLMClient</code>, and <code>Embedder</code> abstract interfaces. Inject them into the orchestrator. Swap Qdrant for Chroma or vLLM for Ollama without touching orchestration logic.</p>
+    </div>
+    <div class="improve-card">
+      <h4>📊 Observability (OpenTelemetry)</h4>
+      <p>Add structured logging, tracing spans per pipeline stage, and Prometheus metrics (tokens/sec, retrieval latency, validation pass rate). Export to Grafana for real-time dashboards.</p>
+    </div>
+    <div class="improve-card">
+      <h4>🔐 Auth Middleware</h4>
+      <p>Add API key authentication via FastAPI middleware. Hash keys and store in env config. Without this, the indexer endpoint is a destructive operation open to anyone on the network.</p>
+    </div>
+    <div class="improve-card">
+      <h4>🧪 AST-Based Validation</h4>
+      <p>Use tree-sitter (already a dependency) to parse the generated test code and validate structure: correct imports, annotation presence, no forbidden annotations. More reliable than string matching.</p>
+    </div>
+    <div class="improve-card">
+      <h4>⚡ Async Indexing with Job Queue</h4>
+      <p>Move <code>/reindex</code> to a background Celery or asyncio task. Return a job ID immediately. Add <code>GET /reindex/{job_id}/status</code> for polling. Prevents HTTP timeouts on large repos.</p>
+    </div>
+    <div class="improve-card">
+      <h4>📝 Evaluation Pipeline</h4>
+      <p>Add a <code>benchmark.py</code> suite that runs the agent against known Java classes and checks: does the test compile? Does it achieve a target line coverage? Enables tracking quality regressions as the model or prompts change.</p>
+    </div>
+    <div class="improve-card">
+      <h4>🗃️ Test File Output</h4>
+      <p>Add an option to automatically write the generated test to the correct directory in the Java project (e.g., <code>src/test/java/...</code>). Close the workflow loop without manual copy-paste.</p>
+    </div>
+    <div class="improve-card">
+      <h4>🔍 Hybrid Search</h4>
+      <p>Supplement dense vector search in Qdrant with BM25 keyword search. Hybrid retrieval significantly improves precision for exact class/method name lookups that dense embeddings sometimes miss.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── SECTION 13 ── -->
+<section class="section" id="s13">
+  <div class="section-number">// 13</div>
+  <h2>Visual Diagrams</h2>
+
+  <h3>Diagram 1 — System Architecture</h3>
+  <div class="diagram-wrap">
+    <svg viewBox="0 0 780 420" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-height:420px;">
+      <!-- Defs -->
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#4f8ef7"/>
+        </marker>
+        <marker id="arrow2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#7ee8b2"/>
+        </marker>
+      </defs>
+
+      <!-- IDE Layer -->
+      <rect x="20" y="30" width="130" height="60" rx="8" fill="#181d2b" stroke="#4f8ef7" stroke-width="1.5"/>
+      <text x="85" y="56" text-anchor="middle" fill="#4f8ef7" font-size="11" font-weight="bold">Tabby IDE</text>
+      <text x="85" y="72" text-anchor="middle" fill="#5e6e99" font-size="9">VS Code Plugin</text>
+
+      <!-- FastAPI -->
+      <rect x="220" y="20" width="150" height="80" rx="8" fill="#181d2b" stroke="#7ee8b2" stroke-width="1.5"/>
+      <text x="295" y="48" text-anchor="middle" fill="#7ee8b2" font-size="11" font-weight="bold">FastAPI Server</text>
+      <text x="295" y="64" text-anchor="middle" fill="#5e6e99" font-size="9">server/api.py</text>
+      <text x="295" y="78" text-anchor="middle" fill="#5e6e99" font-size="9">server/session.py</text>
+      <text x="295" y="90" text-anchor="middle" fill="#4f8ef7" font-size="9">:8080</text>
+
+      <!-- Orchestrator -->
+      <rect x="220" y="140" width="150" height="80" rx="8" fill="#181d2b" stroke="#f7c84f" stroke-width="1.5"/>
+      <text x="295" y="168" text-anchor="middle" fill="#f7c84f" font-size="11" font-weight="bold">Orchestrator</text>
+      <text x="295" y="184" text-anchor="middle" fill="#5e6e99" font-size="9">agent/orchestrator.py</text>
+      <text x="295" y="200" text-anchor="middle" fill="#5e6e99" font-size="9">prompt.py · rules.py</text>
+      <text x="295" y="214" text-anchor="middle" fill="#5e6e99" font-size="9">memory.py</text>
+
+      <!-- RAG -->
+      <rect x="30" y="270" width="140" height="80" rx="8" fill="#181d2b" stroke="#7ee8b2" stroke-width="1.5"/>
+      <text x="100" y="298" text-anchor="middle" fill="#7ee8b2" font-size="11" font-weight="bold">RAG Client</text>
+      <text x="100" y="314" text-anchor="middle" fill="#5e6e99" font-size="9">rag/client.py</text>
+      <text x="100" y="330" text-anchor="middle" fill="#5e6e99" font-size="9">MiniLM Embedder</text>
+
+      <!-- Qdrant -->
+      <rect x="30" y="380" width="140" height="32" rx="6" fill="#111520" stroke="#4f8ef7" stroke-width="1"/>
+      <text x="100" y="401" text-anchor="middle" fill="#4f8ef7" font-size="10">Qdrant :6333</text>
+
+      <!-- vLLM -->
+      <rect x="440" y="140" width="150" height="80" rx="8" fill="#181d2b" stroke="#f76f8e" stroke-width="1.5"/>
+      <text x="515" y="168" text-anchor="middle" fill="#f76f8e" font-size="11" font-weight="bold">vLLM Server</text>
+      <text x="515" y="184" text-anchor="middle" fill="#5e6e99" font-size="9">vllm/client.py</text>
+      <text x="515" y="200" text-anchor="middle" fill="#5e6e99" font-size="9">Qwen2.5-Coder-7B</text>
+      <text x="515" y="214" text-anchor="middle" fill="#f76f8e" font-size="9">:8000 (OpenAI API)</text>
+
+      <!-- Indexer -->
+      <rect x="440" y="270" width="150" height="80" rx="8" fill="#181d2b" stroke="#5e6e99" stroke-width="1.5"/>
+      <text x="515" y="298" text-anchor="middle" fill="#c8d4f0" font-size="11" font-weight="bold">Indexer</text>
+      <text x="515" y="314" text-anchor="middle" fill="#5e6e99" font-size="9">parse_java.py</text>
+      <text x="515" y="330" text-anchor="middle" fill="#5e6e99" font-size="9">summarize.py · build_index.py</text>
+
+      <!-- Java Repo -->
+      <rect x="630" y="270" width="130" height="80" rx="8" fill="#111520" stroke="#5e6e99" stroke-width="1"/>
+      <text x="695" y="298" text-anchor="middle" fill="#5e6e99" font-size="11" font-weight="bold">Java Repo</text>
+      <text x="695" y="314" text-anchor="middle" fill="#5e6e99" font-size="9">.java files</text>
+      <text x="695" y="330" text-anchor="middle" fill="#5e6e99" font-size="9">DDD structure</text>
+
+      <!-- Arrows -->
+      <!-- IDE → FastAPI -->
+      <line x1="150" y1="60" x2="218" y2="60" stroke="#4f8ef7" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="184" y="53" fill="#4f8ef7" font-size="8" text-anchor="middle">OpenAI API</text>
+
+      <!-- FastAPI → Orchestrator -->
+      <line x1="295" y1="100" x2="295" y2="138" stroke="#7ee8b2" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+      <!-- Orchestrator → RAG -->
+      <line x1="250" y1="220" x2="145" y2="268" stroke="#7ee8b2" stroke-width="1.5" marker-end="url(#arrow2)"/>
+      <text x="175" y="255" fill="#7ee8b2" font-size="8">retrieve</text>
+
+      <!-- Orchestrator → vLLM -->
+      <line x1="370" y1="180" x2="438" y2="180" stroke="#f76f8e" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="404" y="174" fill="#f76f8e" font-size="8" text-anchor="middle">generate</text>
+
+      <!-- RAG → Qdrant -->
+      <line x1="100" y1="350" x2="100" y2="378" stroke="#4f8ef7" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+      <!-- Indexer → Qdrant -->
+      <line x1="480" y1="350" x2="175" y2="396" stroke="#5e6e99" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="330" y="388" fill="#5e6e99" font-size="8" text-anchor="middle">upsert vectors</text>
+
+      <!-- Java Repo → Indexer -->
+      <line x1="630" y1="310" x2="592" y2="310" stroke="#5e6e99" stroke-width="1.5" marker-end="url(#arrow)"/>
+    </svg>
+  </div>
+
+  <h3>Diagram 2 — Agent Loop</h3>
+  <div class="diagram-wrap">
+    <svg viewBox="0 0 700 280" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-height:280px;">
+      <defs>
+        <marker id="arr3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#4f8ef7"/>
+        </marker>
+        <marker id="arr4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#f7c84f"/>
+        </marker>
+      </defs>
+
+      <!-- Steps as rounded boxes -->
+      <!-- User Request -->
+      <rect x="10" y="110" width="100" height="50" rx="8" fill="#181d2b" stroke="#4f8ef7" stroke-width="1.5"/>
+      <text x="60" y="131" text-anchor="middle" fill="#4f8ef7" font-size="10" font-weight="bold">User</text>
+      <text x="60" y="147" text-anchor="middle" fill="#5e6e99" font-size="9">Request</text>
+
+      <!-- Retrieve -->
+      <rect x="150" y="110" width="100" height="50" rx="8" fill="#181d2b" stroke="#7ee8b2" stroke-width="1.5"/>
+      <text x="200" y="131" text-anchor="middle" fill="#7ee8b2" font-size="10" font-weight="bold">Retrieve</text>
+      <text x="200" y="147" text-anchor="middle" fill="#5e6e99" font-size="9">RAG + Memory</text>
+
+      <!-- Reason -->
+      <rect x="290" y="110" width="100" height="50" rx="8" fill="#181d2b" stroke="#f7c84f" stroke-width="1.5"/>
+      <text x="340" y="131" text-anchor="middle" fill="#f7c84f" font-size="10" font-weight="bold">Reason</text>
+      <text x="340" y="147" text-anchor="middle" fill="#5e6e99" font-size="9">LLM Generate</text>
+
+      <!-- Validate -->
+      <rect x="430" y="110" width="100" height="50" rx="8" fill="#181d2b" stroke="#f76f8e" stroke-width="1.5"/>
+      <text x="480" y="131" text-anchor="middle" fill="#f76f8e" font-size="10" font-weight="bold">Validate</text>
+      <text x="480" y="147" text-anchor="middle" fill="#5e6e99" font-size="9">rules.py check</text>
+
+      <!-- Respond -->
+      <rect x="570" y="110" width="120" height="50" rx="8" fill="#181d2b" stroke="#4f8ef7" stroke-width="1.5"/>
+      <text x="630" y="131" text-anchor="middle" fill="#4f8ef7" font-size="10" font-weight="bold">Respond</text>
+      <text x="630" y="147" text-anchor="middle" fill="#5e6e99" font-size="9">+ Store in Memory</text>
+
+      <!-- Arrows between boxes -->
+      <line x1="110" y1="135" x2="148" y2="135" stroke="#4f8ef7" stroke-width="1.5" marker-end="url(#arr3)"/>
+      <line x1="250" y1="135" x2="288" y2="135" stroke="#4f8ef7" stroke-width="1.5" marker-end="url(#arr3)"/>
+      <line x1="390" y1="135" x2="428" y2="135" stroke="#4f8ef7" stroke-width="1.5" marker-end="url(#arr3)"/>
+      <line x1="530" y1="135" x2="568" y2="135" stroke="#4f8ef7" stroke-width="1.5" marker-end="url(#arr3)"/>
+
+      <!-- Feedback loop arrow (bottom) -->
+      <path d="M 630 160 C 630 220, 480 240, 340 240 C 200 240, 110 220, 60 180" stroke="#f7c84f" stroke-width="1.5" stroke-dasharray="5 3" fill="none" marker-end="url(#arr4)"/>
+      <text x="340" y="258" text-anchor="middle" fill="#f7c84f" font-size="9">Human feedback via /refine-test → loop repeats</text>
+
+      <!-- Validate fail path -->
+      <line x1="480" y1="110" x2="480" y2="75" stroke="#f76f8e" stroke-width="1" stroke-dasharray="4 3"/>
+      <line x1="480" y1="75" x2="340" y2="75" stroke="#f76f8e" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr3)"/>
+      <text x="410" y="68" text-anchor="middle" fill="#f76f8e" font-size="9">fail (no auto-retry)</text>
+      <text x="340" y="105" text-anchor="middle" fill="#f76f8e" font-size="8">↓ returned as validation_issues</text>
+
+      <!-- Title labels -->
+      <text x="200" y="20" text-anchor="middle" fill="#5e6e99" font-size="10" font-style="italic">Session-based multi-turn refinement loop</text>
+    </svg>
+  </div>
+
+  <h3>Diagram 3 — Request Processing Flow</h3>
+  <div class="diagram-wrap">
+    <svg viewBox="0 0 760 460" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-height:460px;">
+      <defs>
+        <marker id="arr5" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L8,3 z" fill="#c8d4f0"/>
+        </marker>
+      </defs>
+
+      <!-- Column headers -->
+      <text x="80" y="22" text-anchor="middle" fill="#4f8ef7" font-size="10" font-weight="bold">CLIENT</text>
+      <text x="240" y="22" text-anchor="middle" fill="#7ee8b2" font-size="10" font-weight="bold">API LAYER</text>
+      <text x="390" y="22" text-anchor="middle" fill="#f7c84f" font-size="10" font-weight="bold">AGENT LAYER</text>
+      <text x="545" y="22" text-anchor="middle" fill="#f76f8e" font-size="10" font-weight="bold">MODEL / STORE</text>
+
+      <!-- Timeline lines -->
+      <line x1="80" y1="30" x2="80" y2="450" stroke="#1f2740" stroke-width="1"/>
+      <line x1="240" y1="30" x2="240" y2="450" stroke="#1f2740" stroke-width="1"/>
+      <line x1="390" y1="30" x2="390" y2="450" stroke="#1f2740" stroke-width="1"/>
+      <line x1="545" y1="30" x2="545" y2="450" stroke="#1f2740" stroke-width="1"/>
+
+      <!-- Step 1: POST /generate-test -->
+      <rect x="20" y="45" width="120" height="30" rx="5" fill="#181d2b" stroke="#4f8ef7" stroke-width="1"/>
+      <text x="80" y="65" text-anchor="middle" fill="#4f8ef7" font-size="9">POST /generate-test</text>
+      <line x1="140" y1="60" x2="178" y2="60" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+
+      <!-- Step 2: Route + session lookup -->
+      <rect x="180" y="45" width="120" height="30" rx="5" fill="#181d2b" stroke="#7ee8b2" stroke-width="1"/>
+      <text x="240" y="62" text-anchor="middle" fill="#7ee8b2" font-size="9">Route + load session</text>
+      <line x1="300" y1="60" x2="328" y2="60" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+
+      <!-- Step 3: Orchestrator -->
+      <rect x="330" y="45" width="120" height="30" rx="5" fill="#181d2b" stroke="#f7c84f" stroke-width="1"/>
+      <text x="390" y="62" text-anchor="middle" fill="#f7c84f" font-size="9">orchestrator.run()</text>
+
+      <!-- Step 4: embed query -->
+      <line x1="390" y1="75" x2="390" y2="105" stroke="#f7c84f" stroke-width="1"/>
+      <line x1="390" y1="105" x2="483" y2="105" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+      <rect x="485" y="90" width="120" height="30" rx="5" fill="#181d2b" stroke="#f76f8e" stroke-width="1"/>
+      <text x="545" y="110" text-anchor="middle" fill="#f76f8e" font-size="9">MiniLM: embed query</text>
+
+      <!-- Step 5: Qdrant search -->
+      <line x1="545" y1="120" x2="545" y2="155" stroke="#f76f8e" stroke-width="1"/>
+      <rect x="485" y="155" width="120" height="30" rx="5" fill="#181d2b" stroke="#f76f8e" stroke-width="1"/>
+      <text x="545" y="175" text-anchor="middle" fill="#f76f8e" font-size="9">Qdrant: similarity search</text>
+
+      <!-- Return chunks -->
+      <line x1="485" y1="170" x2="413" y2="170" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+      <text x="447" y="163" text-anchor="middle" fill="#5e6e99" font-size="8">top-k chunks</text>
+
+      <!-- Step 6: Build prompt -->
+      <line x1="390" y1="185" x2="390" y2="215" stroke="#f7c84f" stroke-width="1"/>
+      <rect x="330" y="215" width="120" height="30" rx="5" fill="#181d2b" stroke="#f7c84f" stroke-width="1"/>
+      <text x="390" y="235" text-anchor="middle" fill="#f7c84f" font-size="9">prompt.build()</text>
+
+      <!-- Step 7: vLLM call -->
+      <line x1="450" y1="230" x2="483" y2="230" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+      <rect x="485" y="215" width="120" height="30" rx="5" fill="#181d2b" stroke="#f76f8e" stroke-width="1"/>
+      <text x="545" y="235" text-anchor="middle" fill="#f76f8e" font-size="9">vLLM: chat/completions</text>
+
+      <!-- Return LLM output -->
+      <line x1="485" y1="245" x2="413" y2="275" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+      <text x="447" y="263" text-anchor="middle" fill="#5e6e99" font-size="8">test_code</text>
+
+      <!-- Step 8: Validate -->
+      <rect x="330" y="280" width="120" height="30" rx="5" fill="#181d2b" stroke="#f7c84f" stroke-width="1"/>
+      <text x="390" y="300" text-anchor="middle" fill="#f7c84f" font-size="9">rules.validate()</text>
+
+      <!-- Step 9: Update memory -->
+      <line x1="390" y1="310" x2="390" y2="340" stroke="#f7c84f" stroke-width="1"/>
+      <rect x="330" y="340" width="120" height="30" rx="5" fill="#181d2b" stroke="#f7c84f" stroke-width="1"/>
+      <text x="390" y="360" text-anchor="middle" fill="#f7c84f" font-size="9">memory.update()</text>
+
+      <!-- Return to API -->
+      <line x1="330" y1="355" x2="302" y2="355" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+      <rect x="180" y="340" width="120" height="30" rx="5" fill="#181d2b" stroke="#7ee8b2" stroke-width="1"/>
+      <text x="240" y="360" text-anchor="middle" fill="#7ee8b2" font-size="9">HTTP 200 Response</text>
+
+      <!-- Return to client -->
+      <line x1="180" y1="355" x2="142" y2="355" stroke="#c8d4f0" stroke-width="1" marker-end="url(#arr5)"/>
+      <rect x="20" y="340" width="120" height="30" rx="5" fill="#181d2b" stroke="#4f8ef7" stroke-width="1"/>
+      <text x="80" y="360" text-anchor="middle" fill="#4f8ef7" font-size="9">{test_code, ...}</text>
+
+      <!-- Labels on timeline -->
+      <text x="80" y="430" text-anchor="middle" fill="#5e6e99" font-size="8">Tabby / curl</text>
+      <text x="240" y="430" text-anchor="middle" fill="#5e6e99" font-size="8">server/api.py</text>
+      <text x="390" y="430" text-anchor="middle" fill="#5e6e99" font-size="8">agent/orchestrator.py</text>
+      <text x="545" y="430" text-anchor="middle" fill="#5e6e99" font-size="8">Qdrant · vLLM</text>
+    </svg>
+  </div>
+
+</section>
+
+</main>
+</div>
+
+<footer>
+  Analysis generated: March 2026 &nbsp;·&nbsp; Repository: huynguyenjv/ai-agent &nbsp;·&nbsp; Stack: Python · FastAPI · Qdrant · vLLM · Qwen2.5-Coder-7B
+</footer>
+
+</body>
+</html>
