@@ -4,18 +4,13 @@ RAG client for querying the Qdrant vector index.
 
 import os
 import time
-import warnings
 from typing import Optional
-
-# Bypass SSL for corporate proxy
-os.environ.setdefault('HF_HUB_DISABLE_SSL_VERIFY', '1')
-warnings.filterwarnings('ignore')
 
 import structlog
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from sentence_transformers import SentenceTransformer
 
+from utils.embedding import ONNXEmbedder
 from .schema import CodeChunk, SearchQuery, SearchResult, MetadataFilter, IndexStats, FieldSchema
 
 logger = structlog.get_logger()
@@ -29,11 +24,11 @@ class RAGClient:
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
         collection_name: str = "java_codebase",
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        embedding_model: str = "all-MiniLM-L6-v2-onnx",
     ):
         self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
         self.collection_name = collection_name
-        self.embedder = SentenceTransformer(embedding_model)
+        self.embedder = ONNXEmbedder(embedding_model)
         logger.info(
             "RAG client initialized",
             host=qdrant_host,

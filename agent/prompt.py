@@ -681,6 +681,6 @@ NOW: analyze and write tests for the following service:
 
     def estimate_tokens(self, text: str) -> int:
         """Estimate token count for text."""
-        # Rough approximation: 1 token ≈ 4 characters
-        return len(text) // 4
+        from utils.tokenizer import count_tokens
+        return count_tokens(text)
 

@@ -13,19 +13,11 @@ from contextlib import asynccontextmanager
 from typing import Optional, Literal
 
 import structlog
-import logging
-
-# Cấu hình log level DEBUG cho toàn bộ app
-logging.basicConfig(level=logging.DEBUG)
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
-)
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
-from collections import defaultdict
 
 from agent.orchestrator import AgentOrchestrator, GenerationRequest, StreamEvent, StreamPhase
 from agent.events import get_event_bus, Event, EventType
@@ -34,6 +26,8 @@ from indexer.build_index import IndexBuilder
 from rag.client import RAGClient
 from rag.schema import SearchQuery
 from vllm.client import VLLMClient
+from utils.rate_limiter import RateLimiter
+from utils.tokenizer import count_tokens
 from .session import SessionManager, SessionInfo
 
 # Load environment variables
@@ -46,6 +40,7 @@ orchestrator: Optional[AgentOrchestrator] = None
 index_builder: Optional[IndexBuilder] = None
 metrics_collector: Optional[MetricsCollector] = None
 session_manager: SessionManager = SessionManager()
+rate_limiter: Optional[RateLimiter] = None
 
 # Thread pool for running blocking operations
 # Use limited workers to prevent resource exhaustion
@@ -56,9 +51,6 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))  # requests per window
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # window in seconds
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))  # max request time in seconds
-
-# Simple in-memory rate limiter (use Redis for distributed deployments)
-_rate_limit_store: dict[str, list[float]] = defaultdict(list)
 
 
 # ============================================================================
@@ -186,6 +178,7 @@ class GenerateTestResponse(BaseModel):
     success: bool
     test_code: Optional[str] = None
     class_name: str = ""
+    session_id: Optional[str] = None
     validation_passed: bool = True
     validation_issues: list[str] = Field(default_factory=list)
     error: Optional[str] = None
@@ -222,6 +215,8 @@ class HealthResponse(BaseModel):
     status: str
     vllm_healthy: bool
     qdrant_healthy: bool
+    redis_healthy: bool = False
+    cache_backend: str = "memory"
     index_stats: Optional[dict] = None
 
 
@@ -231,7 +226,7 @@ def create_orchestrator() -> AgentOrchestrator:
         qdrant_host=os.getenv("QDRANT_HOST", "localhost"),
         qdrant_port=int(os.getenv("QDRANT_PORT", "6333")),
         collection_name=os.getenv("QDRANT_COLLECTION", "java_codebase"),
-        embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2-onnx"),
     )
 
     vllm_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
@@ -252,6 +247,7 @@ def create_orchestrator() -> AgentOrchestrator:
     return AgentOrchestrator(
         rag_client=rag_client,
         vllm_client=vllm_client,
+        repo_path=os.getenv("JAVA_REPO_PATH") or None,
     )
 
 
@@ -261,20 +257,30 @@ def create_index_builder() -> IndexBuilder:
         qdrant_host=os.getenv("QDRANT_HOST", "localhost"),
         qdrant_port=int(os.getenv("QDRANT_PORT", "6333")),
         collection_name=os.getenv("QDRANT_COLLECTION", "java_codebase"),
-        embedding_model=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2-onnx"),
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global orchestrator, index_builder, _executor, metrics_collector
+    global orchestrator, index_builder, _executor, metrics_collector, rate_limiter
 
     logger.info("Starting AI Agent server...")
 
     # Initialize thread pool for blocking operations
     _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     logger.info("Thread pool initialized", max_workers=MAX_WORKERS)
+
+    # Initialize rate limiter
+    rate_limiter = RateLimiter(
+        redis_host=os.getenv("REDIS_HOST", "localhost"),
+        redis_port=int(os.getenv("REDIS_PORT", "6379")),
+        redis_password=os.getenv("REDIS_PASSWORD") or None,
+        redis_db=int(os.getenv("REDIS_DB", "0")),
+        requests_per_window=RATE_LIMIT_REQUESTS,
+        window_seconds=RATE_LIMIT_WINDOW,
+    )
 
     # Initialize components
     orchestrator = create_orchestrator()
@@ -305,6 +311,28 @@ async def lifespan(app: FastAPI):
         orchestrator.vllm.close()
         logger.info("vLLM client closed")
 
+    # Close Qdrant connections
+    if orchestrator and orchestrator.rag:
+        try:
+            orchestrator.rag.qdrant.close()
+            logger.info("Qdrant client (RAG) closed")
+        except Exception as e:
+            logger.warning("Failed to close RAG Qdrant client", error=str(e))
+    if index_builder:
+        try:
+            index_builder.qdrant.close()
+            logger.info("Qdrant client (indexer) closed")
+        except Exception as e:
+            logger.warning("Failed to close indexer Qdrant client", error=str(e))
+
+    # Close Redis connections
+    if rate_limiter and rate_limiter.redis_client:
+        try:
+            rate_limiter.redis_client.close()
+            logger.info("Redis client (rate limiter) closed")
+        except Exception as e:
+            logger.warning("Failed to close rate limiter Redis", error=str(e))
+
     # Shutdown thread pool
     if _executor:
         _executor.shutdown(wait=True, cancel_futures=True)
@@ -316,7 +344,8 @@ async def _periodic_session_cleanup():
     while True:
         try:
             await asyncio.sleep(300)  # Every 5 minutes
-            count = session_manager.cleanup_expired()
+            loop = asyncio.get_running_loop()
+            count = await loop.run_in_executor(_executor, session_manager.cleanup_expired)
             if count > 0:
                 logger.info("Cleaned up expired sessions", count=count)
         except asyncio.CancelledError:
@@ -333,7 +362,7 @@ _active_tasks_lock = __import__("threading").Lock()
 async def run_in_executor(func, *args):
     """Run a blocking function in the thread pool with timeout."""
     global _active_tasks
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     with _active_tasks_lock:
         _active_tasks += 1
@@ -367,23 +396,22 @@ async def run_in_executor(func, *args):
             _active_tasks -= 1
 
 
-def check_rate_limit(client_ip: str) -> bool:
-    """Check if client has exceeded rate limit. Returns True if allowed."""
-    now = time.time()
-    window_start = now - RATE_LIMIT_WINDOW
+def check_rate_limit(client_ip: str) -> tuple[bool, int]:
+    """Check if client has exceeded rate limit.
+
+    Returns:
+        (allowed: bool, remaining: int) - Whether request is allowed and remaining requests
+
+    NOTE: This is a sync function that may do Redis I/O.
+    Must be called via run_in_executor() from async context.
+    """
+    if not rate_limiter:
+        return True, RATE_LIMIT_REQUESTS  # Allow if rate limiter not initialized
     
-    # Clean old entries
-    _rate_limit_store[client_ip] = [
-        ts for ts in _rate_limit_store[client_ip] if ts > window_start
-    ]
+    allowed = rate_limiter.check_rate_limit(client_ip)
+    remaining = rate_limiter.get_remaining_requests(client_ip)
     
-    # Check limit
-    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
-        return False
-    
-    # Record this request
-    _rate_limit_store[client_ip].append(now)
-    return True
+    return allowed, remaining
 
 
 def create_app() -> FastAPI:
@@ -419,7 +447,7 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
         # Skip rate limiting for health checks
-        if request.url.path in ["/health", "/v1/health", "/v1/models"]:
+        if request.url.path in ["/health", "/v1/health", "/v1/models", "/metrics"]:
             return await call_next(request)
         
         # Get client IP (handle proxy headers)
@@ -427,17 +455,36 @@ def create_app() -> FastAPI:
         if not client_ip:
             client_ip = request.client.host if request.client else "unknown"
         
-        # Check rate limit
-        if not check_rate_limit(client_ip):
-            logger.warning("Rate limit exceeded", client_ip=client_ip)
+        # Check rate limit — run in executor to avoid blocking event loop
+        loop = asyncio.get_running_loop()
+        allowed, remaining = await loop.run_in_executor(
+            _executor, check_rate_limit, client_ip
+        )
+        if not allowed:
+            logger.warning("Rate limit exceeded", client_ip=client_ip, remaining=remaining)
             return JSONResponse(
                 status_code=429,
                 content={
-                    "detail": f"Rate limit exceeded. Max {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds."
+                    "error": "Rate limit exceeded",
+                    "message": f"Too many requests. Max {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds.",
+                    "retry_after": RATE_LIMIT_WINDOW
+                },
+                headers={
+                    "Retry-After": str(RATE_LIMIT_WINDOW),
+                    "X-RateLimit-Limit": str(RATE_LIMIT_REQUESTS),
+                    "X-RateLimit-Remaining": str(remaining),
+                    "X-RateLimit-Reset": str(int(time.time() + RATE_LIMIT_WINDOW)),
                 }
             )
         
-        return await call_next(request)
+        response = await call_next(request)
+        
+        # Add rate limit headers to successful responses
+        response.headers["X-RateLimit-Limit"] = str(RATE_LIMIT_REQUESTS)
+        response.headers["X-RateLimit-Remaining"] = str(remaining - 1)  # Account for current request 
+        response.headers["X-RateLimit-Reset"] = str(int(time.time() + RATE_LIMIT_WINDOW))
+        
+        return response
 
     return app
 
@@ -477,17 +524,44 @@ async def health_check():
                 )
                 qdrant_healthy = True
                 index_stats = {"collection": "java_codebase", "total_points": 0, "status": "connected"}
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Qdrant direct connection check failed", error=str(e))
 
     status = "healthy" if (vllm_healthy and qdrant_healthy) else "degraded"
+
+    # Check Redis/cache health
+    from utils.cache_service import get_cache_service
+    cache = get_cache_service()
+    redis_healthy = cache.is_redis_connected
+    cache_backend = cache.backend_name
 
     return HealthResponse(
         status=status,
         vllm_healthy=vllm_healthy,
         qdrant_healthy=qdrant_healthy,
+        redis_healthy=redis_healthy,
+        cache_backend=cache_backend,
         index_stats=index_stats,
     )
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Get cache service statistics."""
+    from utils.cache_service import get_cache_service
+    cache = get_cache_service()
+    loop = asyncio.get_running_loop()
+    stats = await loop.run_in_executor(_executor, cache.get_cache_stats)
+    
+    # Add rate limiter info
+    if rate_limiter:
+        stats["rate_limiter"] = {
+            "backend": "redis" if rate_limiter.redis_client else "memory",
+            "requests_per_window": rate_limiter.requests_per_window,
+            "window_seconds": rate_limiter.window_seconds,
+        }
+    
+    return stats
 
 
 @app.post("/generate-test", response_model=GenerateTestResponse, deprecated=True)
@@ -537,7 +611,10 @@ async def refine_test(request: RefineTestRequest):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Verify session exists
-    session = session_manager.get_session(request.session_id)
+    loop = asyncio.get_running_loop()
+    session = await loop.run_in_executor(
+        _executor, session_manager.get_session, request.session_id
+    )
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -549,9 +626,12 @@ async def refine_test(request: RefineTestRequest):
     )
 
     if result.success:
-        session_manager.update_session(
-            session_id=request.session_id,
-            increment_tests=True,
+        await loop.run_in_executor(
+            _executor,
+            lambda: session_manager.update_session(
+                session_id=request.session_id,
+                increment_tests=True,
+            ),
         )
 
     return GenerateTestResponse(
@@ -577,10 +657,11 @@ async def reindex(request: ReindexRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"Directory not found: {request.repo_path}")
 
     try:
-        # Run indexing (could be moved to background for large repos)
-        points_indexed = index_builder.index_repository(
-            repo_path=request.repo_path,
-            recreate=request.recreate,
+        # Run indexing in thread pool to avoid blocking event loop
+        points_indexed = await run_in_executor(
+            index_builder.index_repository,
+            request.repo_path,
+            request.recreate,
         )
 
         return ReindexResponse(
@@ -604,7 +685,7 @@ async def get_index_stats():
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    stats = orchestrator.rag.get_stats()
+    stats = await run_in_executor(orchestrator.rag.get_stats)
     return stats.model_dump()
 
 
@@ -623,12 +704,12 @@ async def lookup_class(class_name: str):
     rag = orchestrator.rag
 
     # Tier 1: metadata scroll (guaranteed find)
-    chunk = rag._scroll_by_class_name(class_name)
+    chunk = await run_in_executor(rag._scroll_by_class_name, class_name)
     lookup_method = "scroll"
 
     # Tier 2: semantic search fallback
     if not chunk:
-        result = rag.search_by_class(class_name, top_k=1, include_dependencies=False)
+        result = await run_in_executor(rag.search_by_class, class_name, 1, False)
         chunk = result.chunks[0] if result.chunks else None
         lookup_method = "semantic"
 
@@ -667,13 +748,15 @@ async def lookup_class(class_name: str):
 @app.post("/session", response_model=SessionInfo)
 async def create_session():
     """Create a new session."""
-    return session_manager.create_session()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, session_manager.create_session)
 
 
 @app.get("/session/{session_id}", response_model=SessionInfo)
 async def get_session(session_id: str):
     """Get session information."""
-    session = session_manager.get_session(session_id)
+    loop = asyncio.get_running_loop()
+    session = await loop.run_in_executor(_executor, session_manager.get_session, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -682,7 +765,9 @@ async def get_session(session_id: str):
 @app.delete("/session/{session_id}")
 async def delete_session(session_id: str):
     """Delete a session."""
-    if session_manager.delete_session(session_id):
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(_executor, session_manager.delete_session, session_id)
+    if deleted:
         return {"message": "Session deleted"}
     raise HTTPException(status_code=404, detail="Session not found")
 
@@ -690,7 +775,8 @@ async def delete_session(session_id: str):
 @app.get("/sessions", response_model=list[SessionInfo])
 async def list_sessions():
     """List all active sessions."""
-    return session_manager.list_sessions()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, session_manager.list_sessions)
 
 
 # ============================================================================
@@ -1137,9 +1223,9 @@ def _non_streaming_response(
             )
         ],
         usage=ChatCompletionUsage(
-            prompt_tokens=len(user_content) // 4,
-            completion_tokens=len(content) // 4,
-            total_tokens=tokens_used or (len(user_content) + len(content)) // 4,
+            prompt_tokens=count_tokens(user_content),
+            completion_tokens=count_tokens(content),
+            total_tokens=tokens_used or (count_tokens(user_content) + count_tokens(content)),
         ),
     )
 
@@ -1196,20 +1282,20 @@ def _stream_test_generation(
 
         # Run the sync generator in a thread, ferry events via asyncio.Queue
         queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
 
         def _run_sync():
             try:
                 for event in orchestrator.generate_test_streaming(gen_request):
-                    queue.put_nowait(event)
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
             except Exception as exc:
-                queue.put_nowait(StreamEvent(
-                    phase=StreamPhase.ERROR,
-                    content=f"Error: {exc}",
-                ))
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    StreamEvent(phase=StreamPhase.ERROR, content=f"Error: {exc}"),
+                )
             finally:
-                queue.put_nowait(None)  # sentinel
+                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
-        loop = asyncio.get_running_loop()
         loop.run_in_executor(None, _run_sync)
 
         while True:
@@ -1280,6 +1366,7 @@ def _stream_from_vllm(
             # so we run it in a thread and ferry deltas via an asyncio.Queue
             # to avoid blocking the event loop.
             queue: asyncio.Queue[str | None] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
 
             def _run_sync_gen():
                 try:
@@ -1289,13 +1376,14 @@ def _stream_from_vllm(
                         temperature=temperature,
                         max_tokens=max_tokens,
                     ):
-                        queue.put_nowait(delta_text)
+                        loop.call_soon_threadsafe(queue.put_nowait, delta_text)
                 except Exception as exc:
-                    queue.put_nowait(f"\n\n[Error: {exc}]")
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, f"\n\n[Error: {exc}]"
+                    )
                 finally:
-                    queue.put_nowait(None)  # sentinel
+                    loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
-            loop = asyncio.get_running_loop()
             loop.run_in_executor(None, _run_sync_gen)
 
             while True:
@@ -1447,7 +1535,9 @@ async def get_rag_context(
 
     session = None
     if session_id:
-        session = orchestrator.memory_manager.get_session(session_id)
+        session = await run_in_executor(
+            orchestrator.memory_manager.get_session, session_id
+        )
 
     chunks = await run_in_executor(
         orchestrator._get_rag_context, class_name, file_path, session
@@ -1495,12 +1585,13 @@ async def agent_event_stream():
     as the agent processes requests.
     """
     import asyncio
-    import queue
+    import queue as queue_mod
 
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    event_queue: queue.Queue = queue.Queue(maxsize=100)
+    event_queue: queue_mod.Queue = queue_mod.Queue(maxsize=100)
+    keepalive_counter = 0  # Track iterations for keepalive spacing
 
     def _forward_to_queue(event: Event) -> None:
         try:
@@ -1511,28 +1602,36 @@ async def agent_event_stream():
                 "source": event.source,
                 "plan_id": event.plan_id,
             })
-        except queue.Full:
-            pass  # Drop oldest events if consumer is slow
+        except queue_mod.Full:
+            logger.debug("Event queue full, dropping event")
 
     # Subscribe to all events
     orchestrator.event_bus.subscribe_all(_forward_to_queue)
 
     async def _event_generator():
+        nonlocal keepalive_counter
         try:
             while True:
                 try:
                     evt = event_queue.get_nowait()
+                    keepalive_counter = 0
                     yield f"data: {json.dumps(evt)}\n\n"
-                except queue.Empty:
-                    # Send keepalive every 15s
-                    yield ": keepalive\n\n"
+                except queue_mod.Empty:
+                    keepalive_counter += 1
+                    # Send keepalive every ~15s (15 iterations × 1s sleep)
+                    if keepalive_counter >= 15:
+                        yield ": keepalive\n\n"
+                        keepalive_counter = 0
                     await asyncio.sleep(1)
         finally:
-            # Cleanup: best-effort unsubscribe
+            # Cleanup: thread-safe unsubscribe via EventBus lock
             try:
-                orchestrator.event_bus._wildcard_handlers.remove(_forward_to_queue)
-            except (ValueError, AttributeError):
-                pass
+                with orchestrator.event_bus._lock:
+                    handlers = orchestrator.event_bus._wildcard_handlers
+                    if _forward_to_queue in handlers:
+                        handlers.remove(_forward_to_queue)
+            except Exception:
+                logger.debug("Event handler cleanup failed (non-critical)")
 
     return StreamingResponse(
         _event_generator(),
