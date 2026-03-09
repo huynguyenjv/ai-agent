@@ -13,6 +13,8 @@ from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
+from utils.tokenizer import count_tokens
+
 import structlog
 
 from .plan import ExecutionPlan, PlanStep, StepAction, StepStatus, TaskType
@@ -28,6 +30,7 @@ from .metrics import MetricsCollector
 from rag.client import RAGClient
 from rag.schema import SearchQuery, CodeChunk, MetadataFilter
 from vllm.client import VLLMClient
+from utils.cache_service import get_cache_service
 
 # Phase 2: optional context builder
 try:
@@ -125,6 +128,9 @@ class AgentOrchestrator:
         self.event_bus = get_event_bus()
         self.metrics = MetricsCollector(self.event_bus)
 
+        # Centralized cache service (Redis-backed if available)
+        self.cache = get_cache_service()
+
         self.top_k = top_k_results
         self.max_context_tokens = max_context_tokens
         self.max_repair_attempts = max_repair_attempts
@@ -146,6 +152,7 @@ class AgentOrchestrator:
         logger.info(
             "Agent orchestrator initialized (Phase 1-4: SM + Planner + Context + Validation + Events)",
             intelligence=self.context_builder.intelligence_ready if self.context_builder else False,
+            cache_backend=self.cache.backend_name,
         )
 
     # =====================================================================
@@ -314,7 +321,8 @@ class AgentOrchestrator:
                         top_k=self.top_k,
                     )
                     rag_chunks = context_result.rag_chunks
-                except Exception:
+                except Exception as e:
+                    logger.warning("ContextBuilder failed, falling back to RAG", error=str(e))
                     rag_chunks = self._get_rag_context(
                         class_name=class_name,
                         file_path=request.file_path,
@@ -375,7 +383,7 @@ class AgentOrchestrator:
                 extracted_code, rag_chunks=rag_chunks,
             )
 
-            tokens_used = len(full_response) // 4  # rough estimate
+            tokens_used = count_tokens(full_response)
 
             if validation_result.passed:
                 yield StreamEvent(
@@ -1167,8 +1175,14 @@ class AgentOrchestrator:
         if session:
             cached = session.get_cached_rag_context(cache_key)
             if cached:
-                logger.debug("Using cached RAG context", class_name=class_name)
+                logger.debug("Using cached RAG context (session)", class_name=class_name)
                 return [CodeChunk(**c) for c in cached]
+
+        # Check centralized Redis cache (shared across sessions)
+        redis_cached = self.cache.get_rag_context(cache_key)
+        if redis_cached:
+            logger.debug("Using cached RAG context (Redis)", class_name=class_name)
+            return [CodeChunk(**c) for c in redis_cached]
 
         chunks: list[CodeChunk] = []
         existing_fqns: set[str] = set()
@@ -1260,12 +1274,11 @@ class AgentOrchestrator:
         if unfound_types and main_chunk:
             main_chunk.unfound_types = sorted(unfound_types)
 
-        # Cache in session
+        # Cache in session and Redis
+        chunks_data = [c.model_dump() for c in chunks]
         if session:
-            session.cache_rag_context(
-                cache_key,
-                [c.model_dump() for c in chunks],
-            )
+            session.cache_rag_context(cache_key, chunks_data)
+        self.cache.cache_rag_context(cache_key, chunks_data, ttl=3600)
 
         logger.info(
             "RAG context retrieved (target+deps+used_types)",

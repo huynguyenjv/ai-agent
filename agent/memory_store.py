@@ -313,10 +313,17 @@ def create_memory_store(backend: str = "memory", **kwargs) -> MemoryStore:
         **kwargs: Backend-specific configuration
     
     Returns:
-        MemoryStore instance
+        MemoryStore instance (falls back to InMemoryStore if Redis is unavailable)
     """
     if backend == "redis":
-        return RedisStore(**kwargs)
+        try:
+            return RedisStore(**kwargs)
+        except ImportError:
+            logger.warning("Redis package not installed, falling back to in-memory store")
+            return InMemoryStore()
+        except Exception as e:
+            logger.warning("Redis connection failed, falling back to in-memory store", error=str(e))
+            return InMemoryStore()
     else:
         return InMemoryStore()
 

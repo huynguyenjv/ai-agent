@@ -10,6 +10,9 @@ from typing import Optional, Generator
 import httpx
 import structlog
 
+from utils.ssl_utils import ssl_config
+from utils.tokenizer import count_tokens
+
 logger = structlog.get_logger()
 
 
@@ -58,7 +61,7 @@ class VLLMClient:
         )
 
         # Use longer timeouts for connect and read
-        self.client = httpx.Client(
+        client_kwargs = ssl_config.configure_httpx_client(
             timeout=httpx.Timeout(
                 connect=30.0,
                 read=timeout,
@@ -72,6 +75,8 @@ class VLLMClient:
             },
             http2=False,  # Disable HTTP/2 for better compatibility with vLLM
         )
+        
+        self.client = httpx.Client(**client_kwargs)
 
         logger.info(
             "vLLM client initialized",
@@ -194,7 +199,7 @@ class VLLMClient:
 
         content = "".join(content_parts)
         # Estimate tokens (streaming doesn't always return usage)
-        tokens_used = len(content) // 4  # Rough estimate
+        tokens_used = count_tokens(content)
 
         logger.info(
             "Streaming generation complete",

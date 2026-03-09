@@ -5,7 +5,8 @@ Ensures the assembled context fits within a specified token budget.
 Uses a priority-based approach: high-priority snippets are preserved
 while lower-priority ones are truncated or dropped.
 
-Token estimation uses a fast char-based heuristic (~4 chars/token for code).
+Token counting uses tiktoken (cl100k_base) for accuracy, with a
+character-based heuristic fallback when tiktoken is unavailable.
 """
 
 from __future__ import annotations
@@ -22,8 +23,7 @@ logger = structlog.get_logger()
 
 # ── Constants ────────────────────────────────────────────────────────
 
-CHARS_PER_TOKEN = 4  # Conservative estimate for code
-DEFAULT_TOKEN_BUDGET = 6000  # ~24K chars
+DEFAULT_TOKEN_BUDGET = 6000
 
 
 # ── Token Optimizer ──────────────────────────────────────────────────
@@ -126,8 +126,9 @@ class TokenOptimizer:
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
-        """Fast token estimation based on character count."""
-        return max(1, len(text) // CHARS_PER_TOKEN)
+        """Token estimation using tiktoken (with heuristic fallback)."""
+        from utils.tokenizer import count_tokens
+        return count_tokens(text)
 
     def _truncate_snippet(self, snippet: Snippet, max_tokens: int) -> Snippet | None:
         """Truncate a snippet to fit within max_tokens.
@@ -135,33 +136,49 @@ class TokenOptimizer:
         For code snippets, truncates at method boundaries if possible.
         For summaries, truncates at sentence boundaries.
         Returns a new Snippet with truncated content, or None if too small.
+
+        Uses iterative binary-search to find the best char boundary whose
+        token count is ≤ *max_tokens*, then snaps to a meaningful boundary
+        (closing brace or newline for code, period or newline for summaries).
         """
-        max_chars = max_tokens * CHARS_PER_TOKEN
-        if max_chars < 50:
+        if max_tokens < 10:
             return None
 
         content = snippet.content
-        if len(content) <= max_chars:
+        # Fast path — already fits
+        if self.estimate_tokens(content) <= max_tokens:
             return snippet
 
-        # Try to truncate at a meaningful boundary
-        truncated = content[:max_chars]
+        # ── Binary search for the best char length ≤ max_tokens ──────
+        lo, hi = 0, len(content)
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self.estimate_tokens(content[:mid]) <= max_tokens:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
 
-        # For code: find the last complete method (look for closing brace at line start)
+        if best < 50:
+            return None
+
+        truncated = content[:best]
+
+        # ── Snap to a meaningful boundary ────────────────────────────
         if snippet.role.value in ("source", "dependency", "related"):
+            # Code: prefer closing brace at start of line
             last_brace = truncated.rfind("\n}")
-            if last_brace > max_chars * 0.5:  # At least 50% of content
+            if last_brace > best * 0.5:
                 truncated = truncated[: last_brace + 2] + "\n// ... (truncated)"
             else:
-                # Fall back to last complete line
                 last_newline = truncated.rfind("\n")
                 if last_newline > 0:
                     truncated = truncated[:last_newline] + "\n// ... (truncated)"
 
-        # For summaries: truncate at sentence boundary
         elif snippet.role.value == "summary":
             last_period = truncated.rfind(". ")
-            if last_period > max_chars * 0.5:
+            if last_period > best * 0.5:
                 truncated = truncated[: last_period + 1] + " ..."
             else:
                 last_newline = truncated.rfind("\n")
