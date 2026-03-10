@@ -231,6 +231,67 @@ class RedisCacheService:
         """Delete cached session data."""
         return self.delete(f"session:{session_id}")
 
+    # ── Collection Registry ──────────────────────────────────────────
+
+    _REGISTRY_KEY = "collections:registry"
+
+    def register_collection(
+        self, collection_name: str, repo_path: str, points_indexed: int = 0,
+    ) -> bool:
+        """Register a collection → repo_path mapping.
+
+        Stored as a Redis hash:  collections:registry  →  {collection_name: JSON}
+        Falls back to in-memory dict when Redis is unavailable.
+        """
+        import time as _time
+        entry = json.dumps({
+            "repo_path": repo_path,
+            "points": points_indexed,
+            "indexed_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        if self._using_redis:
+            try:
+                self._redis.hset(self._key(self._REGISTRY_KEY), collection_name, entry)
+                return True
+            except Exception as e:
+                logger.error("Redis HSET registry failed", error=str(e))
+        # Fallback
+        registry = self._fallback.get(self._REGISTRY_KEY) or {}
+        registry[collection_name] = json.loads(entry)
+        self._fallback.set(self._REGISTRY_KEY, registry, ttl=0)
+        return True
+
+    def get_collection_registry(self) -> dict[str, dict]:
+        """Return the full registry:  {collection_name: {repo_path, points, indexed_at}}."""
+        if self._using_redis:
+            try:
+                raw = self._redis.hgetall(self._key(self._REGISTRY_KEY))
+                return {k: json.loads(v) for k, v in raw.items()} if raw else {}
+            except Exception as e:
+                logger.error("Redis HGETALL registry failed", error=str(e))
+        return self._fallback.get(self._REGISTRY_KEY) or {}
+
+    def resolve_collection_by_path(self, file_path: str) -> Optional[str]:
+        """Given a file_path, try to find which collection it belongs to.
+
+        Matches by checking if the file_path starts with (or contains)
+        any registered repo_path.
+        """
+        registry = self.get_collection_registry()
+        if not registry:
+            return None
+
+        # Normalize separators
+        normalized = file_path.replace("\\", "/").lower()
+        best_match: Optional[str] = None
+        best_len = 0
+        for coll_name, info in registry.items():
+            rp = info.get("repo_path", "").replace("\\", "/").lower()
+            if rp and (normalized.startswith(rp) or rp in normalized) and len(rp) > best_len:
+                best_match = coll_name
+                best_len = len(rp)
+        return best_match
+
     # ── Stats ────────────────────────────────────────────────────────
 
     def get_cache_stats(self) -> dict:

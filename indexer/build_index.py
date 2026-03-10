@@ -99,19 +99,20 @@ class IndexBuilder:
     # Collection management
     # ------------------------------------------------------------------
 
-    def create_collection(self, recreate: bool = False) -> None:
+    def create_collection(self, recreate: bool = False, collection_name: Optional[str] = None) -> None:
+        effective_collection = collection_name or self.collection_name
         collections = self.qdrant.get_collections().collections
-        exists = any(c.name == self.collection_name for c in collections)
+        exists = any(c.name == effective_collection for c in collections)
 
         if exists and recreate:
-            logger.info("Deleting existing collection", collection=self.collection_name)
-            self.qdrant.delete_collection(self.collection_name)
+            logger.info("Deleting existing collection", collection=effective_collection)
+            self.qdrant.delete_collection(effective_collection)
             exists = False
 
         if not exists:
-            logger.info("Creating collection", collection=self.collection_name)
+            logger.info("Creating collection", collection=effective_collection)
             self.qdrant.create_collection(
-                collection_name=self.collection_name,
+                collection_name=effective_collection,
                 vectors_config=models.VectorParams(
                     size=self.vector_size,
                     distance=models.Distance.COSINE,
@@ -126,7 +127,7 @@ class IndexBuilder:
                 ("is_model", models.PayloadSchemaType.KEYWORD),
             ]:
                 self.qdrant.create_payload_index(
-                    collection_name=self.collection_name,
+                    collection_name=effective_collection,
                     field_name=fname,
                     field_schema=ftype,
                 )
@@ -135,9 +136,13 @@ class IndexBuilder:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def index_repository(self, repo_path: str, recreate: bool = False) -> int:
-        logger.info("Starting repository indexing", repo_path=repo_path)
-        self.create_collection(recreate=recreate)
+    def index_repository(
+        self, repo_path: str, recreate: bool = False,
+        collection_name: Optional[str] = None,
+    ) -> int:
+        effective_collection = collection_name or self.collection_name
+        logger.info("Starting repository indexing", repo_path=repo_path, collection=effective_collection)
+        self.create_collection(recreate=recreate, collection_name=effective_collection)
 
         # 1. Parse all Java files
         classes = self.parser.parse_directory(repo_path)
@@ -180,7 +185,7 @@ class IndexBuilder:
         batch_size = 100
         for i in range(0, len(points), batch_size):
             batch = points[i: i + batch_size]
-            self.qdrant.upsert(collection_name=self.collection_name, points=batch)
+            self.qdrant.upsert(collection_name=effective_collection, points=batch)
             logger.info("Indexed batch", start=i, end=i + len(batch))
 
         logger.info("Indexing complete", total_points=len(points))

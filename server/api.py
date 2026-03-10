@@ -109,6 +109,9 @@ class ChatCompletionRequest(BaseModel):
     # Custom fields for RAG
     file_path: Optional[str] = None
     workspace_path: Optional[str] = None
+    # Multi-collection: explicit Qdrant collection name
+    # (set via Continue's extraBodyProperties or sent by CI/CD pipelines)
+    collection: Optional[str] = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -198,6 +201,13 @@ class ReindexRequest(BaseModel):
 
     repo_path: str = Field(..., description="Path to the Java repository")
     recreate: bool = Field(False, description="Whether to recreate the collection")
+    collection: Optional[str] = Field(
+        None,
+        description=(
+            "Qdrant collection name. If omitted, auto-derived from repo folder name "
+            "(e.g. 'vtrip.core.iam' → 'vtrip_core_iam')."
+        ),
+    )
 
 
 class ReindexResponse(BaseModel):
@@ -205,6 +215,7 @@ class ReindexResponse(BaseModel):
 
     success: bool
     message: str
+    collection: str = ""
     points_indexed: int = 0
     error: Optional[str] = None
 
@@ -259,6 +270,52 @@ def create_index_builder() -> IndexBuilder:
         collection_name=os.getenv("QDRANT_COLLECTION", "java_codebase"),
         embedding_model=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2-onnx"),
     )
+
+
+# ── Collection helpers ──────────────────────────────────────────────
+
+import re as _re
+
+
+def _derive_collection_name(repo_path: str) -> str:
+    """Derive a Qdrant-safe collection name from a repository path.
+
+    Examples:
+        C:\\Users\\...\\vtrip.core.iam      → vtrip_core_iam
+        /home/ci/repos/my-awesome-service → my_awesome_service
+    """
+    folder = os.path.basename(os.path.normpath(repo_path))
+    # Replace dots, hyphens, spaces with underscores; lowercase; strip non-alnum
+    safe = _re.sub(r"[^a-zA-Z0-9_]", "_", folder).strip("_").lower()
+    return safe or "java_codebase"
+
+
+def _resolve_collection(
+    explicit: Optional[str] = None,
+    file_path: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> str:
+    """Resolve which Qdrant collection to use (3-tier fallback).
+
+    1. Explicit collection name from request (Continue extraBodyProperties / CI param)
+    2. Auto-detect from file_path via Redis registry
+    3. Default from env var
+    """
+    # Tier 1: explicit
+    if explicit:
+        return explicit
+
+    # Tier 2: auto-detect from file_path (or workspace_path) via registry
+    lookup_path = file_path or workspace_path
+    if lookup_path:
+        from utils.cache_service import get_cache_service
+        cache = get_cache_service()
+        matched = cache.resolve_collection_by_path(lookup_path)
+        if matched:
+            return matched
+
+    # Tier 3: default
+    return os.getenv("QDRANT_COLLECTION", "java_codebase")
 
 
 @asynccontextmanager
@@ -648,7 +705,13 @@ async def refine_test(request: RefineTestRequest):
 
 @app.post("/reindex", response_model=ReindexResponse)
 async def reindex(request: ReindexRequest, background_tasks: BackgroundTasks):
-    """Reindex a Java repository."""
+    """Reindex a Java repository into a dedicated Qdrant collection.
+
+    If ``collection`` is not provided, it is auto-derived from the repo
+    folder name (e.g. ``vtrip.core.iam`` → ``vtrip_core_iam``).
+    The mapping is stored in Redis so ``chat/completions`` can resolve it
+    automatically from ``file_path``.
+    """
     if not index_builder:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
@@ -656,22 +719,32 @@ async def reindex(request: ReindexRequest, background_tasks: BackgroundTasks):
     if not os.path.isdir(request.repo_path):
         raise HTTPException(status_code=400, detail=f"Directory not found: {request.repo_path}")
 
+    # Derive collection name
+    collection_name = request.collection or _derive_collection_name(request.repo_path)
+
     try:
         # Run indexing in thread pool to avoid blocking event loop
         points_indexed = await run_in_executor(
             index_builder.index_repository,
             request.repo_path,
             request.recreate,
+            collection_name,
         )
+
+        # Register collection → repo_path mapping in Redis
+        from utils.cache_service import get_cache_service
+        cache = get_cache_service()
+        cache.register_collection(collection_name, request.repo_path, points_indexed)
 
         return ReindexResponse(
             success=True,
-            message=f"Successfully indexed {points_indexed} code elements",
+            message=f"Successfully indexed {points_indexed} code elements into collection '{collection_name}'",
+            collection=collection_name,
             points_indexed=points_indexed,
         )
 
     except Exception as e:
-        logger.error("Reindexing failed", error=str(e))
+        logger.error("Reindexing failed", error=str(e), collection=collection_name)
         return ReindexResponse(
             success=False,
             message="Reindexing failed",
@@ -680,20 +753,59 @@ async def reindex(request: ReindexRequest, background_tasks: BackgroundTasks):
 
 
 @app.get("/index/stats")
-async def get_index_stats():
-    """Get statistics about the vector index."""
+async def get_index_stats(collection: Optional[str] = None):
+    """Get statistics about the vector index.
+
+    Query param ``collection`` lets you check a specific collection.
+    If omitted, uses the default collection.
+    """
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    stats = await run_in_executor(orchestrator.rag.get_stats)
+    stats = await run_in_executor(orchestrator.rag.get_stats, collection)
     return stats.model_dump()
 
 
+@app.get("/collections")
+async def list_collections():
+    """List all indexed Qdrant collections with their metadata.
+
+    Returns both Qdrant-side collections and the registry (repo_path mapping).
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Get collections from Qdrant
+    qdrant_collections = await run_in_executor(orchestrator.rag.list_collections)
+
+    # Get registry from Redis/memory
+    from utils.cache_service import get_cache_service
+    cache = get_cache_service()
+    registry = cache.get_collection_registry()
+
+    # Merge info
+    result = []
+    for coll_name in qdrant_collections:
+        entry = {"name": coll_name}
+        if coll_name in registry:
+            entry.update(registry[coll_name])
+        result.append(entry)
+
+    # Add registry-only entries (indexed but collection might have been deleted)
+    for coll_name, info in registry.items():
+        if coll_name not in qdrant_collections:
+            entry = {"name": coll_name, "status": "registry_only (no Qdrant collection)"}
+            entry.update(info)
+            result.append(entry)
+
+    return {"collections": result, "total": len(result)}
+
+
 @app.get("/index/lookup/{class_name}")
-async def lookup_class(class_name: str):
+async def lookup_class(class_name: str, collection: Optional[str] = None):
     """Diagnostic: check if a class is indexed in Qdrant and what info is stored.
 
-    Usage: GET /index/lookup/UserProfile
+    Usage: GET /index/lookup/UserProfile?collection=vtrip_core_iam
     Returns the full payload stored in Qdrant for that class, including
     fields, record_components, usage_hint, used_types, has_builder, etc.
     Useful for debugging why the LLM generates wrong construction patterns.
@@ -704,12 +816,16 @@ async def lookup_class(class_name: str):
     rag = orchestrator.rag
 
     # Tier 1: metadata scroll (guaranteed find)
-    chunk = await run_in_executor(rag._scroll_by_class_name, class_name)
+    chunk = await run_in_executor(
+        rag._scroll_by_class_name, class_name, "class", collection,
+    )
     lookup_method = "scroll"
 
     # Tier 2: semantic search fallback
     if not chunk:
-        result = await run_in_executor(rag.search_by_class, class_name, 1, False)
+        result = await run_in_executor(
+            rag.search_by_class, class_name, 1, False, collection,
+        )
         chunk = result.chunks[0] if result.chunks else None
         lookup_method = "semantic"
 
@@ -817,6 +933,13 @@ class PipelineGenerateRequest(BaseModel):
         None,
         description="List of changed/added method names (optional, for incremental mode)",
     )
+    collection: Optional[str] = Field(
+        None,
+        description=(
+            "Qdrant collection name. If omitted, auto-resolved from file_path "
+            "via the registry, or falls back to default."
+        ),
+    )
 
 
 class PipelineGenerateResponse(BaseModel):
@@ -827,6 +950,7 @@ class PipelineGenerateResponse(BaseModel):
     class_name: str = ""
     file_path: str = ""
     mode: str = "full"
+    collection: str = ""
     validation_passed: bool = True
     validation_issues: list[str] = Field(default_factory=list)
     error: Optional[str] = None
@@ -911,6 +1035,10 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             or "Generate comprehensive unit tests covering all public methods",
         existing_test_code=request.existing_test_code if request.mode == "incremental" else None,
         changed_methods=request.changed_methods if request.mode == "incremental" else None,
+        collection_name=_resolve_collection(
+            explicit=request.collection,
+            file_path=request.file_path,
+        ),
     )
 
     result = await run_in_executor(orchestrator.generate_test, gen_request)
@@ -921,6 +1049,7 @@ async def pipeline_generate(request: PipelineGenerateRequest):
         class_name=result.class_name,
         file_path=request.file_path,
         mode=request.mode,
+        collection=gen_request.collection_name or "",
         validation_passed=result.validation_passed,
         validation_issues=result.validation_issues,
         error=result.error,
@@ -982,6 +1111,10 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
                     or "Generate comprehensive unit tests covering all public methods",
                 existing_test_code=file_req.existing_test_code if file_req.mode == "incremental" else None,
                 changed_methods=file_req.changed_methods if file_req.mode == "incremental" else None,
+                collection_name=_resolve_collection(
+                    explicit=file_req.collection,
+                    file_path=file_req.file_path,
+                ),
             )
 
             result = await run_in_executor(orchestrator.generate_test, gen_request)
@@ -1087,6 +1220,8 @@ async def chat_completions(request: ChatCompletionRequest):
       - Tool calling (tools in request, tool_calls in response)
       - Test generation pipeline (with RAG + validation + repair)
       - General chat with RAG context enhancement
+      - Multi-collection: resolves Qdrant collection from ``collection``
+        field, ``file_path``, or falls back to default.
     """
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
@@ -1122,6 +1257,14 @@ async def chat_completions(request: ChatCompletionRequest):
     if not file_path:
         file_path = _extract_java_file_path_from_message(user_content)
 
+    # ── Resolve Qdrant collection (3-tier) ───────────────────────────
+    resolved_collection = _resolve_collection(
+        explicit=request.collection,
+        file_path=file_path,
+        workspace_path=request.workspace_path,
+    )
+    logger.debug("Resolved collection", collection=resolved_collection)
+
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created_time = int(time.time())
 
@@ -1129,10 +1272,11 @@ async def chat_completions(request: ChatCompletionRequest):
     # PATH 1: Test generation pipeline
     # ═════════════════════════════════════════════════════════════════
     if is_test_request and file_path:
-        logger.info("Using test generation pipeline", file_path=file_path)
+        logger.info("Using test generation pipeline", file_path=file_path, collection=resolved_collection)
         gen_request = GenerationRequest(
             file_path=file_path,
             task_description=user_content,
+            collection_name=resolved_collection,
         )
 
         # ── REAL STREAMING: progress phases + token-by-token code ────
@@ -1166,7 +1310,7 @@ async def chat_completions(request: ChatCompletionRequest):
     # Build the enhanced prompt (with optional RAG context)
     enhanced_prompt = user_content
     if file_path:
-        enhanced_prompt = await _enrich_with_rag(user_content, file_path)
+        enhanced_prompt = await _enrich_with_rag(user_content, file_path, resolved_collection)
 
     effective_system = system_content or orchestrator.prompt_builder.build_system_prompt()
 
@@ -1458,16 +1602,22 @@ def _build_metadata_block(result) -> str:
     return "\n".join(parts)
 
 
-async def _enrich_with_rag(user_content: str, file_path: str) -> str:
+async def _enrich_with_rag(
+    user_content: str, file_path: str,
+    collection_name: Optional[str] = None,
+) -> str:
     """Add RAG context to the prompt for general chat."""
     class_name = file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
     try:
         search_result = await run_in_executor(
-            lambda: orchestrator.rag.search(SearchQuery(
-                query=f"{class_name} service methods dependencies",
-                top_k=5,
-                score_threshold=0.4,
-            ))
+            lambda: orchestrator.rag.search(
+                SearchQuery(
+                    query=f"{class_name} service methods dependencies",
+                    top_k=5,
+                    score_threshold=0.4,
+                ),
+                collection_name=collection_name,
+            )
         )
         if search_result.chunks:
             rag_context = "\n\n## Codebase Context:\n"
