@@ -641,10 +641,39 @@ async def generate_test(request: GenerateTestRequest):
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
+    # Read source file from disk and embed it as an inline code fence so the
+    # LLM receives the actual Java source code. build_test_generation_prompt
+    # already knows how to extract it from task_description.
+    base_description = (
+        request.task_description
+        or "Generate comprehensive unit tests covering all public methods"
+    )
+    task_description_with_source = base_description
+    if os.path.isfile(request.file_path):
+        try:
+            loop = asyncio.get_running_loop()
+            source_code = await loop.run_in_executor(
+                _executor, lambda: open(request.file_path, encoding="utf-8").read()
+            )
+            task_description_with_source = (
+                f"{base_description}\n\n"
+                f"```{request.file_path}\n{source_code}\n```"
+            )
+            logger.info(
+                "Source code embedded in task_description",
+                file_path=request.file_path,
+                source_len=len(source_code),
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not read source file, proceeding without inline source",
+                file_path=request.file_path,
+                error=str(e),
+            )
+
     gen_request = GenerationRequest(
         file_path=request.file_path,
-        task_description=request.task_description
-            or "Generate comprehensive unit tests covering all public methods",
+        task_description=task_description_with_source,
     )
 
     result = await run_in_executor(orchestrator.generate_test, gen_request)
@@ -1037,11 +1066,64 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             detail="existing_test_code is required when mode='incremental'",
         )
 
+    # Read source file from disk and embed it as an inline code fence so the
+    # LLM receives the actual Java source code. build_test_generation_prompt
+    # already knows how to extract it from task_description (same format as
+    # the Continue IDE sends via chat/completions).
+    base_description = (
+        request.task_description
+        or "Generate comprehensive unit tests covering all public methods"
+    )
+    task_description_with_source = base_description
+    if request.mode == "full" and os.path.isfile(request.file_path):
+        try:
+            loop = asyncio.get_running_loop()
+            source_code = await loop.run_in_executor(
+                _executor, lambda: open(request.file_path, encoding="utf-8").read()
+            )
+            task_description_with_source = (
+                f"{base_description}\n\n"
+                f"```{request.file_path}\n{source_code}\n```"
+            )
+            logger.info(
+                "Source code embedded in task_description",
+                file_path=request.file_path,
+                source_len=len(source_code),
+                mode=request.mode,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not read source file, proceeding without inline source",
+                file_path=request.file_path,
+                error=str(e),
+            )
+    elif request.mode == "incremental" and request.existing_test_code and os.path.isfile(request.file_path):
+        # For incremental mode: also read source so the LLM can see what changed
+        try:
+            loop = asyncio.get_running_loop()
+            source_code = await loop.run_in_executor(
+                _executor, lambda: open(request.file_path, encoding="utf-8").read()
+            )
+            task_description_with_source = (
+                f"{base_description}\n\n"
+                f"```{request.file_path}\n{source_code}\n```"
+            )
+            logger.info(
+                "Source code embedded in task_description (incremental)",
+                file_path=request.file_path,
+                source_len=len(source_code),
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not read source file for incremental mode",
+                file_path=request.file_path,
+                error=str(e),
+            )
+
     gen_request = GenerationRequest(
         file_path=request.file_path,
         class_name=request.class_name,
-        task_description=request.task_description
-            or "Generate comprehensive unit tests covering all public methods",
+        task_description=task_description_with_source,
         existing_test_code=request.existing_test_code if request.mode == "incremental" else None,
         changed_methods=request.changed_methods if request.mode == "incremental" else None,
         collection_name=_resolve_collection(
