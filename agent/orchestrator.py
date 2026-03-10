@@ -55,6 +55,10 @@ class GenerationRequest:
     changed_methods: Optional[list[str]] = None
     # Multi-collection: which Qdrant collection to search in
     collection_name: Optional[str] = None
+    # Explicit source code (from CI/CD pipeline).
+    # If provided, embedded into prompt so LLM sees full source instead of
+    # only the RAG summary.
+    source_code: Optional[str] = None
 
 
 @dataclass
@@ -226,7 +230,9 @@ class AgentOrchestrator:
 
             # ── Execute plan steps ───────────────────────────────────
             result = self._execute_plan(
-                sm, plan, collection_name=request.collection_name,
+                sm, plan,
+                collection_name=request.collection_name,
+                source_code=request.source_code,
             )
 
             # Phase 4: Publish generation completed
@@ -323,6 +329,7 @@ class AgentOrchestrator:
                         file_path=request.file_path,
                         session=session,
                         top_k=self.top_k,
+                        collection_name=request.collection_name,
                     )
                     rag_chunks = context_result.rag_chunks
                 except Exception as e:
@@ -355,6 +362,13 @@ class AgentOrchestrator:
                 rag_chunks=rag_chunks,
                 task_description=request.task_description,
                 session=session,
+            )
+
+            # Debug log: LLM input
+            self._log_llm_input(
+                system_prompt, user_prompt,
+                source="generate_test_streaming",
+                class_name=class_name,
             )
 
             # ── GENERATING (stream tokens) ───────────────────────────
@@ -568,6 +582,7 @@ class AgentOrchestrator:
     def _execute_plan(
         self, sm: StateMachine, plan: ExecutionPlan,
         collection_name: Optional[str] = None,
+        source_code: Optional[str] = None,
     ) -> GenerationResult:
         """Execute an ``ExecutionPlan`` step-by-step, driven by the StateMachine.
 
@@ -589,6 +604,7 @@ class AgentOrchestrator:
             "validation_issues": [],
             "tokens_used": 0,
             "collection_name": collection_name,
+            "source_code": source_code,
         }
 
         # Resolve session once
@@ -813,6 +829,7 @@ class AgentOrchestrator:
                     inline_source=step.params.get("inline_source"),
                     session=ctx.get("session"),
                     top_k=self.top_k,
+                    collection_name=ctx.get("collection_name"),
                 )
                 ctx["rag_chunks"] = context_result.rag_chunks
                 ctx["context_result"] = context_result
@@ -885,14 +902,35 @@ class AgentOrchestrator:
                 task_description=plan.metadata.get("task_description"),
             )
         else:
+            # If explicit source_code is available (from pipeline) but not
+            # already embedded in task_description, wrap it so the LLM sees
+            # the real source code instead of only RAG summaries.
+            task_desc = plan.metadata.get("task_description") or ""
+            source_code = ctx.get("source_code")
+            if source_code and "```" not in task_desc:
+                task_desc = (
+                    f"{task_desc}\n\n"
+                    f"```{ctx.get('file_path', plan.file_path)}\n"
+                    f"{source_code}\n"
+                    f"```"
+                )
+
             ctx["system_prompt"] = self.prompt_builder.build_system_prompt()
             ctx["user_prompt"] = self.prompt_builder.build_test_generation_prompt(
                 class_name=ctx["class_name"],
                 file_path=ctx.get("file_path", plan.file_path),
                 rag_chunks=ctx.get("rag_chunks", []),
-                task_description=plan.metadata.get("task_description"),
+                task_description=task_desc,
                 session=ctx.get("session"),
             )
+
+        # Debug log: LLM input (for all prompt types)
+        self._log_llm_input(
+            ctx["system_prompt"], ctx["user_prompt"],
+            source="_step_build_prompt",
+            class_name=ctx.get("class_name", ""),
+            plan_id=plan.plan_id,
+        )
 
         # Record user message in session
         session = ctx.get("session")
@@ -913,6 +951,14 @@ class AgentOrchestrator:
         # Transition to GENERATING if not already there (repair transitions already done)
         if sm.state not in (AgentState.GENERATING,):
             sm.transition_to(AgentState.GENERATING, class_name=ctx["class_name"])
+
+        # Debug log: LLM input
+        self._log_llm_input(
+            ctx["system_prompt"], ctx["user_prompt"],
+            source="_step_generate_code",
+            class_name=ctx.get("class_name", ""),
+            plan_id=plan.plan_id,
+        )
 
         response = self.vllm.generate(
             system_prompt=ctx["system_prompt"],
@@ -1151,6 +1197,33 @@ class AgentOrchestrator:
     # =====================================================================
     # Helpers (preserved from original orchestrator)
     # =====================================================================
+
+    @staticmethod
+    def _log_llm_input(
+        system_prompt: str,
+        user_prompt: str,
+        source: str = "",
+        class_name: str = "",
+        plan_id: str = "",
+    ) -> None:
+        """Debug-log the exact prompts sent to the LLM.
+
+        Truncates each prompt at 2000 chars to avoid log flooding,
+        but always logs the full length so you can tell if it was cut.
+        """
+        MAX_LOG = 2000
+        sys_len = len(system_prompt)
+        usr_len = len(user_prompt)
+        logger.debug(
+            "LLM input",
+            source=source,
+            class_name=class_name,
+            plan_id=plan_id,
+            system_prompt_len=sys_len,
+            user_prompt_len=usr_len,
+            system_prompt=system_prompt[:MAX_LOG] + ("..." if sys_len > MAX_LOG else ""),
+            user_prompt=user_prompt[:MAX_LOG] + ("..." if usr_len > MAX_LOG else ""),
+        )
 
     def _get_cached_rag_context(self, ctx: dict, step: PlanStep) -> list[CodeChunk]:
         """Load RAG context from session cache (for refinement)."""

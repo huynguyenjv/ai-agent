@@ -162,6 +162,7 @@ class ContextBuilder:
         inline_source: Optional[str] = None,
         session=None,
         top_k: int = 10,
+        collection_name: Optional[str] = None,
     ) -> ContextResult:
         """Build optimized context for test generation.
 
@@ -178,7 +179,7 @@ class ContextBuilder:
         start = time.time()
 
         # Step 1: RAG search (always needed for summaries)
-        rag_chunks = self._rag_search(class_name, file_path, session, inline_source, top_k)
+        rag_chunks = self._rag_search(class_name, file_path, session, inline_source, top_k, collection_name=collection_name)
 
         # Step 2: Intelligence analysis (if available)
         test_context = None
@@ -282,6 +283,7 @@ class ContextBuilder:
         session,
         inline_source: Optional[str],
         top_k: int,
+        collection_name: Optional[str] = None,
     ) -> list[CodeChunk]:
         """Perform RAG search for a class and its dependencies."""
         try:
@@ -289,6 +291,7 @@ class ContextBuilder:
                 class_name=class_name,
                 top_k=top_k,
                 include_dependencies=True,
+                collection_name=collection_name,
             )
             return result.chunks
         except Exception as e:

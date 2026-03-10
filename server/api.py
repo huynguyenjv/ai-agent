@@ -940,23 +940,15 @@ class PipelineGenerateRequest(BaseModel):
             "via the registry, or falls back to default."
         ),
     )
-
-
-class PipelineGenerateResponse(BaseModel):
-    """Response from pipeline test generation."""
-
-    success: bool
-    test_code: Optional[str] = None
-    class_name: str = ""
-    file_path: str = ""
-    mode: str = "full"
-    collection: str = ""
-    validation_passed: bool = True
-    validation_issues: list[str] = Field(default_factory=list)
-    error: Optional[str] = None
-    rag_chunks_used: int = 0
-    tokens_used: int = 0
-    repair_attempts: int = 0
+    source_code: Optional[str] = Field(
+        None,
+        description=(
+            "Full Java source code of the class. When provided the LLM sees "
+            "the real source instead of only the RAG summary, significantly "
+            "improving test quality. CI script should read the file and send "
+            "its content here."
+        ),
+    )
 
 
 class PipelineBatchRequest(BaseModel):
@@ -978,6 +970,23 @@ class PipelineBatchItemResult(BaseModel):
     validation_passed: bool = True
     validation_issues: list[str] = Field(default_factory=list)
     error: Optional[str] = None
+    tokens_used: int = 0
+    repair_attempts: int = 0
+
+
+class PipelineGenerateResponse(BaseModel):
+    """Response from single test generation."""
+
+    success: bool
+    test_code: str | None = None
+    class_name: str | None = None
+    file_path: str
+    mode: str = "full"
+    collection: str = ""
+    validation_passed: bool = False
+    validation_issues: list[str] = []
+    error: str | None = None
+    rag_chunks_used: int = 0
     tokens_used: int = 0
     repair_attempts: int = 0
 
@@ -1039,6 +1048,7 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             explicit=request.collection,
             file_path=request.file_path,
         ),
+        source_code=request.source_code,
     )
 
     result = await run_in_executor(orchestrator.generate_test, gen_request)
@@ -1115,6 +1125,7 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
                     explicit=file_req.collection,
                     file_path=file_req.file_path,
                 ),
+                source_code=file_req.source_code,
             )
 
             result = await run_in_executor(orchestrator.generate_test, gen_request)
