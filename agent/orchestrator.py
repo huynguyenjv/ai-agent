@@ -53,6 +53,8 @@ class GenerationRequest:
     session_id: Optional[str] = None
     existing_test_code: Optional[str] = None
     changed_methods: Optional[list[str]] = None
+    # Multi-collection: which Qdrant collection to search in
+    collection_name: Optional[str] = None
 
 
 @dataclass
@@ -223,7 +225,9 @@ class AgentOrchestrator:
             )
 
             # ── Execute plan steps ───────────────────────────────────
-            result = self._execute_plan(sm, plan)
+            result = self._execute_plan(
+                sm, plan, collection_name=request.collection_name,
+            )
 
             # Phase 4: Publish generation completed
             self.event_bus.publish(Event(
@@ -327,12 +331,14 @@ class AgentOrchestrator:
                         class_name=class_name,
                         file_path=request.file_path,
                         session=session,
+                        collection_name=request.collection_name,
                     )
             else:
                 rag_chunks = self._get_rag_context(
                     class_name=class_name,
                     file_path=request.file_path,
                     session=session,
+                    collection_name=request.collection_name,
                 )
 
             yield StreamEvent(
@@ -559,7 +565,10 @@ class AgentOrchestrator:
     # Plan execution engine
     # =====================================================================
 
-    def _execute_plan(self, sm: StateMachine, plan: ExecutionPlan) -> GenerationResult:
+    def _execute_plan(
+        self, sm: StateMachine, plan: ExecutionPlan,
+        collection_name: Optional[str] = None,
+    ) -> GenerationResult:
         """Execute an ``ExecutionPlan`` step-by-step, driven by the StateMachine.
 
         The engine loops through pending steps, executing each one and
@@ -579,6 +588,7 @@ class AgentOrchestrator:
             "validation_passed": True,
             "validation_issues": [],
             "tokens_used": 0,
+            "collection_name": collection_name,
         }
 
         # Resolve session once
@@ -820,6 +830,7 @@ class AgentOrchestrator:
                     file_path=ctx.get("file_path", plan.file_path),
                     session=ctx.get("session"),
                     inline_source=step.params.get("inline_source"),
+                    collection_name=ctx.get("collection_name"),
                 )
                 ctx["rag_chunks"] = rag_chunks
                 ctx["context_result"] = None
@@ -830,6 +841,7 @@ class AgentOrchestrator:
                 file_path=ctx.get("file_path", plan.file_path),
                 session=ctx.get("session"),
                 inline_source=step.params.get("inline_source"),
+                collection_name=ctx.get("collection_name"),
             )
             ctx["rag_chunks"] = rag_chunks
             ctx["context_result"] = None
@@ -1159,6 +1171,7 @@ class AgentOrchestrator:
         file_path: str,
         session: Optional[SessionMemory],
         inline_source: Optional[str] = None,
+        collection_name: Optional[str] = None,
     ) -> list[CodeChunk]:
         """Exact graph traversal: fetch target class → deps → used_types.
 
@@ -1192,6 +1205,7 @@ class AgentOrchestrator:
             class_name=class_name,
             top_k=1,
             include_dependencies=False,
+            collection_name=collection_name,
         )
         main_chunk = main_result.chunks[0] if main_result.chunks else None
         if not main_chunk:
@@ -1241,6 +1255,7 @@ class AgentOrchestrator:
                     class_name=type_name,
                     top_k=1,
                     include_dependencies=False,
+                    collection_name=collection_name,
                 )
                 return result.chunks[0] if result.chunks else None
             except Exception as e:
