@@ -19,6 +19,7 @@ class TaskType(str, Enum):
     REFINEMENT = "refinement"
     GENERAL_CHAT = "general_chat"
     INCREMENTAL_UPDATE = "incremental_update"
+    TWO_PHASE_GENERATION = "two_phase_generation"  # New: Two-phase strategy
 
 
 class StepAction(str, Enum):
@@ -34,6 +35,13 @@ class StepAction(str, Enum):
     REPAIR_CODE = "repair_code"
     ANALYZE_EXISTING_TEST = "analyze_existing_test"
     MERGE_TESTS = "merge_tests"
+    
+    # Two-Phase Strategy actions
+    ANALYZE_SERVICE = "analyze_service"           # Phase 1: Analyze service
+    LOOKUP_REGISTRY = "lookup_registry"           # Lookup domain types in registry
+    GENERATE_METHOD_TESTS = "generate_method_tests"  # Phase 2: Generate per method
+    ASSEMBLE_TEST_CLASS = "assemble_test_class"   # Assemble final test class
+    CALCULATE_COMPLEXITY = "calculate_complexity"  # Calculate service complexity
 
 
 class StepStatus(str, Enum):
