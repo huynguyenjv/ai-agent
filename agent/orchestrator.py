@@ -24,7 +24,7 @@ from .rules import TestRules
 from .memory import SessionMemory, MemoryManager
 from .state_machine import AgentState, StateMachine, TransitionError
 from .validation import ValidationPipeline, ValidationResult, IssueSeverity
-from .repair import RepairStrategySelector, RepairPlan
+from .repair import RepairStrategySelector, RepairPlan, FailureMemory, RepairReasoningEngine, RepairLevel
 from .events import EventBus, Event, EventType, get_event_bus
 from .metrics import MetricsCollector
 from rag.client import RAGClient
@@ -145,7 +145,7 @@ class AgentOrchestrator:
         vllm_client: VLLMClient,
         top_k_results: int = 10,
         max_context_tokens: int = 4000,
-        max_repair_attempts: int = 2,
+        max_repair_attempts: int = 3,
         repo_path: Optional[str] = None,
         token_budget: int = 6000,
     ):
@@ -644,25 +644,65 @@ class AgentOrchestrator:
                     metadata={"passed": False, **validation_result.get_summary()},
                 )
 
-                # ── REPAIRING ────────────────────────────────────────
-                for attempt in range(1, self.max_repair_attempts + 1):
-                    yield StreamEvent(
-                        phase=StreamPhase.REPAIRING,
-                        content=f"\n\n🔧 Repair attempt {attempt}/{self.max_repair_attempts}…",
-                        metadata={"attempt": attempt},
+                # ── REPAIRING (escalating + failure memory) ──────────
+                sp_max_repair = 3
+                sp_memory = FailureMemory()
+                sp_reasoning_engine = RepairReasoningEngine()
+
+                for attempt in range(1, sp_max_repair + 1):
+                    sp_issues_before = validation_result.error_messages
+
+                    # Determine escalation level
+                    sp_level = self.repair_selector.determine_level(
+                        attempt_number=attempt,
+                        max_attempts=sp_max_repair,
+                        memory=sp_memory,
                     )
 
-                    # Build repair prompt
+                    yield StreamEvent(
+                        phase=StreamPhase.REPAIRING,
+                        content=(
+                            f"\n\n🔧 Repair attempt {attempt}/{sp_max_repair} "
+                            f"(Level: {sp_level.value})…"
+                        ),
+                        metadata={"attempt": attempt, "level": sp_level.value},
+                    )
+
+                    # Level 2: Run reasoning engine
+                    sp_reasoning = None
+                    if sp_level == RepairLevel.REASONING:
+                        yield StreamEvent(
+                            phase=StreamPhase.REPAIRING,
+                            content="\n🧠 Analyzing root cause…\n",
+                        )
+                        sys_p, usr_p = sp_reasoning_engine.build_reasoning_prompt(
+                            test_code=extracted_code,
+                            validation_issues=validation_result.error_messages,
+                            memory=sp_memory,
+                        )
+                        reasoning_resp = self.vllm.generate(
+                            system_prompt=sys_p,
+                            user_prompt=usr_p,
+                            temperature=0.1,
+                            max_tokens=1500,
+                        )
+                        if reasoning_resp.success:
+                            sp_reasoning = sp_reasoning_engine.parse_reasoning(reasoning_resp.content)
+
+                    # Build repair plan (with memory + reasoning)
                     repair_plan = self.repair_selector.build_repair_plan(
                         validation_result=validation_result,
                         attempt_number=attempt,
-                        max_attempts=self.max_repair_attempts,
+                        max_attempts=sp_max_repair,
+                        memory=sp_memory,
+                        reasoning=sp_reasoning,
                     )
                     repair_section = repair_plan.get_repair_prompt_section()
                     feedback = (
                         f"{repair_section}\n\n"
-                        f"Auto-repair attempt {attempt}: fix the following validation issues: "
-                        f"{', '.join(validation_result.error_messages)}"
+                        f"Repair attempt {attempt}/{sp_max_repair} (Level: {sp_level.value}). "
+                        f"Fix these issues:\n"
+                        + "\n".join(f"- {msg}" for msg in validation_result.error_messages)
                     )
 
                     repair_system = self.prompt_builder.build_system_prompt()
@@ -676,7 +716,7 @@ class AgentOrchestrator:
                     # Stream repair generation
                     yield StreamEvent(
                         phase=StreamPhase.GENERATING,
-                        content=f"\n\n⚡ Re-generating (repair {attempt})…\n\n",
+                        content=f"\n\n⚡ Re-generating (repair {attempt}, {sp_level.value})…\n\n",
                     )
 
                     repair_parts: list[str] = []
@@ -703,10 +743,20 @@ class AgentOrchestrator:
                         extracted_code, rag_chunks=rag_chunks,
                     )
 
+                    # Record attempt in failure memory
+                    sp_record = sp_memory.record_attempt(
+                        attempt_number=attempt,
+                        strategy=sp_level.value,
+                        instructions_used=[i.description for i in repair_plan.instructions],
+                        issues_before=sp_issues_before,
+                        issues_after=validation_result.error_messages,
+                        reasoning=sp_reasoning.get("overall_strategy") if sp_reasoning else None,
+                    )
+
                     if validation_result.passed:
                         yield StreamEvent(
                             phase=StreamPhase.VALIDATING,
-                            content=f"✅ Validation passed after repair {attempt}",
+                            content=f"✅ Validation passed after repair {attempt} ({sp_level.value})",
                             metadata={"passed": True, **validation_result.get_summary()},
                         )
                         break
@@ -715,7 +765,8 @@ class AgentOrchestrator:
                             phase=StreamPhase.VALIDATING,
                             content=(
                                 f"⚠️ Still {len(validation_result.errors)} errors "
-                                f"after repair {attempt}"
+                                f"(fixed {len(sp_record.issues_fixed)}, "
+                                f"new {len(sp_record.issues_introduced)})"
                             ),
                             metadata={"passed": False, **validation_result.get_summary()},
                         )
@@ -931,10 +982,39 @@ class AgentOrchestrator:
             extracted_code = self._extract_code(full_response)
             tokens_used = count_tokens(full_response)
 
+            # ── SELF-REVIEW ─────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.VALIDATING,
+                content="\n\n🔍 **Self-Review: LLM checking its own output…**\n",
+            )
+
+            reviewed_code, review_issues = self.two_phase_strategy.self_review(
+                test_code=extracted_code,
+                source_code=source_code,
+                class_name=class_name,
+                rag_chunks=rag_chunks,
+            )
+
+            if review_issues:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content=(
+                        f"📝 Self-review found {len(review_issues)} issue(s): "
+                        f"{'; '.join(review_issues[:3])}\n"
+                    ),
+                    metadata={"self_review_issues": len(review_issues)},
+                )
+                extracted_code = reviewed_code
+            else:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content="✅ Self-review: no issues found\n",
+                )
+
             # ── VALIDATING ───────────────────────────────────────────
             yield StreamEvent(
                 phase=StreamPhase.VALIDATING,
-                content="\n\n🔎 Validating generated code…",
+                content="\n🔎 Validating generated code…",
             )
 
             validation_result = self.validator.validate(extracted_code, rag_chunks=rag_chunks)
@@ -955,24 +1035,71 @@ class AgentOrchestrator:
                     metadata={"passed": False, **validation_result.get_summary()},
                 )
 
-                # ── REPAIRING (same mechanism as single-pass) ────────
-                for attempt in range(1, self.max_repair_attempts + 1):
-                    yield StreamEvent(
-                        phase=StreamPhase.REPAIRING,
-                        content=f"\n\n🔧 Repair attempt {attempt}/{self.max_repair_attempts}…",
-                        metadata={"attempt": attempt},
+                # ── ITERATIVE REPAIR (escalating + failure memory) ───
+                max_repair = 3  # 3 levels: targeted→reasoning→regenerate
+                memory = FailureMemory()
+                reasoning_engine = RepairReasoningEngine()
+
+                for attempt in range(1, max_repair + 1):
+                    issues_before = validation_result.error_messages
+
+                    # Determine escalation level
+                    level = self.repair_selector.determine_level(
+                        attempt_number=attempt,
+                        max_attempts=max_repair,
+                        memory=memory,
                     )
 
+                    yield StreamEvent(
+                        phase=StreamPhase.REPAIRING,
+                        content=(
+                            f"\n\n🔧 Repair attempt {attempt}/{max_repair} "
+                            f"(Level: {level.value})…"
+                        ),
+                        metadata={"attempt": attempt, "level": level.value},
+                    )
+
+                    # Level 2+: Run reasoning engine
+                    reasoning = None
+                    if level == RepairLevel.REASONING:
+                        yield StreamEvent(
+                            phase=StreamPhase.REPAIRING,
+                            content="\n🧠 Analyzing root cause of failures…\n",
+                        )
+                        sys_p, usr_p = reasoning_engine.build_reasoning_prompt(
+                            test_code=extracted_code,
+                            validation_issues=validation_result.error_messages,
+                            memory=memory,
+                        )
+                        reasoning_resp = self.vllm.generate(
+                            system_prompt=sys_p,
+                            user_prompt=usr_p,
+                            temperature=0.1,
+                            max_tokens=1500,
+                        )
+                        if reasoning_resp.success:
+                            reasoning = reasoning_engine.parse_reasoning(reasoning_resp.content)
+                            if reasoning:
+                                strategy_msg = reasoning.get("overall_strategy", "")[:150]
+                                yield StreamEvent(
+                                    phase=StreamPhase.REPAIRING,
+                                    content=f"💡 Root cause: {strategy_msg}\n",
+                                )
+
+                    # Build repair plan (with memory + reasoning)
                     repair_plan = self.repair_selector.build_repair_plan(
                         validation_result=validation_result,
                         attempt_number=attempt,
-                        max_attempts=self.max_repair_attempts,
+                        max_attempts=max_repair,
+                        memory=memory,
+                        reasoning=reasoning,
                     )
                     repair_section = repair_plan.get_repair_prompt_section()
                     feedback = (
                         f"{repair_section}\n\n"
-                        f"Auto-repair attempt {attempt}: fix these issues: "
-                        f"{', '.join(validation_result.error_messages)}"
+                        f"Repair attempt {attempt}/{max_repair} (Level: {level.value}). "
+                        f"Fix these issues:\n"
+                        + "\n".join(f"- {msg}" for msg in validation_result.error_messages)
                     )
 
                     repair_system = self.prompt_builder.build_system_prompt()
@@ -985,7 +1112,7 @@ class AgentOrchestrator:
 
                     yield StreamEvent(
                         phase=StreamPhase.GENERATING,
-                        content=f"\n\n⚡ Re-generating (repair {attempt})…\n\n",
+                        content=f"\n\n⚡ Re-generating (repair {attempt}, {level.value})…\n\n",
                     )
 
                     repair_parts: list[str] = []
@@ -1009,17 +1136,31 @@ class AgentOrchestrator:
                     )
                     validation_result = self.validator.validate(extracted_code, rag_chunks=rag_chunks)
 
+                    # Record attempt in failure memory
+                    record = memory.record_attempt(
+                        attempt_number=attempt,
+                        strategy=level.value,
+                        instructions_used=[inst.description for inst in repair_plan.instructions],
+                        issues_before=issues_before,
+                        issues_after=validation_result.error_messages,
+                        reasoning=reasoning.get("overall_strategy") if reasoning else None,
+                    )
+
                     if validation_result.passed:
                         yield StreamEvent(
                             phase=StreamPhase.VALIDATING,
-                            content=f"✅ Validation passed after repair {attempt}",
+                            content=f"✅ Validation passed after repair {attempt} ({level.value})",
                             metadata={"passed": True, **validation_result.get_summary()},
                         )
                         break
                     else:
                         yield StreamEvent(
                             phase=StreamPhase.VALIDATING,
-                            content=f"⚠️ Still {len(validation_result.errors)} errors after repair {attempt}",
+                            content=(
+                                f"⚠️ Still {len(validation_result.errors)} errors "
+                                f"(fixed {len(record.issues_fixed)}, "
+                                f"new {len(record.issues_introduced)})"
+                            ),
                             metadata={"passed": False, **validation_result.get_summary()},
                         )
 
@@ -1038,6 +1179,7 @@ class AgentOrchestrator:
                     "complexity_score": analysis_result.complexity_score,
                     "methods_analyzed": len(analysis_result.methods),
                     "domain_types": analysis_result.all_domain_types,
+                    "self_review_issues": len(review_issues),
                 },
             )
 
@@ -1498,6 +1640,8 @@ class AgentOrchestrator:
         # Phase 3: use ValidationPipeline for severity-aware validation
         # Pass RAG chunks for construction pattern cross-check (Pass 7)
         rag_chunks = ctx.get("rag_chunks")
+        prev_issues = ctx.get("validation_issues", [])  # Before this validation
+
         validation_result = self.validator.validate(
             ctx.get("extracted_code", ""),
             rag_chunks=rag_chunks,
@@ -1505,6 +1649,19 @@ class AgentOrchestrator:
         ctx["validation_result"] = validation_result
         ctx["validation_passed"] = validation_result.passed
         ctx["validation_issues"] = validation_result.error_messages
+
+        # Record in failure memory (if repair is in progress)
+        memory: Optional[FailureMemory] = ctx.get("repair_memory")
+        repair_plan: Optional[RepairPlan] = ctx.get("repair_plan")
+        if memory and repair_plan and prev_issues:
+            memory.record_attempt(
+                attempt_number=repair_plan.attempt_number,
+                strategy=repair_plan.level.value if hasattr(repair_plan, 'level') else repair_plan.strategy,
+                instructions_used=[i.description for i in repair_plan.instructions],
+                issues_before=prev_issues,
+                issues_after=validation_result.error_messages,
+            )
+            ctx.pop("repair_plan", None)  # Consume after recording
 
         logger.info(
             "Validation result",
@@ -1555,19 +1712,55 @@ class AgentOrchestrator:
     def _step_repair_code(
         self, sm: StateMachine, plan: ExecutionPlan, step: PlanStep, ctx: dict
     ) -> None:
-        """Phase 3: Build a targeted repair prompt using RepairStrategySelector."""
+        """Phase 3: Build a targeted repair prompt using RepairStrategySelector.
+
+        Uses FailureMemory to track what was tried and avoid repeating.
+        Uses RepairReasoningEngine on Level 2+ for root-cause analysis.
+        """
         issues = step.params.get("validation_issues", [])
         generated_code = step.params.get("generated_code", ctx.get("extracted_code", ""))
         validation_result = ctx.get("validation_result")
         attempt = step.params.get("attempt", 1)
 
+        # Initialize failure memory (persists across repair attempts in ctx)
+        if "repair_memory" not in ctx:
+            ctx["repair_memory"] = FailureMemory()
+        memory: FailureMemory = ctx["repair_memory"]
+
         # Build targeted repair plan if we have structured validation
         repair_section = ""
         if validation_result and isinstance(validation_result, ValidationResult):
+            # Determine escalation level
+            level = self.repair_selector.determine_level(
+                attempt_number=attempt,
+                max_attempts=self.max_repair_attempts,
+                memory=memory,
+            )
+
+            # Level 2+: Run reasoning engine
+            reasoning = None
+            if level == RepairLevel.REASONING:
+                reasoning_engine = RepairReasoningEngine()
+                sys_p, usr_p = reasoning_engine.build_reasoning_prompt(
+                    test_code=generated_code,
+                    validation_issues=issues,
+                    memory=memory,
+                )
+                reasoning_resp = self.vllm.generate(
+                    system_prompt=sys_p,
+                    user_prompt=usr_p,
+                    temperature=0.1,
+                    max_tokens=1500,
+                )
+                if reasoning_resp.success:
+                    reasoning = reasoning_engine.parse_reasoning(reasoning_resp.content)
+
             repair_plan = self.repair_selector.build_repair_plan(
                 validation_result=validation_result,
                 attempt_number=attempt,
                 max_attempts=self.max_repair_attempts,
+                memory=memory,
+                reasoning=reasoning,
             )
             repair_section = repair_plan.get_repair_prompt_section()
             ctx["repair_plan"] = repair_plan
@@ -1576,8 +1769,10 @@ class AgentOrchestrator:
                 "Targeted repair plan built",
                 plan_id=plan.plan_id,
                 attempt=attempt,
+                level=level.value,
                 strategy=repair_plan.strategy,
                 instructions=repair_plan.instruction_count,
+                has_reasoning=reasoning is not None,
             )
 
             # Phase 4: Publish repair completed (plan built)
@@ -1585,8 +1780,9 @@ class AgentOrchestrator:
                 type=EventType.REPAIR_COMPLETED,
                 data={
                     "attempt": attempt,
+                    "level": level.value,
                     "strategy": repair_plan.strategy,
-                    "success": True,  # repair plan built, actual success determined later
+                    "success": True,
                 },
                 source="orchestrator",
                 plan_id=plan.plan_id,
@@ -1597,7 +1793,8 @@ class AgentOrchestrator:
         if repair_section:
             feedback_parts.append(repair_section)
         feedback_parts.append(
-            f"Auto-repair attempt {attempt}: fix the following validation issues: {', '.join(issues)}"
+            f"Repair attempt {attempt}/{self.max_repair_attempts}: "
+            f"fix the following validation issues: {', '.join(issues)}"
         )
 
         ctx["system_prompt"] = self.prompt_builder.build_system_prompt()
