@@ -1,22 +1,25 @@
 """
-Two-Phase Generation Strategy — Analyze first, then generate with enriched context.
+Two-Phase Generation Strategy — Analyze → Generate → Self-Review → Validate → Repair.
 
-This strategy splits test generation into two distinct phases:
+Architecture (iterative):
 
-Phase 1 (Analysis):
-    - LLM analyzes the service source code
-    - Outputs structured JSON with method analysis and test scenarios
-    - Identifies all dependencies, domain types, exceptions
-    - NO code generation in this phase
+  Phase 1 (Analysis):
+    - LLM analyzes service source code → structured JSON plan
+    - Identifies dependencies, domain types, exceptions
+    - NO code generation
 
-Phase 2 (Enhanced Generation):
-    - Enriches RAG context by searching for missing types (exceptions, domain types)
-    - Builds a COMPLETE test class prompt with analysis summary + registry context
-    - Generates the COMPLETE test class in ONE LLM call (same quality as single-pass)
-    - Uses PromptBuilder for consistent prompt style
+  Phase 2 (Enhanced Generation with iterative refinement):
+    - Enriches RAG context by searching for missing types
+    - Generates COMPLETE test class with analysis + registry context
+    - **Self-Review**: LLM reviews its own output for issues
+    - **Validate**: Runs validation pipeline IN THE LOOP
+    - **Smart Repair**: Uses escalating repair strategy:
+        Level 1 — Targeted (category-based)
+        Level 2 — Reasoning (LLM explains WHY, then fixes)
+        Level 3 — Regenerate (full regen with failure memory)
+    - FailureMemory tracks what was tried → prevents repeating failed fixes
 
-Key insight: Phase 2 is essentially a BETTER single-pass — same full-class generation,
-but with richer context. This avoids the quality degradation of per-method generation.
+Key insight: Phase 2 is a BETTER single-pass with richer context + iterative refinement.
 """
 
 from __future__ import annotations
@@ -38,7 +41,12 @@ from .analysis_prompt import (
 from .prompt import PromptBuilder
 from .rules import TestRules
 from .validation import ValidationPipeline, ValidationResult
-from .repair import RepairStrategySelector
+from .repair import (
+    RepairStrategySelector,
+    RepairReasoningEngine,
+    FailureMemory,
+    RepairLevel,
+)
 from .events import Event, EventType, get_event_bus
 from rag.client import RAGClient
 from rag.schema import CodeChunk
@@ -63,8 +71,15 @@ class TwoPhaseConfig:
     generation_temperature: float = 0.2     # Standard temp for code gen
     generation_max_tokens: int = 4000       # Max tokens for complete class
 
-    # Repair settings
-    max_repair_attempts: int = 2            # Max repair attempts
+    # Self-review settings
+    self_review_enabled: bool = True        # Enable LLM self-review after gen
+    self_review_temperature: float = 0.1    # Low temp for review accuracy
+    self_review_max_tokens: int = 1500      # Max tokens for review output
+
+    # Repair settings (escalating)
+    max_repair_attempts: int = 3            # 3 levels: targeted→reasoning→regen
+    reasoning_enabled: bool = True          # Enable LLM reasoning in Level 2
+    reasoning_max_tokens: int = 1500        # Max tokens for reasoning output
 
     # Fallback settings
     fallback_to_single_pass: bool = True    # Fallback if two-phase fails
@@ -76,6 +91,7 @@ class TwoPhaseState(str, Enum):
     ANALYZING = "analyzing"
     ENRICHING = "enriching"
     GENERATING = "generating"
+    SELF_REVIEWING = "self_reviewing"
     VALIDATING = "validating"
     REPAIRING = "repairing"
     COMPLETED = "completed"
@@ -102,12 +118,17 @@ class TwoPhaseResult:
     validation_issues: list[str] = field(default_factory=list)
     validation_result: Optional[ValidationResult] = None
 
-    # Metrics
+    # Self-review
+    self_review_issues: list[str] = field(default_factory=list)
+    self_review_applied: bool = False
+
+    # Repair metrics
     total_tokens_used: int = 0
     analysis_time_ms: float = 0.0
     generation_time_ms: float = 0.0
     total_time_ms: float = 0.0
     repair_attempts: int = 0
+    repair_levels_used: list[str] = field(default_factory=list)  # ["targeted", "reasoning"]
 
     # Error info
     error: Optional[str] = None
@@ -119,10 +140,15 @@ class TwoPhaseResult:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TwoPhaseStrategy:
-    """Two-Phase Generation: Analyze → Enrich → Generate.
+    """Two-Phase Generation: Analyze → Enrich → Generate → Self-Review → Validate → Repair.
 
     Phase 2 generates the COMPLETE test class in a single LLM call,
     using the same PromptBuilder as single-pass but with enriched context.
+    After generation, an iterative refinement loop runs:
+
+      1. Self-Review: LLM checks its own output for issues
+      2. Validate: Structural/pattern validation
+      3. Repair (if needed): Escalating strategy with failure memory
 
     Usage::
 
@@ -134,15 +160,16 @@ class TwoPhaseStrategy:
             rag_client=rag_client,
         )
 
-        # Non-streaming
+        # Non-streaming (full iterative loop)
         result = strategy.generate(source_code, class_name, file_path, rag_chunks)
 
-        # Streaming (used by orchestrator)
+        # Streaming (orchestrator drives the loop)
         analysis = strategy.analyze(source_code, class_name, file_path)
         extra = strategy.search_missing_context(analysis, rag_chunks, source_code)
         sys_prompt, usr_prompt = strategy.build_generation_prompt(
             analysis, class_name, file_path, rag_chunks + extra, source_code)
         # then stream with vllm.stream_generate(sys_prompt, usr_prompt)
+        # then call strategy.self_review(code) + strategy.iterative_repair(...)
     """
 
     def __init__(
@@ -164,6 +191,7 @@ class TwoPhaseStrategy:
         self.analysis_builder = AnalysisPromptBuilder()
         self.validator = ValidationPipeline()
         self.repair_selector = RepairStrategySelector()
+        self.reasoning_engine = RepairReasoningEngine()
         self.event_bus = get_event_bus()
 
         self._state = TwoPhaseState.IDLE
@@ -381,6 +409,262 @@ class TwoPhaseStrategy:
 
         return system_prompt, user_prompt
 
+    def self_review(
+        self,
+        test_code: str,
+        source_code: str,
+        class_name: str,
+        rag_chunks: list[CodeChunk],
+    ) -> tuple[str, list[str]]:
+        """Self-Review: Ask LLM to review its own generated test code.
+
+        The LLM checks for:
+          1. Missing imports for types used in the test
+          2. Wrong method names (compared to source code)
+          3. Missing @BeforeEach setup
+          4. Incorrect mock configurations
+          5. Hallucinated methods or constructors
+
+        Returns (corrected_code, issues_found).
+        If no issues found, returns (original_code, []).
+        """
+        if not self.config.self_review_enabled:
+            return test_code, []
+
+        self._state = TwoPhaseState.SELF_REVIEWING
+
+        system_prompt = (
+            "You are a Java test code reviewer. Review the generated test code "
+            "against the original source code and fix ALL issues.\n\n"
+            "CHECK FOR:\n"
+            "1. Missing imports — every class used in test must be imported\n"
+            "2. Wrong method names — method calls must EXACTLY match the source code\n"
+            "3. Wrong constructor/builder patterns — check source for actual constructors\n"
+            "4. Missing @BeforeEach setUp — shared test data should be in setUp()\n"
+            "5. Hallucinated methods — don't call methods that don't exist in source\n"
+            "6. Missing verify() — every when() mock should have a matching verify()\n\n"
+            "Output the COMPLETE corrected test class. If no changes needed, "
+            "output the original code unchanged."
+        )
+
+        # Extract dependency info from RAG chunks for the reviewer
+        dep_info_parts = []
+        for chunk in rag_chunks[:8]:  # Top 8 chunks
+            if chunk.class_name and chunk.fully_qualified_name:
+                dep_info_parts.append(
+                    f"- {chunk.class_name}: {chunk.fully_qualified_name} "
+                    f"(type={chunk.type}, layer={chunk.layer})"
+                )
+
+        dep_context = "\n".join(dep_info_parts) if dep_info_parts else "No dependency info available"
+
+        user_prompt = f"""Review this generated test code against the source code.
+
+## Source Code Under Test
+```java
+{source_code}
+```
+
+## Available Types (from RAG index — use these FQNs for imports)
+{dep_context}
+
+## Generated Test Code to Review
+```java
+{test_code}
+```
+
+## Review Checklist
+1. Are ALL imports correct? (check each used class has an import)
+2. Do method calls match EXACTLY what's in the source code?
+3. Are domain type constructors/builders correct?
+4. Is there a @BeforeEach setUp() for shared variables?
+5. Are there any hallucinated (non-existent) methods?
+6. Is every when() mock paired with a verify()?
+
+If you find issues, output the CORRECTED complete test class.
+If no issues, output the original test class unchanged.
+Start your response with the issues found as comments, then the corrected code."""
+
+        response = self.vllm.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=self.config.self_review_temperature,
+            max_tokens=self.config.self_review_max_tokens + 2000,  # Extra for full class
+        )
+
+        if not response.success:
+            logger.warning("Self-review LLM call failed", error=response.error)
+            return test_code, []
+
+        # Extract issues found and corrected code
+        review_content = response.content
+        issues_found = self._extract_review_issues(review_content)
+        corrected_code = self._extract_code(review_content)
+
+        if issues_found:
+            logger.info(
+                "Self-review found issues",
+                issues_count=len(issues_found),
+                issues=issues_found[:5],
+            )
+        else:
+            logger.info("Self-review: no issues found")
+
+        self._publish_event(EventType.STEP_COMPLETED, {
+            "phase": "self_review",
+            "issues_found": len(issues_found),
+            "code_changed": corrected_code != test_code,
+        })
+
+        return corrected_code, issues_found
+
+    def iterative_repair(
+        self,
+        test_code: str,
+        validation_result: ValidationResult,
+        rag_chunks: list[CodeChunk],
+        source_code: str = "",
+    ) -> tuple[str, int, list[str]]:
+        """Iterative repair with escalating strategy + failure memory.
+
+        Repair loop:
+          Attempt 1 → Level 1 (TARGETED): Category-based instructions
+          Attempt 2 → Level 2 (REASONING): LLM reasons about WHY, then fixes
+          Attempt 3 → Level 3 (REGENERATE): Full regen with failure context
+
+        Returns (repaired_code, attempts_used, levels_used).
+        """
+        memory = FailureMemory()
+        current_code = test_code
+        current_validation = validation_result
+        levels_used: list[str] = []
+
+        for attempt in range(1, self.config.max_repair_attempts + 1):
+            self._state = TwoPhaseState.REPAIRING
+
+            issues_before = current_validation.error_messages
+
+            # Determine escalation level
+            level = self.repair_selector.determine_level(
+                attempt_number=attempt,
+                max_attempts=self.config.max_repair_attempts,
+                memory=memory,
+            )
+            levels_used.append(level.value)
+
+            logger.info(
+                "Repair attempt",
+                attempt=attempt,
+                level=level.value,
+                errors=len(current_validation.errors),
+                persistent=len(memory.get_persistent_issues()),
+            )
+
+            self._publish_event(EventType.REPAIR_STARTED, {
+                "attempt": attempt,
+                "level": level.value,
+                "errors": len(current_validation.errors),
+            })
+
+            # Level 2+: Run reasoning engine first
+            reasoning = None
+            if level == RepairLevel.REASONING and self.config.reasoning_enabled:
+                reasoning = self._run_reasoning(
+                    current_code, current_validation.error_messages, memory,
+                )
+
+            # Build repair plan (uses memory + reasoning)
+            repair_plan = self.repair_selector.build_repair_plan(
+                validation_result=current_validation,
+                attempt_number=attempt,
+                max_attempts=self.config.max_repair_attempts,
+                memory=memory,
+                reasoning=reasoning,
+            )
+
+            # Build repair prompt
+            repair_section = repair_plan.get_repair_prompt_section()
+
+            feedback = (
+                f"{repair_section}\n\n"
+                f"Repair attempt {attempt}/{self.config.max_repair_attempts} "
+                f"(Level: {level.value}). Fix these validation issues:\n"
+                + "\n".join(f"- {msg}" for msg in current_validation.error_messages)
+            )
+
+            system_prompt = self.prompt_builder.build_system_prompt()
+            user_prompt = self.prompt_builder.build_refinement_prompt(
+                original_code=current_code,
+                feedback=feedback,
+                validation_issues=current_validation.error_messages,
+                rag_chunks=rag_chunks,
+            )
+
+            response = self.vllm.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.1,
+                max_tokens=self.config.generation_max_tokens,
+            )
+
+            if not response.success:
+                logger.warning("Repair LLM call failed", error=response.error)
+                # Record failed attempt
+                memory.record_attempt(
+                    attempt_number=attempt,
+                    strategy=level.value,
+                    instructions_used=[inst.description for inst in repair_plan.instructions],
+                    issues_before=issues_before,
+                    issues_after=issues_before,  # Same issues (call failed)
+                    reasoning=reasoning.get("overall_strategy") if reasoning else None,
+                )
+                continue
+
+            repaired_code = self._extract_code(response.content)
+
+            # Validate immediately (in-loop validation)
+            current_validation = self.validator.validate(repaired_code, rag_chunks=rag_chunks)
+
+            # Record attempt with full diff
+            record = memory.record_attempt(
+                attempt_number=attempt,
+                strategy=level.value,
+                instructions_used=[inst.description for inst in repair_plan.instructions],
+                issues_before=issues_before,
+                issues_after=current_validation.error_messages,
+                reasoning=reasoning.get("overall_strategy") if reasoning else None,
+            )
+
+            self._publish_event(EventType.REPAIR_COMPLETED, {
+                "attempt": attempt,
+                "level": level.value,
+                "success": current_validation.passed,
+                "fixed": len(record.issues_fixed),
+                "introduced": len(record.issues_introduced),
+            })
+
+            if current_validation.passed:
+                logger.info(
+                    "Repair successful",
+                    attempt=attempt,
+                    level=level.value,
+                )
+                return repaired_code, attempt, levels_used
+
+            current_code = repaired_code
+
+            # Log progress
+            logger.info(
+                "Repair attempt result",
+                attempt=attempt,
+                fixed=len(record.issues_fixed),
+                introduced=len(record.issues_introduced),
+                remaining=len(current_validation.errors),
+            )
+
+        # Return last attempt even if not fully fixed
+        return current_code, self.config.max_repair_attempts, levels_used
+
     # ═══════════════════════════════════════════════════════════════════
     # Full Non-Streaming Generation
     # ═══════════════════════════════════════════════════════════════════
@@ -393,9 +677,15 @@ class TwoPhaseStrategy:
         rag_chunks: list[CodeChunk],
         collection_name: Optional[str] = None,
     ) -> TwoPhaseResult:
-        """Execute full two-phase generation (non-streaming).
+        """Execute full two-phase generation with iterative refinement.
 
-        Orchestrates: analyze → enrich → build prompt → generate → validate → repair.
+        Full flow:
+          Phase 1: Analyze → AnalysisResult
+          Enrich: Search missing context
+          Phase 2: Generate complete test class
+          Self-Review: LLM checks its own output
+          Validate: Structural/pattern validation
+          Repair (if needed): Escalating strategy with failure memory
         """
         start_time = time.time()
         result = TwoPhaseResult(success=False, class_name=class_name)
@@ -472,7 +762,21 @@ class TwoPhaseStrategy:
                 "tokens_used": response.tokens_used,
             })
 
-            # ── Validate ──────────────────────────────────────────────
+            # ── Self-Review ───────────────────────────────────────────
+            reviewed_code, review_issues = self.self_review(
+                test_code=test_code,
+                source_code=source_code,
+                class_name=class_name,
+                rag_chunks=all_chunks,
+            )
+
+            if review_issues:
+                result.self_review_issues = review_issues
+                result.self_review_applied = (reviewed_code != test_code)
+                test_code = reviewed_code
+                result.test_code = test_code
+
+            # ── Validate (IN the loop, not just at end) ──────────────
             self._state = TwoPhaseState.VALIDATING
 
             validation_result = self.validator.validate(test_code, rag_chunks=all_chunks)
@@ -486,23 +790,23 @@ class TwoPhaseStrategy:
                 "warnings": len(validation_result.warnings),
             })
 
-            # ── Repair if needed ──────────────────────────────────────
+            # ── Iterative Repair (escalating, with memory) ───────────
             if not validation_result.passed:
-                self._state = TwoPhaseState.REPAIRING
-
-                repaired_code, repair_attempts = self._run_repair(
+                repaired_code, repair_attempts, levels_used = self.iterative_repair(
                     test_code=test_code,
                     validation_result=validation_result,
                     rag_chunks=all_chunks,
+                    source_code=source_code,
                 )
                 result.repair_attempts = repair_attempts
+                result.repair_levels_used = levels_used
+                result.test_code = repaired_code
 
-                if repaired_code:
-                    result.test_code = repaired_code
-                    validation_result = self.validator.validate(repaired_code, rag_chunks=all_chunks)
-                    result.validation_result = validation_result
-                    result.validation_passed = validation_result.passed
-                    result.validation_issues = validation_result.error_messages
+                # Re-validate after all repairs
+                validation_result = self.validator.validate(repaired_code, rag_chunks=all_chunks)
+                result.validation_result = validation_result
+                result.validation_passed = validation_result.passed
+                result.validation_issues = validation_result.error_messages
 
             # ── Success ───────────────────────────────────────────────
             result.success = True
@@ -514,6 +818,8 @@ class TwoPhaseStrategy:
                 "class_name": class_name,
                 "total_time_ms": round(result.total_time_ms, 1),
                 "validation_passed": result.validation_passed,
+                "self_review_applied": result.self_review_applied,
+                "repair_levels": result.repair_levels_used,
             })
 
             logger.info(
@@ -523,6 +829,8 @@ class TwoPhaseStrategy:
                 validation_passed=result.validation_passed,
                 total_time_ms=round(result.total_time_ms, 1),
                 repair_attempts=result.repair_attempts,
+                repair_levels=result.repair_levels_used,
+                self_review_applied=result.self_review_applied,
                 extra_chunks=len(extra_chunks),
             )
             return result
@@ -544,11 +852,7 @@ class TwoPhaseStrategy:
     # ═══════════════════════════════════════════════════════════════════
 
     def _build_analysis_section(self, analysis_result: AnalysisResult) -> str:
-        """Build an analysis summary to include in the Phase 2 prompt.
-
-        Tells the LLM exactly what methods to test and what scenarios
-        to cover, reducing hallucination of non-existent behaviors.
-        """
+        """Build an analysis summary to include in the Phase 2 prompt."""
         lines = [
             "## Phase 1 Analysis Summary",
             f"Complexity: {analysis_result.complexity_level} (score: {analysis_result.complexity_score})",
@@ -572,76 +876,57 @@ class TwoPhaseStrategy:
 
         return "\n".join(lines)
 
-    def _run_repair(
+    def _run_reasoning(
         self,
         test_code: str,
-        validation_result: ValidationResult,
-        rag_chunks: list[CodeChunk],
-    ) -> tuple[Optional[str], int]:
-        """Run repair loop using PromptBuilder.build_refinement_prompt."""
-        current_code = test_code
+        validation_issues: list[str],
+        memory: FailureMemory,
+    ) -> Optional[dict]:
+        """Run the reasoning engine: ask LLM WHY validation failed.
 
-        for attempt in range(1, self.config.max_repair_attempts + 1):
+        Returns parsed reasoning dict or None on failure.
+        """
+        logger.info("Running repair reasoning engine", issues=len(validation_issues))
+
+        system_prompt, user_prompt = self.reasoning_engine.build_reasoning_prompt(
+            test_code=test_code,
+            validation_issues=validation_issues,
+            memory=memory,
+        )
+
+        response = self.vllm.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.1,
+            max_tokens=self.config.reasoning_max_tokens,
+        )
+
+        if not response.success:
+            logger.warning("Reasoning LLM call failed", error=response.error)
+            return None
+
+        reasoning = self.reasoning_engine.parse_reasoning(response.content)
+        if reasoning:
             logger.info(
-                "Running repair attempt",
-                attempt=attempt,
-                errors=len(validation_result.errors),
+                "Reasoning complete",
+                analyses=len(reasoning.get("analyses", [])),
+                strategy=reasoning.get("overall_strategy", "")[:100],
             )
+        else:
+            logger.warning("Failed to parse reasoning output")
 
-            self._publish_event(EventType.REPAIR_STARTED, {
-                "attempt": attempt,
-                "errors": len(validation_result.errors),
-            })
+        return reasoning
 
-            # Build repair prompt using existing PromptBuilder (same as single-pass)
-            repair_plan = self.repair_selector.build_repair_plan(
-                validation_result=validation_result,
-                attempt_number=attempt,
-                max_attempts=self.config.max_repair_attempts,
-            )
-            repair_section = repair_plan.get_repair_prompt_section()
-
-            feedback = (
-                f"{repair_section}\n\n"
-                f"Auto-repair attempt {attempt}: fix these validation issues: "
-                f"{', '.join(validation_result.error_messages)}"
-            )
-
-            system_prompt = self.prompt_builder.build_system_prompt()
-            user_prompt = self.prompt_builder.build_refinement_prompt(
-                original_code=current_code,
-                feedback=feedback,
-                validation_issues=validation_result.error_messages,
-                rag_chunks=rag_chunks,
-            )
-
-            response = self.vllm.generate(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=0.1,
-                max_tokens=self.config.generation_max_tokens,
-            )
-
-            if not response.success:
-                logger.warning("Repair LLM call failed", error=response.error)
-                continue
-
-            repaired_code = self._extract_code(response.content)
-            validation_result = self.validator.validate(repaired_code, rag_chunks=rag_chunks)
-
-            self._publish_event(EventType.REPAIR_COMPLETED, {
-                "attempt": attempt,
-                "success": validation_result.passed,
-            })
-
-            if validation_result.passed:
-                logger.info("Repair successful", attempt=attempt)
-                return repaired_code, attempt
-
-            current_code = repaired_code
-
-        # Return last attempt even if not fully fixed
-        return current_code, self.config.max_repair_attempts
+    def _extract_review_issues(self, review_content: str) -> list[str]:
+        """Extract issues found during self-review from LLM response."""
+        issues = []
+        # Look for issues in comment format: // ISSUE: ...
+        for match in re.finditer(r'//\s*(?:ISSUE|FIX|FIXED|CHANGE|CHANGED|PROBLEM):\s*(.+)', review_content):
+            issues.append(match.group(1).strip())
+        # Look for bullet points before code: - Found: ...
+        for match in re.finditer(r'^[-*]\s*((?:Found|Fixed|Missing|Wrong|Added|Removed|Changed):.+)', review_content, re.MULTILINE):
+            issues.append(match.group(1).strip())
+        return issues
 
     def _extract_code(self, response: str) -> str:
         """Extract Java code from LLM response."""
