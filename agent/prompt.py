@@ -684,3 +684,128 @@ NOW: analyze and write tests for the following service:
         from utils.tokenizer import count_tokens
         return count_tokens(text)
 
+    def build_registry_enhanced_prompt(
+        self,
+        class_name: str,
+        file_path: str,
+        rag_chunks: list[CodeChunk],
+        registry_context: str,
+        task_description: Optional[str] = None,
+        session: Optional[SessionMemory] = None,
+    ) -> str:
+        """Build prompt with Domain Registry context for better construction accuracy.
+        
+        This is an enhanced version of build_test_generation_prompt that includes
+        pre-computed construction patterns from the Domain Type Registry.
+        
+        Args:
+            class_name: Target class name.
+            file_path: Target file path.
+            rag_chunks: RAG context chunks.
+            registry_context: Pre-built registry context section from DomainTypeRegistry.
+            task_description: Optional task description.
+            session: Optional session memory.
+        
+        Returns:
+            Complete user prompt with registry-enhanced construction hints.
+        """
+        # Build base prompt
+        base_prompt = self.build_test_generation_prompt(
+            class_name=class_name,
+            file_path=file_path,
+            rag_chunks=rag_chunks,
+            task_description=task_description,
+            session=session,
+        )
+        
+        if not registry_context:
+            return base_prompt
+        
+        # Insert registry context before Requirements section
+        parts = base_prompt.split("\n## Requirements")
+        if len(parts) == 2:
+            return f"{parts[0]}\n\n{registry_context}\n\n## Requirements{parts[1]}"
+        
+        # Fallback: append at end
+        return f"{base_prompt}\n\n{registry_context}"
+
+    def build_focused_method_prompt(
+        self,
+        class_name: str,
+        method_name: str,
+        method_signature: str,
+        test_scenarios: list[dict],
+        mock_fields: list[str],
+        registry_context: str,
+        dependencies_called: list[str] = None,
+    ) -> str:
+        """Build a focused prompt for generating tests for a single method.
+        
+        This is used in Phase 2 of Two-Phase Generation, where each method
+        gets its own focused generation call with minimal context.
+        
+        Args:
+            class_name: Service class name.
+            method_name: Method to test.
+            method_signature: Full method signature.
+            test_scenarios: List of test scenarios from Phase 1 analysis.
+            mock_fields: List of mock field declarations.
+            registry_context: Registry construction patterns.
+            dependencies_called: Dependencies this method calls.
+        
+        Returns:
+            Focused user prompt for single method test generation.
+        """
+        parts = []
+        
+        # Header
+        parts.append(f"## Generate Tests for `{method_name}` in `{class_name}`")
+        
+        # Method signature
+        parts.append(f"\n### Method Signature\n```java\n{method_signature}\n```")
+        
+        # Test scenarios
+        if test_scenarios:
+            parts.append("\n### Test Scenarios to Implement")
+            for i, scenario in enumerate(test_scenarios, 1):
+                name = scenario.get("name", f"scenario_{i}")
+                desc = scenario.get("description", "")
+                expected = scenario.get("expected_behavior", "")
+                priority = scenario.get("priority", 1)
+                parts.append(f"\n{i}. **{name}** (Priority {priority})")
+                if desc:
+                    parts.append(f"   - Description: {desc}")
+                if expected:
+                    parts.append(f"   - Expected: {expected}")
+        
+        # Mock fields
+        if mock_fields:
+            parts.append("\n### Available Mock Fields")
+            parts.append("```java")
+            for mock in mock_fields:
+                parts.append(f"@Mock {mock};")
+            parts.append(f"@InjectMocks {class_name} {class_name[0].lower() + class_name[1:]};")
+            parts.append("```")
+        
+        # Dependencies called
+        if dependencies_called:
+            parts.append(f"\n### Dependencies This Method Calls")
+            parts.append(f"Mock these in order: {', '.join(dependencies_called)}")
+        
+        # Registry context
+        if registry_context:
+            parts.append(f"\n{registry_context}")
+        
+        # Output requirements
+        parts.append("""
+### Output Requirements
+1. Generate ONLY test methods for the scenarios above
+2. Use @Test and @DisplayName for each method
+3. Follow AAA pattern with comments: // Arrange, // Act, // Assert
+4. Use EXACT construction patterns from Domain Types section
+5. Verify mock interactions with verify()
+6. Method naming: methodName_WhenCondition_ShouldResult
+7. Output test methods only — no class declaration or imports""")
+        
+        return "\n".join(parts)
+

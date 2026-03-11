@@ -15,9 +15,10 @@ from typing import Optional, Literal
 import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent.orchestrator import AgentOrchestrator, GenerationRequest, StreamEvent, StreamPhase
 from agent.events import get_event_bus, Event, EventType
@@ -90,10 +91,24 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
     role: Literal["system", "user", "assistant", "tool"]
-    content: Optional[str] = None
+    content: Optional[str | list] = None
     tool_calls: Optional[list[ToolCall]] = None    # assistant → tool calls
     tool_call_id: Optional[str] = None             # tool → result
     name: Optional[str] = None                     # tool function name
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _coerce_content(cls, v):
+        """OpenAI allows content as list of parts — flatten to str."""
+        if isinstance(v, list):
+            texts = []
+            for part in v:
+                if isinstance(part, str):
+                    texts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+            return "\n".join(texts)
+        return v
 
 
 class ChatCompletionRequest(BaseModel):
@@ -112,6 +127,28 @@ class ChatCompletionRequest(BaseModel):
     # Multi-collection: explicit Qdrant collection name
     # (set via Continue's extraBodyProperties or sent by CI/CD pipelines)
     collection: Optional[str] = None
+    # Two-Phase Strategy options (set via Continue's extraBodyProperties)
+    force_two_phase: Optional[bool] = False
+    force_single_pass: Optional[bool] = False
+    complexity_threshold: Optional[int] = 10
+
+    @field_validator("force_two_phase", "force_single_pass", mode="before")
+    @classmethod
+    def _coerce_bool(cls, v):
+        """Handle malformed booleans like 'true,' from IDE config."""
+        if isinstance(v, str):
+            v = v.strip().rstrip(",").strip().lower()
+            return v in ("true", "1", "yes")
+        return v
+
+    @field_validator("complexity_threshold", mode="before")
+    @classmethod
+    def _coerce_int(cls, v):
+        """Handle malformed ints like '10,' from IDE config."""
+        if isinstance(v, str):
+            v = v.strip().rstrip(",").strip()
+            return int(v) if v else None
+        return v
 
 
 class ChatCompletionChoice(BaseModel):
@@ -542,6 +579,19 @@ def create_app() -> FastAPI:
         response.headers["X-RateLimit-Reset"] = str(int(time.time() + RATE_LIMIT_WINDOW))
         
         return response
+
+    # ── 422 validation error handler — log details for debugging ─────
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        logger.error(
+            "Request validation failed (422)",
+            path=request.url.path,
+            errors=exc.errors(),
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.errors()},
+        )
 
     return app
 
@@ -978,6 +1028,19 @@ class PipelineGenerateRequest(BaseModel):
             "its content here."
         ),
     )
+    # Two-Phase Strategy options
+    force_two_phase: bool = Field(
+        False,
+        description="Force two-phase generation even for simple services",
+    )
+    force_single_pass: bool = Field(
+        False,
+        description="Force single-pass generation even for complex services",
+    )
+    complexity_threshold: int = Field(
+        10,
+        description="Complexity threshold for auto-routing to two-phase",
+    )
 
 
 class PipelineBatchRequest(BaseModel):
@@ -1018,6 +1081,10 @@ class PipelineGenerateResponse(BaseModel):
     rag_chunks_used: int = 0
     tokens_used: int = 0
     repair_attempts: int = 0
+    # Two-Phase Strategy metadata
+    strategy_used: str = "single_pass"
+    complexity_score: int = 0
+    analysis_result: dict | None = None
 
 
 class PipelineBatchResponse(BaseModel):
@@ -1131,6 +1198,9 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             file_path=request.file_path,
         ),
         source_code=request.source_code,
+        force_two_phase=request.force_two_phase,
+        force_single_pass=request.force_single_pass,
+        complexity_threshold=request.complexity_threshold,
     )
 
     result = await run_in_executor(orchestrator.generate_test, gen_request)
@@ -1148,6 +1218,9 @@ async def pipeline_generate(request: PipelineGenerateRequest):
         rag_chunks_used=result.rag_chunks_used,
         tokens_used=result.tokens_used,
         repair_attempts=result.repair_attempts,
+        strategy_used=result.strategy_used,
+        complexity_score=result.complexity_score,
+        analysis_result=result.analysis_result,
     )
 
 
@@ -1362,14 +1435,31 @@ async def chat_completions(request: ChatCompletionRequest):
     created_time = int(time.time())
 
     # ═════════════════════════════════════════════════════════════════
-    # PATH 1: Test generation pipeline
+    # PATH 1: Test generation pipeline (supports Two-Phase Strategy)
     # ═════════════════════════════════════════════════════════════════
     if is_test_request and file_path:
-        logger.info("Using test generation pipeline", file_path=file_path, collection=resolved_collection)
+        logger.info(
+            "Using test generation pipeline",
+            file_path=file_path,
+            collection=resolved_collection,
+            force_two_phase=request.force_two_phase,
+        )
+        
+        # Extract source code from user message if present
+        source_code = None
+        code_match = _re.search(r'```(?:[^\n]*\.java)?\s*\n(.*?)```', user_content, _re.DOTALL)
+        if code_match:
+            source_code = code_match.group(1).strip()
+        
         gen_request = GenerationRequest(
             file_path=file_path,
             task_description=user_content,
             collection_name=resolved_collection,
+            source_code=source_code,
+            # Two-Phase Strategy options
+            force_two_phase=request.force_two_phase or False,
+            force_single_pass=request.force_single_pass or False,
+            complexity_threshold=request.complexity_threshold or 10,
         )
 
         # ── REAL STREAMING: progress phases + token-by-token code ────
@@ -1692,6 +1782,17 @@ def _build_metadata_block(result) -> str:
         )
 
     parts.append(f"**Tokens used:** {result.tokens_used}")
+    
+    # Two-Phase Strategy metadata
+    strategy = getattr(result, 'strategy_used', 'single_pass')
+    if strategy == "two_phase":
+        parts.append(f"**Strategy:** 🔄 Two-Phase Generation")
+        complexity = getattr(result, 'complexity_score', 0)
+        if complexity:
+            parts.append(f"**Complexity score:** {complexity}")
+    else:
+        parts.append(f"**Strategy:** ⚡ Single-Pass")
+    
     return "\n".join(parts)
 
 
@@ -1898,6 +1999,170 @@ async def tabby_events(request: dict):
     """Receive events from Tabby (telemetry, etc.)."""
     logger.debug("Received Tabby event", event=request)
     return {"status": "ok"}
+
+
+# ============================================================================
+# Two-Phase Strategy & Domain Registry Endpoints
+# ============================================================================
+
+@app.get("/v1/two-phase/status")
+async def two_phase_status():
+    """Check if Two-Phase Strategy is enabled and get configuration."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    return {
+        "enabled": orchestrator.is_two_phase_enabled(),
+        "domain_registry_available": orchestrator.domain_registry is not None,
+        "complexity_calculator_available": orchestrator.complexity_calculator is not None,
+    }
+
+
+@app.get("/v1/complexity/{class_name}")
+async def get_complexity(class_name: str, collection: Optional[str] = None):
+    """Calculate complexity score for a class.
+    
+    Returns complexity score and level (simple/medium/complex).
+    Used to determine if two-phase strategy should be used.
+    
+    Example: GET /v1/complexity/OrderService?collection=my_project
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    score, level = await run_in_executor(
+        orchestrator.get_complexity_score, class_name, collection
+    )
+    
+    return {
+        "class_name": class_name,
+        "complexity_score": score,
+        "complexity_level": level,
+        "recommended_strategy": "two_phase" if score >= 10 else "single_pass",
+    }
+
+
+@app.get("/v1/registry/stats")
+async def registry_stats(collection: Optional[str] = None):
+    """Get Domain Type Registry statistics.
+    
+    Shows how many domain types are indexed and their construction patterns.
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not orchestrator.domain_registry:
+        return {"error": "Domain registry not available"}
+    
+    stats = orchestrator.domain_registry.get_stats(collection)
+    return {
+        "total_types": stats.total_types,
+        "by_pattern": stats.by_pattern,
+        "by_java_type": stats.by_java_type,
+        "build_time_ms": round(stats.build_time_ms, 1),
+        "cached": orchestrator.domain_registry.is_cached(collection),
+    }
+
+
+@app.post("/v1/registry/rebuild")
+async def rebuild_registry(collection: Optional[str] = None):
+    """Rebuild the Domain Type Registry.
+    
+    Call this after reindexing to ensure the registry is up-to-date.
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    result = await run_in_executor(
+        orchestrator.rebuild_domain_registry, collection
+    )
+    return result
+
+
+@app.get("/v1/registry/lookup/{class_name}")
+async def registry_lookup(class_name: str, collection: Optional[str] = None):
+    """Look up construction info for a domain type.
+    
+    Returns the pre-computed construction pattern and example code.
+    
+    Example: GET /v1/registry/lookup/OrderRequest?collection=my_project
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    result = await run_in_executor(
+        orchestrator.get_domain_type_info, class_name, collection
+    )
+    return result
+
+
+@app.get("/v1/registry/prompt-section")
+async def registry_prompt_section(
+    class_names: str,
+    collection: Optional[str] = None,
+):
+    """Generate a prompt section with construction examples for multiple types.
+    
+    Args:
+        class_names: Comma-separated list of class names.
+        collection: Optional Qdrant collection.
+    
+    Example: GET /v1/registry/prompt-section?class_names=OrderRequest,User,Order
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not orchestrator.domain_registry:
+        return {"error": "Domain registry not available"}
+    
+    names = [n.strip() for n in class_names.split(",") if n.strip()]
+    
+    prompt_section = await run_in_executor(
+        orchestrator.domain_registry.get_prompt_section, names, collection
+    )
+    
+    return {
+        "class_names": names,
+        "prompt_section": prompt_section,
+    }
+
+
+@app.post("/pipeline/generate-two-phase", response_model=PipelineGenerateResponse)
+async def pipeline_generate_two_phase(request: PipelineGenerateRequest):
+    """Generate unit tests using Two-Phase Strategy (explicit).
+    
+    This endpoint always uses the two-phase strategy regardless of complexity.
+    Use this when you know the service is complex and want better accuracy.
+    
+    Two-Phase Strategy:
+    1. Phase 1 (Analysis): LLM analyzes the service and outputs a JSON plan
+    2. Phase 2 (Generation): For each method, generate focused tests with
+       exact construction patterns from the Domain Registry
+    
+    Example::
+    
+        POST /pipeline/generate-two-phase
+        {
+            "file_path": "src/main/java/com/example/ComplexService.java",
+            "source_code": "package com.example; ...",
+            "collection": "my_project"
+        }
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not orchestrator.is_two_phase_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="Two-Phase Strategy is not enabled. Check server configuration."
+        )
+    
+    # Force two-phase
+    request.force_two_phase = True
+    request.force_single_pass = False
+    
+    # Delegate to the standard pipeline endpoint
+    return await pipeline_generate(request)
 
 
 if __name__ == "__main__":

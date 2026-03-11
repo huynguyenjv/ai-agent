@@ -563,3 +563,92 @@ class IndexBuilder:
         name_map = {c.name: c for c in classes}
         fqn_map = {c.fully_qualified_name: c for c in classes}
         return self._build_dependency_graph(classes, name_map, fqn_map)
+
+    # ------------------------------------------------------------------
+    # Domain Registry Integration
+    # ------------------------------------------------------------------
+
+    def rebuild_domain_registry(
+        self,
+        collection_name: Optional[str] = None,
+    ) -> dict:
+        """Rebuild the Domain Type Registry after indexing.
+        
+        This should be called after index_repository() to ensure the registry
+        has up-to-date construction patterns for all domain types.
+        
+        Returns:
+            Registry statistics or error dict.
+        """
+        try:
+            from .domain_registry import get_domain_registry
+            
+            effective_collection = collection_name or self.collection_name
+            registry = get_domain_registry(
+                qdrant_client=self.qdrant,
+                default_collection=effective_collection,
+            )
+            
+            stats = registry.build_from_collection(
+                collection_name=effective_collection,
+                force_rebuild=True,
+            )
+            
+            logger.info(
+                "Domain registry rebuilt",
+                collection=effective_collection,
+                total_types=stats.total_types,
+                by_pattern=stats.by_pattern,
+            )
+            
+            return {
+                "success": True,
+                "collection": effective_collection,
+                "total_types": stats.total_types,
+                "by_pattern": stats.by_pattern,
+                "by_java_type": stats.by_java_type,
+                "build_time_ms": round(stats.build_time_ms, 1),
+            }
+            
+        except ImportError:
+            logger.warning("Domain registry module not available")
+            return {"success": False, "error": "Domain registry module not available"}
+        except Exception as e:
+            logger.error("Failed to rebuild domain registry", error=str(e))
+            return {"success": False, "error": str(e)}
+
+    def index_repository_with_registry(
+        self,
+        repo_path: str,
+        recreate: bool = False,
+        collection_name: Optional[str] = None,
+    ) -> dict:
+        """Index repository and rebuild domain registry in one call.
+        
+        This is the recommended method for full reindexing as it ensures
+        the domain registry is always in sync with the index.
+        
+        Returns:
+            Combined result with index and registry statistics.
+        """
+        effective_collection = collection_name or self.collection_name
+        
+        # Step 1: Index repository
+        points_count = self.index_repository(
+            repo_path=repo_path,
+            recreate=recreate,
+            collection_name=effective_collection,
+        )
+        
+        # Step 2: Rebuild domain registry
+        registry_result = self.rebuild_domain_registry(
+            collection_name=effective_collection,
+        )
+        
+        return {
+            "index": {
+                "collection": effective_collection,
+                "points_count": points_count,
+            },
+            "registry": registry_result,
+        }
