@@ -35,3 +35,6 @@ tiktoken==0.6.0
 tenacity==8.2.3
 structlog==24.1.0
 
+# LangGraph orchestration
+langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=1.0.0
