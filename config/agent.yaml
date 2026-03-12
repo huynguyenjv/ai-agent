@@ -125,7 +125,7 @@ langgraph:
   checkpoint_db: "checkpoints.db"
 
   # Default human review setting (can be overridden per request)
-  require_human_review: true
+  require_human_review: false
 
   # Use legacy orchestrator instead of LangGraph
   # Set USE_LEGACY_ORCHESTRATOR=true env var to override
