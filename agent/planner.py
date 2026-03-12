@@ -376,6 +376,157 @@ class Planner:
 
         return plan
 
+    # ── Two-Phase Generation Planning ─────────────────────────────────
+
+    def plan_two_phase_generation(
+        self,
+        file_path: str,
+        class_name: Optional[str] = None,
+        task_description: Optional[str] = None,
+        session_id: Optional[str] = None,
+        max_repair_attempts: int = 2,
+        complexity_score: int = 0,
+    ) -> ExecutionPlan:
+        """Build an execution plan for two-phase test generation.
+
+        Two-phase generation is used for complex services where single-pass
+        generation tends to hallucinate domain types.
+
+        Steps produced (in order):
+          1. extract_class_info      — resolve class name from file path
+          2. retrieve_context        — fetch RAG chunks for target + deps
+          3. analyze_service         — Phase 1: LLM analyzes service, outputs JSON
+          4. lookup_registry         — Lookup domain types in registry
+          5. generate_method_tests   — Phase 2: Generate tests per method
+          6. assemble_test_class     — Assemble final test class
+          7. validate_code           — run rule-based validation
+          8. record_session          — persist to session memory
+        """
+        resolved_class = class_name or self._extract_class_name(file_path)
+
+        plan = ExecutionPlan(
+            task_type=TaskType.TWO_PHASE_GENERATION,
+            class_name=resolved_class or "",
+            file_path=file_path,
+            max_repair_attempts=max_repair_attempts,
+            metadata={
+                "session_id": session_id,
+                "task_description": task_description,
+                "complexity_score": complexity_score,
+                "strategy": "two_phase",
+                "has_inline_source": bool(
+                    task_description and "```" in task_description
+                ),
+            },
+        )
+
+        # Step 1: Resolve class name
+        plan.add_step(
+            action=StepAction.EXTRACT_CLASS_INFO,
+            description=f"Resolve class name from {file_path}",
+            file_path=file_path,
+            class_name=resolved_class,
+        )
+
+        # Step 2: Retrieve RAG context
+        plan.add_step(
+            action=StepAction.RETRIEVE_CONTEXT,
+            description=f"Fetch RAG context for {resolved_class or '?'}",
+            class_name=resolved_class,
+            file_path=file_path,
+            inline_source=task_description,
+            session_id=session_id,
+        )
+
+        # Step 3: Phase 1 - Analyze service
+        plan.add_step(
+            action=StepAction.ANALYZE_SERVICE,
+            description="Phase 1: Analyze service structure and plan tests",
+            class_name=resolved_class,
+            file_path=file_path,
+        )
+
+        # Step 4: Lookup domain types in registry
+        plan.add_step(
+            action=StepAction.LOOKUP_REGISTRY,
+            description="Lookup domain type construction patterns from registry",
+        )
+
+        # Step 5: Phase 2 - Generate tests per method
+        plan.add_step(
+            action=StepAction.GENERATE_METHOD_TESTS,
+            description="Phase 2: Generate focused tests for each method",
+        )
+
+        # Step 6: Assemble final test class
+        plan.add_step(
+            action=StepAction.ASSEMBLE_TEST_CLASS,
+            description="Assemble method tests into complete test class",
+        )
+
+        # Step 7: Validate generated code
+        plan.add_step(
+            action=StepAction.VALIDATE_CODE,
+            description="Validate against JUnit5/Mockito rules",
+        )
+
+        # Step 8: Record in session
+        plan.add_step(
+            action=StepAction.RECORD_SESSION,
+            description="Persist results to session memory",
+            session_id=session_id,
+        )
+
+        logger.info(
+            "Two-phase plan created",
+            plan_id=plan.plan_id,
+            task_type=plan.task_type.value,
+            class_name=plan.class_name,
+            steps=len(plan.steps),
+            complexity_score=complexity_score,
+        )
+
+        return plan
+
+    def plan_complexity_check(
+        self,
+        file_path: str,
+        class_name: Optional[str] = None,
+    ) -> ExecutionPlan:
+        """Build a minimal plan to check service complexity.
+
+        Used to decide whether to use single-pass or two-phase generation.
+        """
+        resolved_class = class_name or self._extract_class_name(file_path)
+
+        plan = ExecutionPlan(
+            task_type=TaskType.TEST_GENERATION,  # Will be changed after check
+            class_name=resolved_class or "",
+            file_path=file_path,
+            metadata={"purpose": "complexity_check"},
+        )
+
+        plan.add_step(
+            action=StepAction.EXTRACT_CLASS_INFO,
+            description=f"Resolve class name from {file_path}",
+            file_path=file_path,
+            class_name=resolved_class,
+        )
+
+        plan.add_step(
+            action=StepAction.RETRIEVE_CONTEXT,
+            description=f"Fetch RAG context for complexity analysis",
+            class_name=resolved_class,
+            file_path=file_path,
+        )
+
+        plan.add_step(
+            action=StepAction.CALCULATE_COMPLEXITY,
+            description="Calculate service complexity score",
+        )
+
+        return plan
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     @staticmethod

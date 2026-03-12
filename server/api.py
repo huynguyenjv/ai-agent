@@ -15,11 +15,13 @@ from typing import Optional, Literal
 import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent.orchestrator import AgentOrchestrator, GenerationRequest, StreamEvent, StreamPhase
+from agent.graph_adapter import GraphOrchestrator, create_graph_orchestrator
 from agent.events import get_event_bus, Event, EventType
 from agent.metrics import MetricsCollector
 from indexer.build_index import IndexBuilder
@@ -37,10 +39,14 @@ logger = structlog.get_logger()
 
 # Global instances
 orchestrator: Optional[AgentOrchestrator] = None
+graph_orchestrator: Optional[GraphOrchestrator] = None  # LangGraph backend
 index_builder: Optional[IndexBuilder] = None
 metrics_collector: Optional[MetricsCollector] = None
 session_manager: SessionManager = SessionManager()
 rate_limiter: Optional[RateLimiter] = None
+
+# Toggle: set USE_LEGACY_ORCHESTRATOR=true to use the old orchestrator
+USE_LEGACY = os.getenv("USE_LEGACY_ORCHESTRATOR", "false").lower() in ("true", "1", "yes")
 
 # Thread pool for running blocking operations
 # Use limited workers to prevent resource exhaustion
@@ -90,10 +96,24 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
     role: Literal["system", "user", "assistant", "tool"]
-    content: Optional[str] = None
+    content: Optional[str | list] = None
     tool_calls: Optional[list[ToolCall]] = None    # assistant → tool calls
     tool_call_id: Optional[str] = None             # tool → result
     name: Optional[str] = None                     # tool function name
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _coerce_content(cls, v):
+        """OpenAI allows content as list of parts — flatten to str."""
+        if isinstance(v, list):
+            texts = []
+            for part in v:
+                if isinstance(part, str):
+                    texts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+            return "\n".join(texts)
+        return v
 
 
 class ChatCompletionRequest(BaseModel):
@@ -112,6 +132,28 @@ class ChatCompletionRequest(BaseModel):
     # Multi-collection: explicit Qdrant collection name
     # (set via Continue's extraBodyProperties or sent by CI/CD pipelines)
     collection: Optional[str] = None
+    # Two-Phase Strategy options (set via Continue's extraBodyProperties)
+    force_two_phase: Optional[bool] = False
+    force_single_pass: Optional[bool] = False
+    complexity_threshold: Optional[int] = 10
+
+    @field_validator("force_two_phase", "force_single_pass", mode="before")
+    @classmethod
+    def _coerce_bool(cls, v):
+        """Handle malformed booleans like 'true,' from IDE config."""
+        if isinstance(v, str):
+            v = v.strip().rstrip(",").strip().lower()
+            return v in ("true", "1", "yes")
+        return v
+
+    @field_validator("complexity_threshold", mode="before")
+    @classmethod
+    def _coerce_int(cls, v):
+        """Handle malformed ints like '10,' from IDE config."""
+        if isinstance(v, str):
+            v = v.strip().rstrip(",").strip()
+            return int(v) if v else None
+        return v
 
 
 class ChatCompletionChoice(BaseModel):
@@ -321,9 +363,9 @@ def _resolve_collection(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global orchestrator, index_builder, _executor, metrics_collector, rate_limiter
+    global orchestrator, graph_orchestrator, index_builder, _executor, metrics_collector, rate_limiter
 
-    logger.info("Starting AI Agent server...")
+    logger.info("Starting AI Agent server...", backend="legacy" if USE_LEGACY else "langgraph")
 
     # Initialize thread pool for blocking operations
     _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -339,9 +381,21 @@ async def lifespan(app: FastAPI):
         window_seconds=RATE_LIMIT_WINDOW,
     )
 
-    # Initialize components
+    # Initialize components — legacy orchestrator always created for fallback
     orchestrator = create_orchestrator()
     index_builder = create_index_builder()
+
+    # Initialize LangGraph orchestrator (new backend)
+    if not USE_LEGACY:
+        try:
+            graph_orchestrator = create_graph_orchestrator(
+                rag_client=orchestrator.rag,
+                vllm_client=orchestrator.vllm,
+            )
+            logger.info("LangGraph orchestrator initialized")
+        except Exception as e:
+            logger.error("LangGraph init failed, using legacy", error=str(e))
+            graph_orchestrator = None
 
     # Phase 4: metrics collector is wired via the orchestrator's event bus
     metrics_collector = orchestrator.metrics if orchestrator else None
@@ -349,7 +403,7 @@ async def lifespan(app: FastAPI):
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(_periodic_session_cleanup())
 
-    logger.info("Server initialized successfully")
+    logger.info("Server initialized successfully", backend="langgraph" if graph_orchestrator else "legacy")
 
     yield
 
@@ -543,6 +597,19 @@ def create_app() -> FastAPI:
         
         return response
 
+    # ── 422 validation error handler — log details for debugging ─────
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        logger.error(
+            "Request validation failed (422)",
+            path=request.url.path,
+            errors=exc.errors(),
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.errors()},
+        )
+
     return app
 
 
@@ -638,7 +705,8 @@ async def generate_test(request: GenerateTestRequest):
 
     Returns generated test code with validation results.
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Read source file from disk and embed it as an inline code fence so the
@@ -676,7 +744,7 @@ async def generate_test(request: GenerateTestRequest):
         task_description=task_description_with_source,
     )
 
-    result = await run_in_executor(orchestrator.generate_test, gen_request)
+    result = await run_in_executor(active.generate_test, gen_request)
 
     return GenerateTestResponse(
         success=result.success,
@@ -978,6 +1046,19 @@ class PipelineGenerateRequest(BaseModel):
             "its content here."
         ),
     )
+    # Two-Phase Strategy options
+    force_two_phase: bool = Field(
+        False,
+        description="Force two-phase generation even for simple services",
+    )
+    force_single_pass: bool = Field(
+        False,
+        description="Force single-pass generation even for complex services",
+    )
+    complexity_threshold: int = Field(
+        10,
+        description="Complexity threshold for auto-routing to two-phase",
+    )
 
 
 class PipelineBatchRequest(BaseModel):
@@ -1018,6 +1099,10 @@ class PipelineGenerateResponse(BaseModel):
     rag_chunks_used: int = 0
     tokens_used: int = 0
     repair_attempts: int = 0
+    # Two-Phase Strategy metadata
+    strategy_used: str = "single_pass"
+    complexity_score: int = 0
+    analysis_result: dict | None = None
 
 
 class PipelineBatchResponse(BaseModel):
@@ -1056,7 +1141,8 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             "changed_methods": ["createUser", "updateEmail"]
         }
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Validate incremental mode requirements
@@ -1131,9 +1217,12 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             file_path=request.file_path,
         ),
         source_code=request.source_code,
+        force_two_phase=request.force_two_phase,
+        force_single_pass=request.force_single_pass,
+        complexity_threshold=request.complexity_threshold,
     )
 
-    result = await run_in_executor(orchestrator.generate_test, gen_request)
+    result = await run_in_executor(active.generate_test, gen_request)
 
     return PipelineGenerateResponse(
         success=result.success,
@@ -1148,6 +1237,9 @@ async def pipeline_generate(request: PipelineGenerateRequest):
         rag_chunks_used=result.rag_chunks_used,
         tokens_used=result.tokens_used,
         repair_attempts=result.repair_attempts,
+        strategy_used=result.strategy_used,
+        complexity_score=result.complexity_score,
+        analysis_result=result.analysis_result,
     )
 
 
@@ -1176,7 +1268,8 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
             ]
         }
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     results: list[PipelineBatchItemResult] = []
@@ -1210,7 +1303,7 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
                 source_code=file_req.source_code,
             )
 
-            result = await run_in_executor(orchestrator.generate_test, gen_request)
+            result = await run_in_executor(active.generate_test, gen_request)
 
             results.append(PipelineBatchItemResult(
                 file_path=file_req.file_path,
@@ -1316,7 +1409,8 @@ async def chat_completions(request: ChatCompletionRequest):
       - Multi-collection: resolves Qdrant collection from ``collection``
         field, ``file_path``, or falls back to default.
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # ── Parse messages ───────────────────────────────────────────────
@@ -1362,14 +1456,31 @@ async def chat_completions(request: ChatCompletionRequest):
     created_time = int(time.time())
 
     # ═════════════════════════════════════════════════════════════════
-    # PATH 1: Test generation pipeline
+    # PATH 1: Test generation pipeline (supports Two-Phase Strategy)
     # ═════════════════════════════════════════════════════════════════
     if is_test_request and file_path:
-        logger.info("Using test generation pipeline", file_path=file_path, collection=resolved_collection)
+        logger.info(
+            "Using test generation pipeline",
+            file_path=file_path,
+            collection=resolved_collection,
+            force_two_phase=request.force_two_phase,
+        )
+        
+        # Extract source code from user message if present
+        source_code = None
+        code_match = _re.search(r'```(?:[^\n]*\.java)?\s*\n(.*?)```', user_content, _re.DOTALL)
+        if code_match:
+            source_code = code_match.group(1).strip()
+        
         gen_request = GenerationRequest(
             file_path=file_path,
             task_description=user_content,
             collection_name=resolved_collection,
+            source_code=source_code,
+            # Two-Phase Strategy options
+            force_two_phase=request.force_two_phase or False,
+            force_single_pass=request.force_single_pass or False,
+            complexity_threshold=request.complexity_threshold or 10,
         )
 
         # ── REAL STREAMING: progress phases + token-by-token code ────
@@ -1379,7 +1490,7 @@ async def chat_completions(request: ChatCompletionRequest):
             )
 
         # ── Non-streaming: run full pipeline, return complete result ─
-        result = await run_in_executor(orchestrator.generate_test, gen_request)
+        result = await run_in_executor(active.generate_test, gen_request)
 
         if result.success:
             response_content = result.test_code or ""
@@ -1523,7 +1634,8 @@ def _stream_test_generation(
 
         def _run_sync():
             try:
-                for event in orchestrator.generate_test_streaming(gen_request):
+                active = _get_orchestrator()
+                for event in active.generate_test_streaming(gen_request):
                     loop.call_soon_threadsafe(queue.put_nowait, event)
             except Exception as exc:
                 loop.call_soon_threadsafe(
@@ -1672,26 +1784,40 @@ def _build_metadata_block(result) -> str:
     """Build a human-readable metadata block for test generation results."""
     parts = []
     parts.append("---")
-    parts.append(f"**Validation:** {'✅ passed' if result.validation_passed else '❌ failed'}")
+    parts.append(f"**Validation:** {'\u2705 passed' if getattr(result, 'validation_passed', False) else '\u274c failed'}")
 
-    if result.validation_issues:
-        parts.append(f"**Issues:** {', '.join(result.validation_issues[:5])}")
+    issues = getattr(result, 'validation_issues', [])
+    if issues:
+        parts.append(f"**Issues:** {', '.join(issues[:5])}")
 
-    if result.repair_attempts:
-        parts.append(f"**Repair attempts:** {result.repair_attempts}")
+    repair = getattr(result, 'repair_attempts', 0)
+    if repair:
+        parts.append(f"**Repair attempts:** {repair}")
 
-    if result.rag_chunks_used:
-        parts.append(f"**RAG context chunks:** {result.rag_chunks_used}")
+    rag = getattr(result, 'rag_chunks_used', 0)
+    if rag:
+        parts.append(f"**RAG context chunks:** {rag}")
 
-    if result.validation_summary:
-        vs = result.validation_summary
+    vs = getattr(result, 'validation_summary', None)
+    if vs:
         parts.append(
             f"**Details:** {vs.get('errors', 0)} errors, "
             f"{vs.get('warnings', 0)} warnings, "
             f"{vs.get('test_count', '?')} test(s)"
         )
 
-    parts.append(f"**Tokens used:** {result.tokens_used}")
+    parts.append(f"**Tokens used:** {getattr(result, 'tokens_used', 0)}")
+    
+    # Two-Phase Strategy metadata
+    strategy = getattr(result, 'strategy_used', 'single_pass')
+    if strategy == "two_phase":
+        parts.append(f"**Strategy:** \U0001f504 Two-Phase Generation")
+        complexity = getattr(result, 'complexity_score', 0)
+        if complexity:
+            parts.append(f"**Complexity score:** {complexity}")
+    else:
+        parts.append(f"**Strategy:** \u26a1 Single-Pass")
+    
     return "\n".join(parts)
 
 
@@ -1898,6 +2024,264 @@ async def tabby_events(request: dict):
     """Receive events from Tabby (telemetry, etc.)."""
     logger.debug("Received Tabby event", event=request)
     return {"status": "ok"}
+
+
+# ============================================================================
+# Two-Phase Strategy & Domain Registry Endpoints
+# ============================================================================
+
+@app.get("/v1/two-phase/status")
+async def two_phase_status():
+    """Check if Two-Phase Strategy is enabled and get configuration."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    return {
+        "enabled": orchestrator.is_two_phase_enabled(),
+        "domain_registry_available": orchestrator.domain_registry is not None,
+        "complexity_calculator_available": orchestrator.complexity_calculator is not None,
+    }
+
+
+@app.get("/v1/complexity/{class_name}")
+async def get_complexity(class_name: str, collection: Optional[str] = None):
+    """Calculate complexity score for a class.
+    
+    Returns complexity score and level (simple/medium/complex).
+    Used to determine if two-phase strategy should be used.
+    
+    Example: GET /v1/complexity/OrderService?collection=my_project
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    score, level = await run_in_executor(
+        orchestrator.get_complexity_score, class_name, collection
+    )
+    
+    return {
+        "class_name": class_name,
+        "complexity_score": score,
+        "complexity_level": level,
+        "recommended_strategy": "two_phase" if score >= 10 else "single_pass",
+    }
+
+
+@app.get("/v1/registry/stats")
+async def registry_stats(collection: Optional[str] = None):
+    """Get Domain Type Registry statistics.
+    
+    Shows how many domain types are indexed and their construction patterns.
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not orchestrator.domain_registry:
+        return {"error": "Domain registry not available"}
+    
+    stats = orchestrator.domain_registry.get_stats(collection)
+    return {
+        "total_types": stats.total_types,
+        "by_pattern": stats.by_pattern,
+        "by_java_type": stats.by_java_type,
+        "build_time_ms": round(stats.build_time_ms, 1),
+        "cached": orchestrator.domain_registry.is_cached(collection),
+    }
+
+
+@app.post("/v1/registry/rebuild")
+async def rebuild_registry(collection: Optional[str] = None):
+    """Rebuild the Domain Type Registry.
+    
+    Call this after reindexing to ensure the registry is up-to-date.
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    result = await run_in_executor(
+        orchestrator.rebuild_domain_registry, collection
+    )
+    return result
+
+
+@app.get("/v1/registry/lookup/{class_name}")
+async def registry_lookup(class_name: str, collection: Optional[str] = None):
+    """Look up construction info for a domain type.
+    
+    Returns the pre-computed construction pattern and example code.
+    
+    Example: GET /v1/registry/lookup/OrderRequest?collection=my_project
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    result = await run_in_executor(
+        orchestrator.get_domain_type_info, class_name, collection
+    )
+    return result
+
+
+@app.get("/v1/registry/prompt-section")
+async def registry_prompt_section(
+    class_names: str,
+    collection: Optional[str] = None,
+):
+    """Generate a prompt section with construction examples for multiple types.
+    
+    Args:
+        class_names: Comma-separated list of class names.
+        collection: Optional Qdrant collection.
+    
+    Example: GET /v1/registry/prompt-section?class_names=OrderRequest,User,Order
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not orchestrator.domain_registry:
+        return {"error": "Domain registry not available"}
+    
+    names = [n.strip() for n in class_names.split(",") if n.strip()]
+    
+    prompt_section = await run_in_executor(
+        orchestrator.domain_registry.get_prompt_section, names, collection
+    )
+    
+    return {
+        "class_names": names,
+        "prompt_section": prompt_section,
+    }
+
+
+@app.post("/pipeline/generate-two-phase", response_model=PipelineGenerateResponse)
+async def pipeline_generate_two_phase(request: PipelineGenerateRequest):
+    """Generate unit tests using Two-Phase Strategy (explicit).
+    
+    This endpoint always uses the two-phase strategy regardless of complexity.
+    Use this when you know the service is complex and want better accuracy.
+    
+    Two-Phase Strategy:
+    1. Phase 1 (Analysis): LLM analyzes the service and outputs a JSON plan
+    2. Phase 2 (Generation): For each method, generate focused tests with
+       exact construction patterns from the Domain Registry
+    
+    Example::
+    
+        POST /pipeline/generate-two-phase
+        {
+            "file_path": "src/main/java/com/example/ComplexService.java",
+            "source_code": "package com.example; ...",
+            "collection": "my_project"
+        }
+    """
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    if not orchestrator.is_two_phase_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="Two-Phase Strategy is not enabled. Check server configuration."
+        )
+    
+    # Force two-phase
+    request.force_two_phase = True
+    request.force_single_pass = False
+    
+    # Delegate to the standard pipeline endpoint
+    return await pipeline_generate(request)
+
+
+# ============================================================================
+# LangGraph endpoints (human review + run status)
+# ============================================================================
+
+
+class ReviewRequest(BaseModel):
+    """Request to approve/reject a generated test."""
+    approved: bool
+    feedback: str = ""
+
+
+class RunStatusResponse(BaseModel):
+    """Run status for polling."""
+    run_id: str
+    status: str  # "running" | "interrupted" | "completed" | "failed"
+    class_name: str = ""
+    validation_passed: Optional[bool] = None
+    test_code: Optional[str] = None
+    validation_issues: list[str] = Field(default_factory=list)
+
+
+def _get_orchestrator():
+    """Get the active orchestrator (graph or legacy)."""
+    if graph_orchestrator and not USE_LEGACY:
+        return graph_orchestrator
+    return orchestrator
+
+
+@app.post("/review/{run_id}")
+async def submit_review(run_id: str, request: ReviewRequest):
+    """Resume a paused graph after human review.
+
+    Only available when using LangGraph backend.
+    """
+    if not graph_orchestrator:
+        raise HTTPException(
+            status_code=400,
+            detail="Human review requires LangGraph backend. Set USE_LEGACY_ORCHESTRATOR=false.",
+        )
+
+    def _do_review():
+        return graph_orchestrator.submit_review(
+            run_id=run_id,
+            approved=request.approved,
+            feedback=request.feedback,
+        )
+
+    result = await run_in_executor(_do_review)
+    return {
+        "success": result.success,
+        "test_code": result.test_code,
+        "class_name": result.class_name,
+        "validation_passed": result.validation_passed,
+        "run_id": run_id,
+    }
+
+
+@app.get("/runs/{run_id}", response_model=RunStatusResponse)
+async def get_run_status(run_id: str):
+    """Get the status of a graph run (for polling)."""
+    if not graph_orchestrator:
+        raise HTTPException(
+            status_code=400,
+            detail="Run tracking requires LangGraph backend.",
+        )
+
+    state = graph_orchestrator.get_run_state(run_id)
+    if not state:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # Determine status
+    human_approved = state.get("human_approved")
+    final_code = state.get("final_test_code")
+    error = state.get("error")
+
+    if error:
+        status = "failed"
+    elif final_code:
+        status = "completed"
+    elif human_approved is None and state.get("require_human_review"):
+        status = "interrupted"
+    else:
+        status = "running"
+
+    return RunStatusResponse(
+        run_id=run_id,
+        status=status,
+        class_name=state.get("class_name", ""),
+        validation_passed=state.get("validation_passed"),
+        test_code=final_code,
+        validation_issues=state.get("validation_issues", []),
+    )
 
 
 if __name__ == "__main__":
