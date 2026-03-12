@@ -12,6 +12,71 @@ orchestrator:
   
   # Enable memory persistence
   enable_memory: true
+  
+  # Maximum repair attempts for validation failures
+  max_repair_attempts: 2
+
+# ═══════════════════════════════════════════════════════════════════════
+# Two-Phase Generation Strategy Configuration
+# ═══════════════════════════════════════════════════════════════════════
+two_phase:
+  # Enable two-phase generation strategy
+  enabled: true
+  
+  # Complexity threshold for auto-routing to two-phase
+  # Services with complexity score >= threshold use two-phase
+  # Complexity = (dependencies × 2) + (used_types × 3) + method_count
+  complexity_threshold: 10
+  
+  # Phase 1 (Analysis) settings
+  analysis:
+    # Temperature for analysis LLM call (lower = more deterministic)
+    temperature: 0.1
+    # Max tokens for analysis output
+    max_tokens: 2000
+    # Timeout in seconds
+    timeout: 60
+  
+  # Phase 2 (Generation) settings
+  generation:
+    # Temperature for code generation
+    temperature: 0.2
+    # Max tokens per method generation
+    max_tokens: 2000
+    # Number of methods to generate per LLM call (1 = most focused)
+    methods_per_batch: 1
+    # Enable parallel method generation (experimental)
+    parallel_generation: false
+  
+  # Repair settings for two-phase
+  repair:
+    # Max repair attempts
+    max_attempts: 2
+  
+  # Fallback behavior
+  fallback:
+    # Fall back to single-pass if two-phase fails
+    to_single_pass: true
+
+# ═══════════════════════════════════════════════════════════════════════
+# Domain Type Registry Configuration
+# ═══════════════════════════════════════════════════════════════════════
+domain_registry:
+  # Enable domain type registry
+  enabled: true
+  
+  # Default Qdrant collection for registry
+  default_collection: "java_codebase"
+  
+  # Auto-rebuild registry on index update
+  auto_rebuild_on_index: true
+  
+  # Cache settings
+  cache:
+    # Enable in-memory caching
+    enabled: true
+    # TTL for cached registry (seconds, 0 = no expiry)
+    ttl: 0
 
 prompt:
   # System prompt template
