@@ -117,3 +117,19 @@ rules:
     - constructor
     - field_injection
 
+# ═══════════════════════════════════════════════════════════════════════
+# LangGraph Orchestration Configuration
+# ═══════════════════════════════════════════════════════════════════════
+langgraph:
+  # SQLite database path for persistent checkpointer
+  checkpoint_db: "checkpoints.db"
+
+  # Default human review setting (can be overridden per request)
+  require_human_review: true
+
+  # Use legacy orchestrator instead of LangGraph
+  # Set USE_LEGACY_ORCHESTRATOR=true env var to override
+  use_legacy: false
+
+  # Max repair attempts within the graph
+  max_retries: 3
