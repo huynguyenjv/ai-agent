@@ -24,13 +24,28 @@ from .rules import TestRules
 from .memory import SessionMemory, MemoryManager
 from .state_machine import AgentState, StateMachine, TransitionError
 from .validation import ValidationPipeline, ValidationResult, IssueSeverity
-from .repair import RepairStrategySelector, RepairPlan
+from .repair import RepairStrategySelector, RepairPlan, FailureMemory, RepairReasoningEngine, RepairLevel
 from .events import EventBus, Event, EventType, get_event_bus
 from .metrics import MetricsCollector
 from rag.client import RAGClient
 from rag.schema import SearchQuery, CodeChunk, MetadataFilter
 from vllm.client import VLLMClient
 from utils.cache_service import get_cache_service
+
+# Two-Phase Strategy imports
+try:
+    from .two_phase_strategy import (
+        TwoPhaseStrategy,
+        TwoPhaseConfig,
+        TwoPhaseResult,
+        ComplexityCalculator,
+    )
+    from indexer.domain_registry import DomainTypeRegistry, get_domain_registry
+    _TWO_PHASE_AVAILABLE = True
+except ImportError:
+    _TWO_PHASE_AVAILABLE = False
+    TwoPhaseStrategy = TwoPhaseConfig = TwoPhaseResult = ComplexityCalculator = None  # type: ignore
+    DomainTypeRegistry = get_domain_registry = None  # type: ignore
 
 # Phase 2: optional context builder
 try:
@@ -59,6 +74,10 @@ class GenerationRequest:
     # If provided, embedded into prompt so LLM sees full source instead of
     # only the RAG summary.
     source_code: Optional[str] = None
+    # Two-Phase Strategy options
+    force_two_phase: bool = False       # Force two-phase even for simple services
+    force_single_pass: bool = False     # Force single-pass even for complex services
+    complexity_threshold: int = 10      # Threshold for auto-routing to two-phase
 
 
 @dataclass
@@ -76,6 +95,10 @@ class GenerationResult:
     plan_summary: Optional[dict] = None
     validation_summary: Optional[dict] = None   # Phase 3: detailed validation
     repair_attempts: int = 0                     # Phase 3: how many repairs
+    # Two-Phase Strategy metadata
+    strategy_used: str = "single_pass"          # "single_pass" or "two_phase"
+    complexity_score: int = 0                   # Calculated complexity
+    analysis_result: Optional[dict] = None      # Phase 1 analysis (two-phase only)
 
     def __post_init__(self):
         if self.validation_issues is None:
@@ -91,6 +114,11 @@ class StreamPhase(str, Enum):
     REPAIRING = "repairing"
     DONE = "done"
     ERROR = "error"
+    # Two-Phase specific phases
+    ANALYZING = "analyzing"           # Phase 1: LLM analyzing service
+    REGISTRY_LOOKUP = "registry_lookup"  # Looking up domain types
+    METHOD_GENERATING = "method_generating"  # Phase 2: Generating per method
+    ASSEMBLING = "assembling"         # Assembling final test class
 
 
 @dataclass
@@ -117,7 +145,7 @@ class AgentOrchestrator:
         vllm_client: VLLMClient,
         top_k_results: int = 10,
         max_context_tokens: int = 4000,
-        max_repair_attempts: int = 2,
+        max_repair_attempts: int = 3,
         repo_path: Optional[str] = None,
         token_budget: int = 6000,
     ):
@@ -155,10 +183,43 @@ class AgentOrchestrator:
                 except Exception as e:
                     logger.warning("Intelligence init failed, using RAG-only", error=str(e))
 
+        # Two-Phase Strategy components (optional)
+        self.two_phase_strategy: Optional[TwoPhaseStrategy] = None
+        self.domain_registry: Optional[DomainTypeRegistry] = None
+        self.complexity_calculator: Optional[ComplexityCalculator] = None
+        self._two_phase_enabled = False
+        
+        if _TWO_PHASE_AVAILABLE:
+            try:
+                # Initialize Domain Registry
+                self.domain_registry = get_domain_registry(
+                    qdrant_client=rag_client.qdrant,
+                    default_collection="java_codebase",
+                )
+                
+                # Initialize Two-Phase Strategy
+                self.two_phase_strategy = TwoPhaseStrategy(
+                    vllm_client=vllm_client,
+                    domain_registry=self.domain_registry,
+                    prompt_builder=self.prompt_builder,
+                    test_rules=self.test_rules,
+                    rag_client=rag_client,
+                    config=TwoPhaseConfig(),
+                )
+                
+                # Initialize Complexity Calculator
+                self.complexity_calculator = ComplexityCalculator()
+                
+                self._two_phase_enabled = True
+                logger.info("Two-Phase Strategy initialized successfully")
+            except Exception as e:
+                logger.warning("Two-Phase Strategy init failed, using single-pass only", error=str(e))
+
         logger.info(
             "Agent orchestrator initialized (Phase 1-4: SM + Planner + Context + Validation + Events)",
             intelligence=self.context_builder.intelligence_ready if self.context_builder else False,
             cache_backend=self.cache.backend_name,
+            two_phase_enabled=self._two_phase_enabled,
         )
 
     # =====================================================================
@@ -172,7 +233,135 @@ class AgentOrchestrator:
           IDLE → PLANNING → RETRIEVING → GENERATING → VALIDATING → COMPLETED
                                                           ↓
                                                       REPAIRING → GENERATING → …
+        
+        For complex services (when two-phase is enabled):
+          IDLE → PLANNING → RETRIEVING → ANALYZING → GENERATING → VALIDATING → COMPLETED
         """
+        # ── Check if Two-Phase should be used ────────────────────────
+        use_two_phase = self._should_use_two_phase(request)
+        
+        logger.info(
+            "Strategy selection",
+            strategy="two_phase" if use_two_phase else "single_pass",
+            force_two_phase=request.force_two_phase,
+            force_single_pass=request.force_single_pass,
+            two_phase_enabled=self._two_phase_enabled,
+            file_path=request.file_path,
+        )
+        
+        if use_two_phase:
+            return self._generate_test_two_phase(request)
+        
+        # ── Single-pass generation (original flow) ───────────────────
+        return self._generate_test_single_pass(request)
+    
+    def _should_use_two_phase(self, request: GenerationRequest) -> bool:
+        """Determine if two-phase strategy should be used."""
+        # Explicit overrides
+        if request.force_single_pass:
+            logger.debug("Two-phase disabled: force_single_pass=True")
+            return False
+        if request.force_two_phase and self._two_phase_enabled:
+            logger.debug("Two-phase enabled: force_two_phase=True")
+            return True
+        
+        # Two-phase not available
+        if not self._two_phase_enabled:
+            logger.debug("Two-phase disabled: feature not available")
+            return False
+        
+        # Skip for incremental updates (existing test code)
+        if request.existing_test_code:
+            logger.debug("Two-phase disabled: incremental update mode")
+            return False
+        
+        # For simple cases (no explicit force), use single-pass
+        # Two-phase only when explicitly requested via force_two_phase=True
+        # This keeps the default behavior unchanged
+        logger.debug("Two-phase disabled: default to single-pass (use force_two_phase=True to enable)")
+        return False
+    
+    def _generate_test_two_phase(self, request: GenerationRequest) -> GenerationResult:
+        """Generate tests using Two-Phase Strategy."""
+        logger.info(
+            "Using Two-Phase Strategy",
+            class_name=request.class_name,
+            file_path=request.file_path,
+        )
+        
+        try:
+            # Get RAG context first
+            class_name = request.class_name or self._extract_class_name(request.file_path)
+            if not class_name:
+                return GenerationResult(
+                    success=False,
+                    error="Could not determine class name from file path",
+                    strategy_used="two_phase",
+                )
+            
+            # Get source code — must be provided explicitly (from pipeline or request)
+            # CodeChunk.summary is a compressed summary, NOT full source code.
+            source_code = request.source_code
+            if not source_code:
+                # Try to get summary as fallback context
+                main_result = self.rag.search_by_class(
+                    class_name=class_name,
+                    top_k=1,
+                    include_dependencies=False,
+                    collection_name=request.collection_name,
+                )
+                if main_result.chunks:
+                    source_code = main_result.chunks[0].summary
+            
+            if not source_code:
+                logger.warning("No source code available, falling back to single-pass")
+                return self._generate_test_single_pass(request)
+            
+            # Get RAG chunks for context
+            rag_chunks = self._get_rag_context(
+                class_name=class_name,
+                file_path=request.file_path,
+                session=None,
+                collection_name=request.collection_name,
+            )
+            
+            # Build registry if not cached
+            if self.domain_registry:
+                self.domain_registry.build_from_collection(
+                    collection_name=request.collection_name,
+                )
+            
+            # Execute two-phase generation
+            result = self.two_phase_strategy.generate(
+                source_code=source_code,
+                class_name=class_name,
+                file_path=request.file_path,
+                rag_chunks=rag_chunks,
+                collection_name=request.collection_name,
+            )
+            
+            # Convert TwoPhaseResult to GenerationResult
+            return GenerationResult(
+                success=result.success,
+                test_code=result.test_code,
+                class_name=class_name,
+                validation_passed=result.validation_passed,
+                validation_issues=result.validation_issues,
+                error=result.error,
+                rag_chunks_used=len(rag_chunks),
+                tokens_used=result.total_tokens_used,
+                strategy_used="two_phase",
+                complexity_score=result.analysis_result.complexity_score if result.analysis_result else 0,
+                analysis_result=result.analysis_result.to_dict() if result.analysis_result else None,
+                repair_attempts=result.repair_attempts,
+            )
+            
+        except Exception as e:
+            logger.error("Two-phase generation failed, falling back to single-pass", error=str(e))
+            return self._generate_test_single_pass(request)
+    
+    def _generate_test_single_pass(self, request: GenerationRequest) -> GenerationResult:
+        """Generate tests using single-pass strategy (original flow)."""
         sm = StateMachine()
 
         try:
@@ -247,16 +436,19 @@ class AgentOrchestrator:
                 plan_id=plan.plan_id,
                 session_id=request.session_id,
             ))
+            
+            # Add strategy metadata
+            result.strategy_used = "single_pass"
             return result
 
         except TransitionError as e:
             logger.error("State transition error", error=str(e))
-            return GenerationResult(success=False, error=str(e))
+            return GenerationResult(success=False, error=str(e), strategy_used="single_pass")
         except Exception as e:
             logger.error("Test generation failed", error=str(e))
             if not sm.is_terminal:
                 sm.fail(error=str(e))
-            return GenerationResult(success=False, error=str(e))
+            return GenerationResult(success=False, error=str(e), strategy_used="single_pass")
 
     # =====================================================================
     # Streaming API  (progress phases + token-by-token code gen)
@@ -268,6 +460,8 @@ class AgentOrchestrator:
         """Generate unit tests with real-time streaming.
 
         Yields ``StreamEvent`` objects for each phase:
+        
+        Single-Pass:
           PLANNING    → "Planning test generation…"
           RETRIEVING  → "Searching codebase context…" + chunk count
           GENERATING  → token-by-token code deltas from vLLM
@@ -275,6 +469,16 @@ class AgentOrchestrator:
           REPAIRING   → (if needed) "Repairing code…" + re-generate stream
           DONE        → final metadata (validation summary, tokens)
           ERROR       → error message
+        
+        Two-Phase (when force_two_phase=True):
+          PLANNING    → "Planning two-phase generation…"
+          RETRIEVING  → "Searching codebase context…"
+          ANALYZING   → Phase 1: LLM analyzing service structure
+          REGISTRY_LOOKUP → Enriching context (registry + exceptions)
+          GENERATING  → Phase 2: Generating complete test class (streamed)
+          VALIDATING  → Validating generated code
+          REPAIRING   → (if needed)
+          DONE        → final metadata
 
         Usage in API layer::
 
@@ -284,6 +488,25 @@ class AgentOrchestrator:
                 else:
                     send_sse_status(event)   # phase update
         """
+        # ── Route to appropriate strategy ────────────────────────────
+        use_two_phase = self._should_use_two_phase(request)
+        
+        logger.info(
+            "Streaming strategy selection",
+            strategy="two_phase" if use_two_phase else "single_pass",
+            force_two_phase=request.force_two_phase,
+            file_path=request.file_path,
+        )
+        
+        if use_two_phase:
+            yield from self._generate_test_streaming_two_phase(request)
+        else:
+            yield from self._generate_test_streaming_single_pass(request)
+    
+    def _generate_test_streaming_single_pass(
+        self, request: GenerationRequest
+    ) -> Generator[StreamEvent, None, None]:
+        """Single-pass streaming generation (original flow)."""
         try:
             # ── PLANNING ─────────────────────────────────────────────
             yield StreamEvent(
@@ -421,25 +644,65 @@ class AgentOrchestrator:
                     metadata={"passed": False, **validation_result.get_summary()},
                 )
 
-                # ── REPAIRING ────────────────────────────────────────
-                for attempt in range(1, self.max_repair_attempts + 1):
-                    yield StreamEvent(
-                        phase=StreamPhase.REPAIRING,
-                        content=f"\n\n🔧 Repair attempt {attempt}/{self.max_repair_attempts}…",
-                        metadata={"attempt": attempt},
+                # ── REPAIRING (escalating + failure memory) ──────────
+                sp_max_repair = 3
+                sp_memory = FailureMemory()
+                sp_reasoning_engine = RepairReasoningEngine()
+
+                for attempt in range(1, sp_max_repair + 1):
+                    sp_issues_before = validation_result.error_messages
+
+                    # Determine escalation level
+                    sp_level = self.repair_selector.determine_level(
+                        attempt_number=attempt,
+                        max_attempts=sp_max_repair,
+                        memory=sp_memory,
                     )
 
-                    # Build repair prompt
+                    yield StreamEvent(
+                        phase=StreamPhase.REPAIRING,
+                        content=(
+                            f"\n\n🔧 Repair attempt {attempt}/{sp_max_repair} "
+                            f"(Level: {sp_level.value})…"
+                        ),
+                        metadata={"attempt": attempt, "level": sp_level.value},
+                    )
+
+                    # Level 2: Run reasoning engine
+                    sp_reasoning = None
+                    if sp_level == RepairLevel.REASONING:
+                        yield StreamEvent(
+                            phase=StreamPhase.REPAIRING,
+                            content="\n🧠 Analyzing root cause…\n",
+                        )
+                        sys_p, usr_p = sp_reasoning_engine.build_reasoning_prompt(
+                            test_code=extracted_code,
+                            validation_issues=validation_result.error_messages,
+                            memory=sp_memory,
+                        )
+                        reasoning_resp = self.vllm.generate(
+                            system_prompt=sys_p,
+                            user_prompt=usr_p,
+                            temperature=0.1,
+                            max_tokens=1500,
+                        )
+                        if reasoning_resp.success:
+                            sp_reasoning = sp_reasoning_engine.parse_reasoning(reasoning_resp.content)
+
+                    # Build repair plan (with memory + reasoning)
                     repair_plan = self.repair_selector.build_repair_plan(
                         validation_result=validation_result,
                         attempt_number=attempt,
-                        max_attempts=self.max_repair_attempts,
+                        max_attempts=sp_max_repair,
+                        memory=sp_memory,
+                        reasoning=sp_reasoning,
                     )
                     repair_section = repair_plan.get_repair_prompt_section()
                     feedback = (
                         f"{repair_section}\n\n"
-                        f"Auto-repair attempt {attempt}: fix the following validation issues: "
-                        f"{', '.join(validation_result.error_messages)}"
+                        f"Repair attempt {attempt}/{sp_max_repair} (Level: {sp_level.value}). "
+                        f"Fix these issues:\n"
+                        + "\n".join(f"- {msg}" for msg in validation_result.error_messages)
                     )
 
                     repair_system = self.prompt_builder.build_system_prompt()
@@ -453,7 +716,7 @@ class AgentOrchestrator:
                     # Stream repair generation
                     yield StreamEvent(
                         phase=StreamPhase.GENERATING,
-                        content=f"\n\n⚡ Re-generating (repair {attempt})…\n\n",
+                        content=f"\n\n⚡ Re-generating (repair {attempt}, {sp_level.value})…\n\n",
                     )
 
                     repair_parts: list[str] = []
@@ -480,10 +743,20 @@ class AgentOrchestrator:
                         extracted_code, rag_chunks=rag_chunks,
                     )
 
+                    # Record attempt in failure memory
+                    sp_record = sp_memory.record_attempt(
+                        attempt_number=attempt,
+                        strategy=sp_level.value,
+                        instructions_used=[i.description for i in repair_plan.instructions],
+                        issues_before=sp_issues_before,
+                        issues_after=validation_result.error_messages,
+                        reasoning=sp_reasoning.get("overall_strategy") if sp_reasoning else None,
+                    )
+
                     if validation_result.passed:
                         yield StreamEvent(
                             phase=StreamPhase.VALIDATING,
-                            content=f"✅ Validation passed after repair {attempt}",
+                            content=f"✅ Validation passed after repair {attempt} ({sp_level.value})",
                             metadata={"passed": True, **validation_result.get_summary()},
                         )
                         break
@@ -492,7 +765,8 @@ class AgentOrchestrator:
                             phase=StreamPhase.VALIDATING,
                             content=(
                                 f"⚠️ Still {len(validation_result.errors)} errors "
-                                f"after repair {attempt}"
+                                f"(fixed {len(sp_record.issues_fixed)}, "
+                                f"new {len(sp_record.issues_introduced)})"
                             ),
                             metadata={"passed": False, **validation_result.get_summary()},
                         )
@@ -524,6 +798,7 @@ class AgentOrchestrator:
                     "validation_issues": validation_result.error_messages,
                     "tokens_used": tokens_used,
                     "rag_chunks_used": len(rag_chunks),
+                    "strategy": "single_pass",
                 },
             )
 
@@ -533,6 +808,384 @@ class AgentOrchestrator:
                 phase=StreamPhase.ERROR,
                 content=f"Error: {e}",
             )
+
+    def _generate_test_streaming_two_phase(
+        self, request: GenerationRequest
+    ) -> Generator[StreamEvent, None, None]:
+        """Two-Phase streaming generation.
+
+        Delegates core logic to TwoPhaseStrategy (analyze, enrich, prompt-build).
+        This method only handles streaming orchestration + event emission.
+
+        Flow:
+          1. Retrieve RAG context (same as single-pass)
+          2. Phase 1: Analyze via TwoPhaseStrategy.analyze()
+          3. Enrich context via TwoPhaseStrategy.search_missing_context()
+          4. Phase 2: Generate COMPLETE test class (streamed) using enhanced prompt
+          5. Validate + Repair (same mechanism as single-pass)
+        """
+        try:
+            # ── PLANNING ─────────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.PLANNING,
+                content=f"📋 Planning **Two-Phase** generation for `{request.file_path}`…\n",
+            )
+            yield StreamEvent(
+                phase=StreamPhase.PLANNING,
+                content="🔄 Strategy: Two-Phase (Analyze → Enhanced Generation)\n",
+            )
+
+            class_name = request.class_name or self._extract_class_name(request.file_path)
+            if not class_name:
+                yield StreamEvent(phase=StreamPhase.ERROR, content="Could not determine class name")
+                return
+
+            # ── RETRIEVING ───────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.RETRIEVING,
+                content=f"🔍 Searching codebase context for `{class_name}`…",
+            )
+
+            rag_chunks: list[CodeChunk] = []
+            source_code = request.source_code
+
+            if self.context_builder:
+                try:
+                    context_result = self.context_builder.build_context(
+                        class_name=class_name,
+                        file_path=request.file_path,
+                        session=None,
+                        top_k=self.top_k,
+                        collection_name=request.collection_name,
+                    )
+                    rag_chunks = context_result.rag_chunks
+                except Exception as e:
+                    logger.warning("ContextBuilder failed", error=str(e))
+                    rag_chunks = self._get_rag_context(
+                        class_name=class_name, file_path=request.file_path,
+                        session=None, collection_name=request.collection_name,
+                    )
+            else:
+                rag_chunks = self._get_rag_context(
+                    class_name=class_name, file_path=request.file_path,
+                    session=None, collection_name=request.collection_name,
+                )
+
+            # Get source code if not provided
+            if not source_code and rag_chunks:
+                main_chunk = next((c for c in rag_chunks if c.class_name == class_name), None)
+                if main_chunk:
+                    source_code = getattr(main_chunk, 'source_code', None) or main_chunk.summary
+
+            if not source_code:
+                yield StreamEvent(
+                    phase=StreamPhase.ERROR,
+                    content="No source code available. Please provide source_code in request.",
+                )
+                return
+
+            yield StreamEvent(
+                phase=StreamPhase.RETRIEVING,
+                content=f"✅ Found {len(rag_chunks)} context chunks\n",
+                metadata={"chunks_count": len(rag_chunks)},
+            )
+
+            # ── PHASE 1: ANALYZING ───────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.ANALYZING,
+                content="\n🔬 **Phase 1: Analyzing service structure…**\n",
+            )
+
+            analysis_result = self.two_phase_strategy.analyze(
+                source_code=source_code,
+                class_name=class_name,
+                file_path=request.file_path,
+            )
+
+            if not analysis_result:
+                yield StreamEvent(
+                    phase=StreamPhase.ERROR,
+                    content="Analysis failed. Falling back to single-pass.\n",
+                )
+                yield from self._generate_test_streaming_single_pass(request)
+                return
+
+            yield StreamEvent(
+                phase=StreamPhase.ANALYZING,
+                content=(
+                    f"✅ Analysis complete: {len(analysis_result.methods)} methods, "
+                    f"{len(analysis_result.all_domain_types)} domain types, "
+                    f"complexity={analysis_result.complexity_level}\n"
+                ),
+                metadata={
+                    "methods": len(analysis_result.methods),
+                    "domain_types": analysis_result.all_domain_types,
+                    "complexity": analysis_result.complexity_level,
+                },
+            )
+
+            # ── ENRICHING CONTEXT ────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.REGISTRY_LOOKUP,
+                content="\n📚 Enriching context (registry + exceptions + domain types)…\n",
+            )
+
+            extra_chunks = self.two_phase_strategy.search_missing_context(
+                analysis_result=analysis_result,
+                rag_chunks=rag_chunks,
+                source_code=source_code,
+                collection_name=request.collection_name,
+            )
+            if extra_chunks:
+                rag_chunks = rag_chunks + extra_chunks
+
+            yield StreamEvent(
+                phase=StreamPhase.REGISTRY_LOOKUP,
+                content=f"✅ Context enriched ({len(extra_chunks)} extra chunks found)\n",
+            )
+
+            # ── PHASE 2: GENERATE COMPLETE TEST CLASS (streamed) ─────
+            yield StreamEvent(
+                phase=StreamPhase.GENERATING,
+                content="\n⚡ **Phase 2: Generating complete test class…**\n\n",
+            )
+
+            system_prompt, user_prompt = self.two_phase_strategy.build_generation_prompt(
+                analysis_result=analysis_result,
+                class_name=class_name,
+                file_path=request.file_path,
+                rag_chunks=rag_chunks,
+                source_code=source_code,
+                collection_name=request.collection_name,
+            )
+
+            # Debug log
+            self._log_llm_input(
+                system_prompt, user_prompt,
+                source="two_phase_streaming_phase2",
+                class_name=class_name,
+            )
+
+            code_parts: list[str] = []
+            for delta_token in self.vllm.stream_generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            ):
+                code_parts.append(delta_token)
+                yield StreamEvent(
+                    phase=StreamPhase.GENERATING,
+                    content=delta_token,
+                    delta=True,
+                )
+
+            full_response = "".join(code_parts)
+            extracted_code = self._extract_code(full_response)
+            tokens_used = count_tokens(full_response)
+
+            # ── SELF-REVIEW ─────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.VALIDATING,
+                content="\n\n🔍 **Self-Review: LLM checking its own output…**\n",
+            )
+
+            reviewed_code, review_issues = self.two_phase_strategy.self_review(
+                test_code=extracted_code,
+                source_code=source_code,
+                class_name=class_name,
+                rag_chunks=rag_chunks,
+            )
+
+            if review_issues:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content=(
+                        f"📝 Self-review found {len(review_issues)} issue(s): "
+                        f"{'; '.join(review_issues[:3])}\n"
+                    ),
+                    metadata={"self_review_issues": len(review_issues)},
+                )
+                extracted_code = reviewed_code
+            else:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content="✅ Self-review: no issues found\n",
+                )
+
+            # ── VALIDATING ───────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.VALIDATING,
+                content="\n🔎 Validating generated code…",
+            )
+
+            validation_result = self.validator.validate(extracted_code, rag_chunks=rag_chunks)
+
+            if validation_result.passed:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content=f"✅ Validation passed ({validation_result.test_count} test(s), 0 errors)",
+                    metadata={"passed": True, **validation_result.get_summary()},
+                )
+            else:
+                yield StreamEvent(
+                    phase=StreamPhase.VALIDATING,
+                    content=(
+                        f"⚠️ Validation: {len(validation_result.errors)} errors, "
+                        f"{len(validation_result.warnings)} warnings"
+                    ),
+                    metadata={"passed": False, **validation_result.get_summary()},
+                )
+
+                # ── ITERATIVE REPAIR (escalating + failure memory) ───
+                max_repair = 3  # 3 levels: targeted→reasoning→regenerate
+                memory = FailureMemory()
+                reasoning_engine = RepairReasoningEngine()
+
+                for attempt in range(1, max_repair + 1):
+                    issues_before = validation_result.error_messages
+
+                    # Determine escalation level
+                    level = self.repair_selector.determine_level(
+                        attempt_number=attempt,
+                        max_attempts=max_repair,
+                        memory=memory,
+                    )
+
+                    yield StreamEvent(
+                        phase=StreamPhase.REPAIRING,
+                        content=(
+                            f"\n\n🔧 Repair attempt {attempt}/{max_repair} "
+                            f"(Level: {level.value})…"
+                        ),
+                        metadata={"attempt": attempt, "level": level.value},
+                    )
+
+                    # Level 2+: Run reasoning engine
+                    reasoning = None
+                    if level == RepairLevel.REASONING:
+                        yield StreamEvent(
+                            phase=StreamPhase.REPAIRING,
+                            content="\n🧠 Analyzing root cause of failures…\n",
+                        )
+                        sys_p, usr_p = reasoning_engine.build_reasoning_prompt(
+                            test_code=extracted_code,
+                            validation_issues=validation_result.error_messages,
+                            memory=memory,
+                        )
+                        reasoning_resp = self.vllm.generate(
+                            system_prompt=sys_p,
+                            user_prompt=usr_p,
+                            temperature=0.1,
+                            max_tokens=1500,
+                        )
+                        if reasoning_resp.success:
+                            reasoning = reasoning_engine.parse_reasoning(reasoning_resp.content)
+                            if reasoning:
+                                strategy_msg = reasoning.get("overall_strategy", "")[:150]
+                                yield StreamEvent(
+                                    phase=StreamPhase.REPAIRING,
+                                    content=f"💡 Root cause: {strategy_msg}\n",
+                                )
+
+                    # Build repair plan (with memory + reasoning)
+                    repair_plan = self.repair_selector.build_repair_plan(
+                        validation_result=validation_result,
+                        attempt_number=attempt,
+                        max_attempts=max_repair,
+                        memory=memory,
+                        reasoning=reasoning,
+                    )
+                    repair_section = repair_plan.get_repair_prompt_section()
+                    feedback = (
+                        f"{repair_section}\n\n"
+                        f"Repair attempt {attempt}/{max_repair} (Level: {level.value}). "
+                        f"Fix these issues:\n"
+                        + "\n".join(f"- {msg}" for msg in validation_result.error_messages)
+                    )
+
+                    repair_system = self.prompt_builder.build_system_prompt()
+                    repair_user = self.prompt_builder.build_refinement_prompt(
+                        original_code=extracted_code,
+                        feedback=feedback,
+                        validation_issues=validation_result.error_messages,
+                        rag_chunks=rag_chunks,
+                    )
+
+                    yield StreamEvent(
+                        phase=StreamPhase.GENERATING,
+                        content=f"\n\n⚡ Re-generating (repair {attempt}, {level.value})…\n\n",
+                    )
+
+                    repair_parts: list[str] = []
+                    for delta_token in self.vllm.stream_generate(
+                        system_prompt=repair_system,
+                        user_prompt=repair_user,
+                    ):
+                        repair_parts.append(delta_token)
+                        yield StreamEvent(
+                            phase=StreamPhase.GENERATING,
+                            content=delta_token,
+                            delta=True,
+                        )
+
+                    full_response = "".join(repair_parts)
+                    extracted_code = self._extract_code(full_response)
+
+                    yield StreamEvent(
+                        phase=StreamPhase.VALIDATING,
+                        content="\n\n🔎 Re-validating…",
+                    )
+                    validation_result = self.validator.validate(extracted_code, rag_chunks=rag_chunks)
+
+                    # Record attempt in failure memory
+                    record = memory.record_attempt(
+                        attempt_number=attempt,
+                        strategy=level.value,
+                        instructions_used=[inst.description for inst in repair_plan.instructions],
+                        issues_before=issues_before,
+                        issues_after=validation_result.error_messages,
+                        reasoning=reasoning.get("overall_strategy") if reasoning else None,
+                    )
+
+                    if validation_result.passed:
+                        yield StreamEvent(
+                            phase=StreamPhase.VALIDATING,
+                            content=f"✅ Validation passed after repair {attempt} ({level.value})",
+                            metadata={"passed": True, **validation_result.get_summary()},
+                        )
+                        break
+                    else:
+                        yield StreamEvent(
+                            phase=StreamPhase.VALIDATING,
+                            content=(
+                                f"⚠️ Still {len(validation_result.errors)} errors "
+                                f"(fixed {len(record.issues_fixed)}, "
+                                f"new {len(record.issues_introduced)})"
+                            ),
+                            metadata={"passed": False, **validation_result.get_summary()},
+                        )
+
+            # ── DONE ─────────────────────────────────────────────────
+            yield StreamEvent(
+                phase=StreamPhase.DONE,
+                content="",
+                metadata={
+                    "success": True,
+                    "class_name": class_name,
+                    "validation_passed": validation_result.passed,
+                    "validation_issues": validation_result.error_messages,
+                    "tokens_used": tokens_used,
+                    "rag_chunks_used": len(rag_chunks),
+                    "strategy": "two_phase",
+                    "complexity_score": analysis_result.complexity_score,
+                    "methods_analyzed": len(analysis_result.methods),
+                    "domain_types": analysis_result.all_domain_types,
+                    "self_review_issues": len(review_issues),
+                },
+            )
+
+        except Exception as e:
+            logger.error("Two-phase streaming generation failed", error=str(e))
+            yield StreamEvent(phase=StreamPhase.ERROR, content=f"Error: {e}")
 
     def refine_test(
         self,
@@ -987,6 +1640,8 @@ class AgentOrchestrator:
         # Phase 3: use ValidationPipeline for severity-aware validation
         # Pass RAG chunks for construction pattern cross-check (Pass 7)
         rag_chunks = ctx.get("rag_chunks")
+        prev_issues = ctx.get("validation_issues", [])  # Before this validation
+
         validation_result = self.validator.validate(
             ctx.get("extracted_code", ""),
             rag_chunks=rag_chunks,
@@ -994,6 +1649,19 @@ class AgentOrchestrator:
         ctx["validation_result"] = validation_result
         ctx["validation_passed"] = validation_result.passed
         ctx["validation_issues"] = validation_result.error_messages
+
+        # Record in failure memory (if repair is in progress)
+        memory: Optional[FailureMemory] = ctx.get("repair_memory")
+        repair_plan: Optional[RepairPlan] = ctx.get("repair_plan")
+        if memory and repair_plan and prev_issues:
+            memory.record_attempt(
+                attempt_number=repair_plan.attempt_number,
+                strategy=repair_plan.level.value if hasattr(repair_plan, 'level') else repair_plan.strategy,
+                instructions_used=[i.description for i in repair_plan.instructions],
+                issues_before=prev_issues,
+                issues_after=validation_result.error_messages,
+            )
+            ctx.pop("repair_plan", None)  # Consume after recording
 
         logger.info(
             "Validation result",
@@ -1044,19 +1712,55 @@ class AgentOrchestrator:
     def _step_repair_code(
         self, sm: StateMachine, plan: ExecutionPlan, step: PlanStep, ctx: dict
     ) -> None:
-        """Phase 3: Build a targeted repair prompt using RepairStrategySelector."""
+        """Phase 3: Build a targeted repair prompt using RepairStrategySelector.
+
+        Uses FailureMemory to track what was tried and avoid repeating.
+        Uses RepairReasoningEngine on Level 2+ for root-cause analysis.
+        """
         issues = step.params.get("validation_issues", [])
         generated_code = step.params.get("generated_code", ctx.get("extracted_code", ""))
         validation_result = ctx.get("validation_result")
         attempt = step.params.get("attempt", 1)
 
+        # Initialize failure memory (persists across repair attempts in ctx)
+        if "repair_memory" not in ctx:
+            ctx["repair_memory"] = FailureMemory()
+        memory: FailureMemory = ctx["repair_memory"]
+
         # Build targeted repair plan if we have structured validation
         repair_section = ""
         if validation_result and isinstance(validation_result, ValidationResult):
+            # Determine escalation level
+            level = self.repair_selector.determine_level(
+                attempt_number=attempt,
+                max_attempts=self.max_repair_attempts,
+                memory=memory,
+            )
+
+            # Level 2+: Run reasoning engine
+            reasoning = None
+            if level == RepairLevel.REASONING:
+                reasoning_engine = RepairReasoningEngine()
+                sys_p, usr_p = reasoning_engine.build_reasoning_prompt(
+                    test_code=generated_code,
+                    validation_issues=issues,
+                    memory=memory,
+                )
+                reasoning_resp = self.vllm.generate(
+                    system_prompt=sys_p,
+                    user_prompt=usr_p,
+                    temperature=0.1,
+                    max_tokens=1500,
+                )
+                if reasoning_resp.success:
+                    reasoning = reasoning_engine.parse_reasoning(reasoning_resp.content)
+
             repair_plan = self.repair_selector.build_repair_plan(
                 validation_result=validation_result,
                 attempt_number=attempt,
                 max_attempts=self.max_repair_attempts,
+                memory=memory,
+                reasoning=reasoning,
             )
             repair_section = repair_plan.get_repair_prompt_section()
             ctx["repair_plan"] = repair_plan
@@ -1065,8 +1769,10 @@ class AgentOrchestrator:
                 "Targeted repair plan built",
                 plan_id=plan.plan_id,
                 attempt=attempt,
+                level=level.value,
                 strategy=repair_plan.strategy,
                 instructions=repair_plan.instruction_count,
+                has_reasoning=reasoning is not None,
             )
 
             # Phase 4: Publish repair completed (plan built)
@@ -1074,8 +1780,9 @@ class AgentOrchestrator:
                 type=EventType.REPAIR_COMPLETED,
                 data={
                     "attempt": attempt,
+                    "level": level.value,
                     "strategy": repair_plan.strategy,
-                    "success": True,  # repair plan built, actual success determined later
+                    "success": True,
                 },
                 source="orchestrator",
                 plan_id=plan.plan_id,
@@ -1086,7 +1793,8 @@ class AgentOrchestrator:
         if repair_section:
             feedback_parts.append(repair_section)
         feedback_parts.append(
-            f"Auto-repair attempt {attempt}: fix the following validation issues: {', '.join(issues)}"
+            f"Repair attempt {attempt}/{self.max_repair_attempts}: "
+            f"fix the following validation issues: {', '.join(issues)}"
         )
 
         ctx["system_prompt"] = self.prompt_builder.build_system_prompt()
@@ -1462,6 +2170,97 @@ class AgentOrchestrator:
     def cleanup_sessions(self) -> int:
         """Clean up expired sessions."""
         return self.memory_manager.cleanup_expired()
+    
+    # ── Two-Phase Strategy helpers ───────────────────────────────────
+    
+    def get_complexity_score(
+        self,
+        class_name: str,
+        collection_name: Optional[str] = None,
+    ) -> tuple[int, str]:
+        """Calculate complexity score for a class.
+        
+        Returns:
+            (score, level) where level is "simple", "medium", or "complex"
+        """
+        if not self.complexity_calculator:
+            return 0, "unknown"
+        
+        try:
+            main_result = self.rag.search_by_class(
+                class_name=class_name,
+                top_k=1,
+                include_dependencies=False,
+                collection_name=collection_name,
+            )
+            if not main_result.chunks:
+                return 0, "unknown"
+            
+            return self.complexity_calculator.calculate_from_rag(main_result.chunks[0])
+        except Exception as e:
+            logger.warning("Complexity calculation failed", error=str(e))
+            return 0, "unknown"
+    
+    def rebuild_domain_registry(
+        self,
+        collection_name: Optional[str] = None,
+    ) -> dict:
+        """Rebuild the domain type registry.
+        
+        Returns:
+            Registry statistics.
+        """
+        if not self.domain_registry:
+            return {"error": "Domain registry not available"}
+        
+        try:
+            stats = self.domain_registry.build_from_collection(
+                collection_name=collection_name,
+                force_rebuild=True,
+            )
+            return {
+                "total_types": stats.total_types,
+                "by_pattern": stats.by_pattern,
+                "by_java_type": stats.by_java_type,
+                "build_time_ms": round(stats.build_time_ms, 1),
+            }
+        except Exception as e:
+            logger.error("Registry rebuild failed", error=str(e))
+            return {"error": str(e)}
+    
+    def get_domain_type_info(
+        self,
+        class_name: str,
+        collection_name: Optional[str] = None,
+    ) -> dict:
+        """Get construction info for a domain type.
+        
+        Returns:
+            Domain type info including construction pattern and example.
+        """
+        if not self.domain_registry:
+            return {"error": "Domain registry not available"}
+        
+        try:
+            info = self.domain_registry.lookup(class_name, collection_name)
+            return {
+                "class_name": info.class_name,
+                "java_type": info.java_type,
+                "construction_pattern": info.construction_pattern.value,
+                "example_code": info.example_code,
+                "found_in_index": info.found_in_index,
+                "reason": info.reason,
+                "fields": [{"name": f.name, "type": f.type} for f in info.fields],
+                "has_builder": info.has_builder,
+                "has_data": info.has_data,
+            }
+        except Exception as e:
+            logger.error("Domain type lookup failed", error=str(e))
+            return {"error": str(e)}
+    
+    def is_two_phase_enabled(self) -> bool:
+        """Check if two-phase strategy is available."""
+        return self._two_phase_enabled
 
 
 # ── Internal exceptions ──────────────────────────────────────────────
