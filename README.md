@@ -1,25 +1,35 @@
 # AI Agent — JUnit5 Test Generator
 
 Self-hosted AI agent that generates **JUnit5 + Mockito** unit tests for Java services.  
-Uses RAG (Qdrant) + local LLM (vLLM) to produce tests that are context-aware, compilable, and follow DDD conventions.
+Uses RAG (Qdrant) + local LLM (vLLM) and is orchestrated by **LangGraph** for modular, maintainable, and extensible workflows.
 
 ## Architecture
 
 ```
-Tabby / Continue IDE
+Continue / Tabby IDE
         │
         ▼
-┌──────────────────────────────────────────────────────┐
-│  FastAPI Server  (OpenAI-compatible /v1/chat/...)     │
-│  server/api.py                                        │
-└──────────┬───────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  FastAPI Server  (OpenAI-compatible /v1/chat/completions) │
+│  server/api.py — toggleable graph vs legacy backend       │
+└──────────┬────────────────────────────────────────────────┘
            │
            ▼
-┌──────────────────────────────────────────────────────┐
-│  Agent Orchestrator        agent/orchestrator.py      │
-│  StateMachine → Planner → Retrieve → Generate        │
-│               → Validate → Repair                     │
-└──────┬──────────────┬────────────────┬───────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  LangGraph Orchestrator (agent/graph.py)                  │
+│  Supervisor → intent routing → SubGraph                   │
+│                                                           │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  UnitTest SubGraph (agent/subgraphs/unit_test.py)   │  │
+│  │                                                     │  │
+│  │  retrieve → check_strategy                          │  │
+│  │    → [single_pass] → build_prompt                   │  │
+│  │    → [two_phase]   → analyze → build_prompt         │  │
+│  │  → call_llm → validate                              │  │
+│  │    → [pass]   → human_review → save_result → END    │  │
+│  │    → [fail]   → repair → validate (loop)            │  │
+│  └─────────────────────────────────────────────────────┘  │
+└──────┬──────────────┬────────────────┬───────────────────┘
        │              │                │
        ▼              ▼                ▼
 ┌────────────┐ ┌────────────┐  ┌──────────────┐
@@ -33,24 +43,22 @@ Tabby / Continue IDE
 │  Indexer   │
 │ (tree-sitter│
 │  → Qdrant) │
-│  indexer/  │
 └────────────┘
 ```
 
-## Features
+## Key Features
 
-- **OpenAI-compatible API** — plug into Tabby IDE or Continue IDE as a custom model provider
-- **Tree-sitter Java parsing** — extracts classes, records, enums, interfaces, Lombok annotations, fields, methods
-- **Semantic vector index** — Qdrant with sentence-transformers (`all-MiniLM-L6-v2`)
-- **DDD-aware layer detection** — auto-classifies service/repository/domain/controller layers
-- **Multi-phase pipeline** — Plan → Retrieve → Generate → Validate → Repair
-- **7-pass validation** — structural checks, anti-patterns, construction cross-checking against RAG metadata
-- **Targeted repair** — per-category repair strategies with focused LLM prompts
-- **Smart context assembly** — priority-based snippet selection + token-budget optimization
-- **Graph intelligence** — file-level dependency graph + global symbol table for smart mock detection
+- **LangGraph orchestration** — modular node-based pipeline with conditional routing, retry loops, and checkpointed state
+- **OpenAI-compatible API** — drop-in for Continue IDE and Tabby IDE
+- **Two-Phase Strategy** — auto-detects complex services (complexity ≥ threshold) and uses LLM analysis before generation
+- **7-pass validation** — structural, forbidden patterns, required annotations, AAA, quality metrics, anti-patterns, RAG cross-check
+- **3-level escalating repair** — targeted → reasoning → regenerate, with FailureMemory
+- **Human-in-the-loop review** — optional `interrupt()` for CI/CD pipelines (auto-approve for IDE clients)
+- **Streaming support** — per-node SSE streaming with phase progress
+- **Smart context assembly** — priority-based snippet selection + token optimization + domain registry
+- **Graph intelligence** — file-level dependency graph + global symbol table
 - **Session memory** — in-memory or Redis-backed conversation persistence
-- **Event bus + metrics** — decoupled observability with timing, counters, quality rates
-- **Streaming support** — token-by-token streaming to avoid vLLM KV cache blocking
+- **Event bus + metrics** — decoupled observability
 
 ## Quick Start
 
@@ -63,15 +71,12 @@ Tabby / Continue IDE
 ### 2. Setup
 
 ```bash
-# Clone & create venv
 python -m venv venv
 source venv/bin/activate        # Linux/Mac
 .\venv\Scripts\Activate.ps1     # Windows PowerShell
 
-# Install dependencies
 pip install -r requirements.txt
 
-# Configure environment
 cp env.example .env
 # Edit .env — set QDRANT_HOST, VLLM_BASE_URL, JAVA_REPO_PATH
 ```
@@ -79,20 +84,16 @@ cp env.example .env
 ### 3. Start Dependencies
 
 ```bash
-# Qdrant only (development)
-docker-compose up -d qdrant
-
-# Full stack (production)
-docker-compose up -d
+docker-compose up -d qdrant      # Development
+docker-compose up -d             # Full stack (production)
 ```
 
-### 4. Index a Java Repository
+### 4. Index & Run
 
 ```bash
-# Start the server
 python main.py
 
-# Index your Java codebase (via API)
+# Index your Java codebase
 curl -X POST http://localhost:8080/reindex \
   -H "Content-Type: application/json" \
   -d '{"repo_path": "/path/to/java/repo"}'
@@ -100,9 +101,7 @@ curl -X POST http://localhost:8080/reindex \
 
 ### 5. Connect IDE
 
-See [TABBY_SETUP.md](TABBY_SETUP.md) for detailed Tabby IDE configuration.
-
-For Continue IDE, add to `config.json`:
+**Continue IDE** — add to `config.json`:
 ```json
 {
   "models": [{
@@ -115,99 +114,163 @@ For Continue IDE, add to `config.json`:
 }
 ```
 
+**Tabby IDE** — see [TABBY_SETUP.md](TABBY_SETUP.md).
+
+## LangGraph Nodes
+
+Each node wraps a battle-tested existing module:
+
+| Node | Module | Purpose |
+|------|--------|---------|
+| `retrieve` | `rag/client.py` + `context/` | Fetch RAG context + parallel dependency resolution |
+| `check_strategy` | Complexity calc | Route single-pass vs two-phase |
+| `analyze` | `two_phase_strategy.py` | Phase 1 LLM analysis (two-phase only) |
+| `build_prompt` | `agent/prompt.py` | Construct system + user prompts |
+| `call_llm` | `vllm/client.py` | Generate code via vLLM |
+| `validate` | `agent/validation.py` | 7-pass validation pipeline |
+| `repair` | `agent/repair.py` | 3-level escalating repair |
+| `human_review` | LangGraph `interrupt()` | Optional human approval |
+| `save_result` | `agent/memory.py` | Persist result + update session |
+
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (main IDE integration) |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (IDE integration) |
 | `GET`  | `/v1/models` | List available models |
-| `POST` | `/generate-test` | Native test generation endpoint |
-| `POST` | `/refine-test` | Refine generated test with feedback |
-| `POST` | `/reindex` | Index/re-index a Java repository |
-| `GET`  | `/index/stats` | Qdrant index statistics |
-| `GET`  | `/index/lookup/{class_name}` | Diagnostic: inspect indexed class payload |
+| `POST` | `/review/{run_id}` | Submit human review (LangGraph only) |
+| `GET`  | `/runs/{run_id}` | Poll run status (LangGraph only) |
+| `POST` | `/generate-test` | Native test generation |
+| `POST` | `/refine-test` | Refine with feedback |
+| `POST` | `/reindex` | Index/re-index a Java repo |
 | `GET`  | `/health` | Health check |
 | `GET`  | `/metrics` | Prometheus-style metrics |
-| `POST` | `/session/create` | Create a new session |
-| `GET`  | `/session/{id}` | Get session state |
-| `DELETE` | `/session/{id}` | Delete session |
+
+## API Examples
+
+### Non-streaming
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ai-agent",
+    "stream": false,
+    "messages": [{
+      "role": "user",
+      "content": "Generate unit tests for UserService\n\n```src/main/java/com/example/UserService.java\npublic class UserService { }\n```"
+    }]
+  }'
+```
+
+### Streaming (SSE)
+```bash
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ai-agent",
+    "stream": true,
+    "messages": [{
+      "role": "user",
+      "content": "Generate tests for OrderService\n\n```src/main/java/com/example/OrderService.java\npublic class OrderService { }\n```"
+    }]
+  }'
+```
 
 ## Project Structure
 
 ```
 ai-agent/
-├── main.py                 # Entry point (uvicorn server)
-├── requirements.txt        # Python dependencies
-├── env.example             # Environment template
-├── Dockerfile              # Container image
-├── docker-compose.yml      # Full stack (agent + qdrant + vllm + redis)
-├── download_model.py       # Download embedding model for offline use
-├── benchmark.py            # API performance benchmark suite
-├── TABBY_SETUP.md          # Tabby IDE integration guide
+├── main.py                     # Entry point (uvicorn)
+├── requirements.txt
+├── Dockerfile / docker-compose.yml
 │
-├── agent/                  # Core orchestration (state machine, planner, prompt, validation, repair)
-├── server/                 # FastAPI HTTP layer (OpenAI-compatible API)
-├── rag/                    # Qdrant vector search client
-├── vllm/                   # LLM client (OpenAI-compatible)
-├── indexer/                # Java parsing + embedding + indexing
-├── context/                # Smart context assembly (snippet selection, token optimization)
-├── intelligence/           # Repo structural intelligence (graph, symbol map)
-├── config/                 # YAML configurations
-├── models/                 # Downloaded embedding model (gitignored)
-├── benchmark/              # Benchmark results (gitignored)
-└── tests/                  # Development test suites
+├── agent/                      # Core orchestration
+│   ├── graph.py                # LangGraph factory (supervisor + subgraphs + checkpointer)
+│   ├── graph_adapter.py        # GraphOrchestrator — drop-in for AgentOrchestrator
+│   ├── state.py                # LangGraph state schemas (AgentState, UnitTestState)
+│   ├── supervisor.py           # Regex-based intent classifier
+│   ├── nodes/                  # LangGraph node functions
+│   │   ├── retrieve.py         # RAG + ContextBuilder
+│   │   ├── check_strategy.py   # Complexity routing
+│   │   ├── analyze.py          # Two-Phase Phase 1
+│   │   ├── build_prompt.py     # Prompt construction
+│   │   ├── call_llm.py         # vLLM generation
+│   │   ├── validate.py         # 7-pass validation
+│   │   ├── repair.py           # 3-level escalating repair
+│   │   ├── human_review.py     # interrupt() for human approval
+│   │   └── save_result.py      # Session memory update
+│   ├── subgraphs/
+│   │   └── unit_test.py        # UnitTest StateGraph definition
+│   ├── orchestrator.py         # Legacy orchestrator (fallback)
+│   ├── prompt.py               # PromptBuilder
+│   ├── validation.py           # ValidationPipeline (7-pass)
+│   ├── repair.py               # RepairStrategySelector
+│   ├── two_phase_strategy.py   # TwoPhaseStrategy + ComplexityCalculator
+│   ├── memory.py / memory_store.py
+│   ├── events.py / metrics.py
+│   └── ...
+│
+├── server/                     # FastAPI HTTP layer
+│   └── api.py                  # OpenAI-compatible endpoints + LangGraph wiring
+├── rag/                        # Qdrant vector search
+├── vllm/                       # LLM client
+├── indexer/                    # Java parsing + embedding + indexing
+├── context/                    # Smart context assembly
+├── intelligence/               # Repo structural analysis
+├── config/                     # YAML configurations
+│   └── agent.yaml              # Agent + two-phase + langgraph config
+└── tests/                      # Test suites
+    ├── test_graph_structure.py  # Graph compilation + routing tests
+    └── test_graph_e2e.py        # Full pipeline E2E test
 ```
-
-Each folder has its own `README.md` with detailed documentation.
 
 ## Configuration
 
-All configuration is via environment variables (see [env.example](env.example)):
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `QDRANT_HOST` | `localhost` | Qdrant server host |
 | `QDRANT_PORT` | `6333` | Qdrant server port |
-| `QDRANT_COLLECTION` | `java_codebase` | Qdrant collection name |
 | `VLLM_BASE_URL` | `http://localhost:8000/v1` | vLLM server URL |
 | `VLLM_MODEL` | `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | Model identifier |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model |
-| `JAVA_REPO_PATH` | — | Java repo to index |
 | `SERVER_PORT` | `8080` | API server port |
-| `MEMORY_BACKEND` | `memory` | `memory` (dev) or `redis` (prod) |
+| `USE_LEGACY_ORCHESTRATOR` | `false` | Set `true` to use legacy orchestrator |
+| `LANGGRAPH_CHECKPOINT_DB` | `checkpoints.db` | SQLite path for LangGraph state |
 
-YAML config files in `config/` provide detailed tuning for agent behavior, RAG search, and LLM generation parameters.
+### LangGraph Config (`config/agent.yaml`)
 
-## Docker
+```yaml
+langgraph:
+  checkpoint_db: "checkpoints.db"
+  require_human_review: false     # true for CI/CD pipelines
+  use_legacy: false
+  max_retries: 3
+```
+
+## Backend Toggle
 
 ```bash
-# Development: only dependencies
-docker-compose up -d qdrant redis
+# LangGraph (default)
+python main.py
 
-# Production: full stack (requires NVIDIA GPU for vLLM)
-docker-compose up -d
-
-# With monitoring tools
-docker-compose --profile tools up -d
+# Legacy orchestrator
+USE_LEGACY_ORCHESTRATOR=true python main.py
 ```
 
 ## Running Tests
 
 ```bash
-# Phase 3/4 tests (validation, repair, events, metrics)
+# Graph structure tests
+python tests/test_graph_structure.py
+
+# Full E2E pipeline test
+python tests/test_graph_e2e.py
+
+# Legacy phase tests
 python -m pytest tests/test_phase3_4.py -v
-
-# Phase 1 tests (state machine, planner)
-python tests/test_phase1.py
-
-# Phase 2 tests (intelligence, context)
-python tests/test_phase2.py
-
-# E2E trace test (AuthUseCaseService scenario)
-python tests/_test_e2e_trace.py
 ```
 
 ## License
 
 Internal use only.
-
