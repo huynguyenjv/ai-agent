@@ -257,6 +257,125 @@ class Planner:
             session_id=original_plan.metadata.get("session_id"),
         )
 
+    def plan_incremental_update(
+        self,
+        file_path: str,
+        existing_test_code: str,
+        class_name: Optional[str] = None,
+        task_description: Optional[str] = None,
+        changed_methods: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
+        max_repair_attempts: int = 2,
+    ) -> ExecutionPlan:
+        """Build an execution plan for incremental test update.
+
+        Used when a test file already exists and only new/changed methods
+        need additional tests.  The CI script provides ``existing_test_code``
+        explicitly — the agent does NOT auto-detect anything.
+
+        Steps produced (in order):
+          1. extract_class_info      — resolve class name from file path
+          2. analyze_existing_test   — parse existing test to find covered methods
+          3. retrieve_context        — fetch RAG chunks for target + deps
+          4. build_prompt            — incremental prompt with existing test
+          5. generate_code           — call LLM
+          6. extract_code            — extract Java code from response
+          7. merge_tests             — merge new tests into existing test class
+          8. validate_code           — run rule-based validation
+          9. record_session          — persist to session memory
+        """
+        resolved_class = class_name or self._extract_class_name(file_path)
+
+        plan = ExecutionPlan(
+            task_type=TaskType.INCREMENTAL_UPDATE,
+            class_name=resolved_class or "",
+            file_path=file_path,
+            max_repair_attempts=max_repair_attempts,
+            metadata={
+                "session_id": session_id,
+                "task_description": task_description,
+                "existing_test_code": existing_test_code,
+                "changed_methods": changed_methods or [],
+            },
+        )
+
+        # Step 1: Resolve class name
+        plan.add_step(
+            action=StepAction.EXTRACT_CLASS_INFO,
+            description=f"Resolve class name from {file_path}",
+            file_path=file_path,
+            class_name=resolved_class,
+        )
+
+        # Step 2: Analyze existing test file
+        plan.add_step(
+            action=StepAction.ANALYZE_EXISTING_TEST,
+            description="Parse existing test to find already-covered methods",
+            existing_test_code=existing_test_code,
+        )
+
+        # Step 3: Retrieve RAG context
+        plan.add_step(
+            action=StepAction.RETRIEVE_CONTEXT,
+            description=f"Fetch RAG context for {resolved_class or '?'}",
+            class_name=resolved_class,
+            file_path=file_path,
+            session_id=session_id,
+        )
+
+        # Step 4: Build incremental prompt
+        plan.add_step(
+            action=StepAction.BUILD_PROMPT,
+            description="Construct incremental update prompt with existing test",
+            class_name=resolved_class,
+            file_path=file_path,
+            task_description=task_description,
+            session_id=session_id,
+        )
+
+        # Step 5: Generate code via LLM
+        plan.add_step(
+            action=StepAction.GENERATE_CODE,
+            description="Call LLM to generate incremental tests",
+        )
+
+        # Step 6: Extract code from response
+        plan.add_step(
+            action=StepAction.EXTRACT_CODE,
+            description="Extract Java code block from LLM response",
+        )
+
+        # Step 7: Merge new tests into existing test class
+        plan.add_step(
+            action=StepAction.MERGE_TESTS,
+            description="Merge newly generated tests into existing test class",
+            existing_test_code=existing_test_code,
+        )
+
+        # Step 8: Validate merged code
+        plan.add_step(
+            action=StepAction.VALIDATE_CODE,
+            description="Validate merged test code against JUnit5/Mockito rules",
+        )
+
+        # Step 9: Record in session
+        plan.add_step(
+            action=StepAction.RECORD_SESSION,
+            description="Persist results to session memory",
+            session_id=session_id,
+        )
+
+        logger.info(
+            "Incremental update plan created",
+            plan_id=plan.plan_id,
+            task_type=plan.task_type.value,
+            class_name=plan.class_name,
+            steps=len(plan.steps),
+            changed_methods=changed_methods,
+        )
+
+        return plan
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     @staticmethod

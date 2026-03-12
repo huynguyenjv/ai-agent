@@ -4,18 +4,13 @@ RAG client for querying the Qdrant vector index.
 
 import os
 import time
-import warnings
 from typing import Optional
-
-# Bypass SSL for corporate proxy
-os.environ.setdefault('HF_HUB_DISABLE_SSL_VERIFY', '1')
-warnings.filterwarnings('ignore')
 
 import structlog
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from sentence_transformers import SentenceTransformer
 
+from utils.embedding import ONNXEmbedder
 from .schema import CodeChunk, SearchQuery, SearchResult, MetadataFilter, IndexStats, FieldSchema
 
 logger = structlog.get_logger()
@@ -29,11 +24,11 @@ class RAGClient:
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
         collection_name: str = "java_codebase",
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        embedding_model: str = "all-MiniLM-L6-v2-onnx",
     ):
         self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
         self.collection_name = collection_name
-        self.embedder = SentenceTransformer(embedding_model)
+        self.embedder = ONNXEmbedder(embedding_model)
         logger.info(
             "RAG client initialized",
             host=qdrant_host,
@@ -41,9 +36,15 @@ class RAGClient:
             collection=collection_name,
         )
 
-    def search(self, query: SearchQuery) -> SearchResult:
-        """Perform semantic search with optional metadata filtering."""
+    def search(self, query: SearchQuery, collection_name: Optional[str] = None) -> SearchResult:
+        """Perform semantic search with optional metadata filtering.
+
+        Args:
+            query: Search query parameters.
+            collection_name: Override collection to search in. Defaults to self.collection_name.
+        """
         start_time = time.time()
+        effective_collection = collection_name or self.collection_name
 
         # Generate query embedding
         query_vector = self.embedder.encode(query.query).tolist()
@@ -53,7 +54,7 @@ class RAGClient:
 
         # Execute search
         results = self.qdrant.search(
-            collection_name=self.collection_name,
+            collection_name=effective_collection,
             query_vector=query_vector,
             limit=query.top_k,
             score_threshold=query.score_threshold,
@@ -132,6 +133,7 @@ class RAGClient:
         logger.info(
             "Search completed",
             query=query.query[:50],
+            collection=effective_collection,
             results=len(chunks),
             time_ms=round(search_time_ms, 2),
         )
@@ -145,7 +147,8 @@ class RAGClient:
 
 
     def search_by_class(
-        self, class_name: str, top_k: int = 10, include_dependencies: bool = True
+        self, class_name: str, top_k: int = 10, include_dependencies: bool = True,
+        collection_name: Optional[str] = None,
     ) -> SearchResult:
         """Search for a specific class and optionally its dependencies.
 
@@ -153,8 +156,12 @@ class RAGClient:
           1. Semantic search WITH class_name metadata filter (fast + accurate)
           2. Qdrant scroll — pure metadata lookup, no embedding (guaranteed find)
           3. Broad semantic search without filter (last resort)
+
+        Args:
+            collection_name: Override collection to search in.
         """
         start_time = time.time()
+        effective_collection = collection_name or self.collection_name
 
         # ── Tier 1: semantic search + metadata filter ──
         query = SearchQuery(
@@ -163,12 +170,12 @@ class RAGClient:
             score_threshold=0.3,
             filters=MetadataFilter(class_name=class_name),
         )
-        result = self.search(query)
+        result = self.search(query, collection_name=effective_collection)
 
         # ── Tier 2: metadata-only scroll (guaranteed if class is indexed) ──
         if not result.chunks:
             logger.debug("Tier-1 miss, trying metadata scroll", class_name=class_name)
-            chunk = self._scroll_by_class_name(class_name)
+            chunk = self._scroll_by_class_name(class_name, collection_name=effective_collection)
             if chunk:
                 result = SearchResult(
                     query=f"class {class_name} (scroll)",
@@ -186,7 +193,7 @@ class RAGClient:
                 score_threshold=0.0,
                 filters=None,
             )
-            fallback_result = self.search(fallback_query)
+            fallback_result = self.search(fallback_query, collection_name=effective_collection)
             # Filter to prefer chunks whose class_name actually matches
             matching = [c for c in fallback_result.chunks if c.class_name == class_name]
             if matching:
@@ -230,10 +237,10 @@ class RAGClient:
                     top_k=1,
                     score_threshold=0.3,
                 )
-                dep_result = self.search(dep_query)
+                dep_result = self.search(dep_query, collection_name=effective_collection)
                 if not dep_result.chunks:
                     # Tier 2 fallback for deps too
-                    dep_chunk = self._scroll_by_class_name(type_name)
+                    dep_chunk = self._scroll_by_class_name(type_name, collection_name=effective_collection)
                     if dep_chunk:
                         all_chunks.append(dep_chunk)
                     else:
@@ -262,7 +269,10 @@ class RAGClient:
 
         return result
 
-    def _scroll_by_class_name(self, class_name: str, prefer_type: str = "class") -> Optional[CodeChunk]:
+    def _scroll_by_class_name(
+        self, class_name: str, prefer_type: str = "class",
+        collection_name: Optional[str] = None,
+    ) -> Optional[CodeChunk]:
         """Pure metadata lookup via Qdrant scroll — no embedding similarity needed.
 
         This guarantees finding a class if it's in the index, regardless of
@@ -270,6 +280,7 @@ class RAGClient:
         Prefers class-level chunks over method-level ones.
         """
         try:
+            effective_collection = collection_name or self.collection_name
             scroll_filter = models.Filter(
                 must=[
                     models.FieldCondition(
@@ -279,7 +290,7 @@ class RAGClient:
                 ]
             )
             points, _ = self.qdrant.scroll(
-                collection_name=self.collection_name,
+                collection_name=effective_collection,
                 scroll_filter=scroll_filter,
                 limit=10,
                 with_payload=True,
@@ -353,7 +364,8 @@ class RAGClient:
             return None
 
     def search_by_layer(
-        self, layer: str, query_text: str, top_k: int = 10
+        self, layer: str, query_text: str, top_k: int = 10,
+        collection_name: Optional[str] = None,
     ) -> SearchResult:
         """Search within a specific DDD layer."""
         query = SearchQuery(
@@ -362,10 +374,11 @@ class RAGClient:
             score_threshold=0.5,
             filters=MetadataFilter(layer=layer),
         )
-        return self.search(query)
+        return self.search(query, collection_name=collection_name)
 
     def search_by_type(
-        self, type_name: str, query_text: str, top_k: int = 10
+        self, type_name: str, query_text: str, top_k: int = 10,
+        collection_name: Optional[str] = None,
     ) -> SearchResult:
         """Search for specific type (service, entity, repository, method)."""
         query = SearchQuery(
@@ -374,10 +387,11 @@ class RAGClient:
             score_threshold=0.5,
             filters=MetadataFilter(type=type_name),
         )
-        return self.search(query)
+        return self.search(query, collection_name=collection_name)
 
     def get_related_code(
-        self, class_name: str, context: str, top_k: int = 10
+        self, class_name: str, context: str, top_k: int = 10,
+        collection_name: Optional[str] = None,
     ) -> SearchResult:
         """Get code related to a class based on context."""
         query = SearchQuery(
@@ -385,7 +399,7 @@ class RAGClient:
             top_k=top_k,
             score_threshold=0.4,
         )
-        return self.search(query)
+        return self.search(query, collection_name=collection_name)
 
     def _build_filter(
         self, filters: Optional[MetadataFilter]
@@ -524,16 +538,17 @@ class RAGClient:
 
         return models.Filter(must=conditions)
 
-    def get_stats(self) -> IndexStats:
+    def get_stats(self, collection_name: Optional[str] = None) -> IndexStats:
         """Get statistics about the index."""
+        effective_collection = collection_name or self.collection_name
         try:
-            info = self.qdrant.get_collection(self.collection_name)
+            info = self.qdrant.get_collection(effective_collection)
 
             # Get type distribution
             type_counts = {}
             for type_name in ["service", "entity", "repository", "method"]:
                 count_result = self.qdrant.count(
-                    collection_name=self.collection_name,
+                    collection_name=effective_collection,
                     count_filter=models.Filter(
                         must=[
                             models.FieldCondition(
@@ -549,7 +564,7 @@ class RAGClient:
             layer_counts = {}
             for layer in ["application", "domain", "infrastructure", "unknown"]:
                 count_result = self.qdrant.count(
-                    collection_name=self.collection_name,
+                    collection_name=effective_collection,
                     count_filter=models.Filter(
                         must=[
                             models.FieldCondition(
@@ -562,7 +577,7 @@ class RAGClient:
                 layer_counts[layer] = count_result.count
 
             return IndexStats(
-                collection_name=self.collection_name,
+                collection_name=effective_collection,
                 total_vectors=info.vectors_count or 0,
                 total_points=info.points_count or 0,
                 status=info.status.value,
@@ -572,9 +587,18 @@ class RAGClient:
         except Exception as e:
             logger.error("Failed to get stats", error=str(e))
             return IndexStats(
-                collection_name=self.collection_name,
+                collection_name=effective_collection,
                 total_vectors=0,
                 total_points=0,
                 status="error",
             )
+
+    def list_collections(self) -> list[str]:
+        """List all collection names in Qdrant."""
+        try:
+            collections = self.qdrant.get_collections().collections
+            return [c.name for c in collections]
+        except Exception as e:
+            logger.error("Failed to list collections", error=str(e))
+            return []
 

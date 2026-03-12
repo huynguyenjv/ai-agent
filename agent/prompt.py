@@ -473,6 +473,77 @@ NOW: analyze and write tests for the following service:
 
         return "\n".join(parts)
 
+    def build_incremental_update_prompt(
+        self,
+        class_name: str,
+        file_path: str,
+        rag_chunks: list[CodeChunk],
+        existing_test_code: str,
+        tested_methods: list[str] = None,
+        changed_methods: list[str] = None,
+        task_description: Optional[str] = None,
+    ) -> str:
+        """Build prompt for incremental test update.
+
+        The LLM receives the existing test file and is asked to generate
+        ONLY new/updated test methods for uncovered or changed methods.
+        """
+        parts = []
+
+        # Task
+        if changed_methods:
+            methods_str = ", ".join(f"`{m}`" for m in changed_methods)
+            parts.append(
+                f"## Task\nThe following methods were changed/added in `{class_name}`: {methods_str}.\n"
+                f"Generate ONLY the additional test methods needed for these changes."
+            )
+        else:
+            parts.append(
+                f"## Task\nGenerate additional unit tests for `{class_name}` "
+                f"covering methods NOT yet tested in the existing test file."
+            )
+
+        if task_description:
+            parts.append(f"\nAdditional instructions: {task_description}")
+
+        # Target class info
+        parts.append(f"\n## Target Class\n- Class: `{class_name}`\n- File: `{file_path}`")
+
+        # Existing test code
+        parts.append(
+            f"\n## Existing Test File\n"
+            f"This test file already exists. DO NOT regenerate tests for methods already covered.\n\n"
+            f"```java\n{existing_test_code}\n```"
+        )
+
+        # Already tested methods
+        if tested_methods:
+            methods_list = ", ".join(f"`{m}`" for m in tested_methods)
+            parts.append(
+                f"\n## Already Tested Methods\n"
+                f"The following methods already have tests — DO NOT duplicate them: {methods_list}"
+            )
+
+        # RAG context (reuse same logic as test generation)
+        if rag_chunks:
+            context_summary = self.build_context_summary(rag_chunks)
+            if context_summary:
+                parts.append(f"\n## Codebase Context\n{context_summary}")
+
+        # Output instructions
+        parts.append("""
+## Output Requirements
+1. Generate ONLY new test methods — not a complete test class
+2. Follow the EXACT same style, naming conventions, and patterns as the existing test file
+3. Use the same @Mock fields already declared in the existing test
+4. If new @Mock fields are needed, list them at the top with a comment: // NEW MOCK FIELDS NEEDED
+5. Each test method must have @Test and @DisplayName
+6. Follow AAA pattern with comments: // Arrange, // Act, // Assert
+7. DO NOT include class declaration, imports, or @BeforeEach — only new test methods
+8. Use method naming: methodName_WhenCondition_ShouldExpectedResult""")
+
+        return "\n".join(parts)
+
     def build_context_summary(self, chunks: list[CodeChunk], max_tokens: int = 2000) -> str:
         """Build a compact context summary from RAG chunks."""
         if not chunks:
@@ -610,6 +681,6 @@ NOW: analyze and write tests for the following service:
 
     def estimate_tokens(self, text: str) -> int:
         """Estimate token count for text."""
-        # Rough approximation: 1 token ≈ 4 characters
-        return len(text) // 4
+        from utils.tokenizer import count_tokens
+        return count_tokens(text)
 

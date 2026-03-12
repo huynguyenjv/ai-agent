@@ -500,33 +500,43 @@ _run("under budget — keep all", test_token_optimizer_under_budget)
 
 
 def test_token_optimizer_over_budget():
-    # Create snippets that exceed budget
+    # Use estimate_tokens so assertions match the real tokenizer backend
+    est = TokenOptimizer.estimate_tokens
+
+    big_content = "public void process(Order o) { repo.save(o); }\n" * 30
+    small_content = "private final OrderRepository repo;\n" * 5
+    low_content = "// related helper\n" * 60
+
     big_snippet = Snippet(
-        content="x" * 4000,  # 1000 tokens
+        content=big_content,
         role=SnippetRole.SOURCE,
         priority=10,
         class_name="Main",
     )
     small_snippet = Snippet(
-        content="y" * 400,  # 100 tokens
+        content=small_content,
         role=SnippetRole.DEPENDENCY,
         priority=20,
         class_name="Dep",
     )
     low_prio = Snippet(
-        content="z" * 4000,  # 1000 tokens
+        content=low_content,
         role=SnippetRole.RELATED,
         priority=50,
         class_name="Related",
     )
 
-    optimizer = TokenOptimizer(token_budget=1200)
+    total = est(big_content) + est(small_content) + est(low_content)
+    budget = est(big_content) + est(small_content) + 20  # leave only 20 tokens for third
+    assert total > budget, f"Test data must exceed budget ({total} vs {budget})"
+
+    optimizer = TokenOptimizer(token_budget=budget)
     result, report = optimizer.optimize([big_snippet, small_snippet, low_prio])
 
-    # Should keep the first two (1100 tokens) and drop/truncate the third
+    # Should keep the first two and drop/truncate the third
     assert len(result) <= 3
     assert report.snippets_dropped + report.snippets_truncated > 0
-    assert report.final_tokens <= 1200
+    assert report.final_tokens <= budget
 
 
 _run("over budget — drop/truncate", test_token_optimizer_over_budget)

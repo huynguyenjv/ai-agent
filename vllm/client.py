@@ -3,12 +3,15 @@ vLLM client for OpenAI-compatible API.
 """
 
 import json
+import time as _time
 from dataclasses import dataclass
 from typing import Optional, Generator
 
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+
+from utils.ssl_utils import ssl_config
+from utils.tokenizer import count_tokens
 
 logger = structlog.get_logger()
 
@@ -48,20 +51,22 @@ class VLLMClient:
         self.timeout = timeout
         self._closed = False
 
-        # Configure connection pool for better performance
+        # Configure connection pool — DISABLE keepalive to prevent
+        # stale/half-open TCP connections from blocking subsequent requests.
+        # Each LLM generation is heavy (seconds to minutes), so the cost
+        # of a fresh TCP connection is negligible.
         limits = httpx.Limits(
             max_connections=max_connections,
-            max_keepalive_connections=max_keepalive_connections,
-            keepalive_expiry=30.0,  # Keep connections alive for 30 seconds
+            max_keepalive_connections=0,   # ← No keepalive: avoids stale conn reuse
         )
 
         # Use longer timeouts for connect and read
-        self.client = httpx.Client(
+        client_kwargs = ssl_config.configure_httpx_client(
             timeout=httpx.Timeout(
                 connect=30.0,
                 read=timeout,
                 write=30.0,
-                pool=30.0,
+                pool=60.0,   # Wait up to 60s for a connection slot
             ),
             limits=limits,
             headers={
@@ -70,6 +75,8 @@ class VLLMClient:
             },
             http2=False,  # Disable HTTP/2 for better compatibility with vLLM
         )
+        
+        self.client = httpx.Client(**client_kwargs)
 
         logger.info(
             "vLLM client initialized",
@@ -78,10 +85,6 @@ class VLLMClient:
             max_connections=max_connections,
         )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-    )
     def generate(
         self,
         system_prompt: str,
@@ -89,88 +92,115 @@ class VLLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = True,  # Default to streaming to avoid KV cache blocking
+        max_retries: int = 2,
     ) -> GenerationResponse:
-        """Generate completion using vLLM with streaming to avoid KV cache blocking."""
-        try:
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": temperature or self.temperature,
-                "max_tokens": max_tokens or self.max_tokens,
-                "top_p": self.top_p,
-                "stream": stream,
-            }
+        """Generate completion using vLLM with retry on connection errors.
 
-            logger.debug(
-                "Sending generation request",
-                model=self.model,
-                prompt_length=len(user_prompt),
-                stream=stream,
-            )
+        Retries only on transient network/connection errors (httpx.RequestError).
+        HTTP 4xx/5xx and other errors are returned immediately.
+        """
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature or self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "top_p": self.top_p,
+            "stream": stream,
+        }
 
-            if stream:
-                return self._generate_streaming(payload)
-            else:
-                return self._generate_non_streaming(payload)
+        last_error: Optional[str] = None
 
-        except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP error: {e.response.status_code}"
-            logger.error("vLLM request failed", error=error_msg)
-            return GenerationResponse(success=False, error=error_msg)
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.debug(
+                    "Sending generation request",
+                    model=self.model,
+                    prompt_length=len(user_prompt),
+                    stream=stream,
+                    attempt=attempt,
+                )
 
-        except httpx.RequestError as e:
-            error_msg = f"Request error: {str(e)}"
-            logger.error("vLLM request failed", error=error_msg)
-            return GenerationResponse(success=False, error=error_msg)
+                if stream:
+                    return self._generate_streaming(payload)
+                else:
+                    return self._generate_non_streaming(payload)
 
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            logger.error("vLLM request failed", error=error_msg)
-            return GenerationResponse(success=False, error=error_msg)
+            except httpx.RequestError as e:
+                # Transient network error — retry
+                last_error = f"Request error (attempt {attempt}/{max_retries}): {e}"
+                logger.warning("vLLM request failed, retrying", error=last_error, attempt=attempt)
+                if attempt < max_retries:
+                    _time.sleep(min(2 ** attempt, 10))  # exponential back-off
+                continue
+
+            except httpx.HTTPStatusError as e:
+                error_msg = f"HTTP error: {e.response.status_code}"
+                logger.error("vLLM request failed", error=error_msg)
+                return GenerationResponse(success=False, error=error_msg)
+
+            except Exception as e:
+                error_msg = f"Unexpected error: {str(e)}"
+                logger.error("vLLM request failed", error=error_msg)
+                return GenerationResponse(success=False, error=error_msg)
+
+        # All retries exhausted
+        logger.error("vLLM generation failed after all retries", error=last_error)
+        return GenerationResponse(success=False, error=last_error)
 
     def _generate_streaming(self, payload: dict) -> GenerationResponse:
-        """Generate with streaming - releases KV cache incrementally."""
+        """Generate with streaming - releases KV cache incrementally.
+
+        After receiving ``[DONE]``, the remaining response body is drained
+        explicitly so that the underlying connection is released cleanly.
+        """
         content_parts = []
         finish_reason = ""
-        
+
         with self.client.stream(
             "POST",
             f"{self.base_url}/chat/completions",
             json=payload,
         ) as response:
             response.raise_for_status()
-            
+
             for line in response.iter_lines():
                 if not line or line.startswith(":"):
                     continue
-                    
+
                 if line.startswith("data: "):
                     data_str = line[6:]  # Remove "data: " prefix
-                    
+
                     if data_str.strip() == "[DONE]":
                         break
-                    
+
                     try:
                         data = json.loads(data_str)
                         choice = data.get("choices", [{}])[0]
                         delta = choice.get("delta", {})
-                        
+
                         if "content" in delta:
                             content_parts.append(delta["content"])
-                        
+
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
-                            
+
                     except json.JSONDecodeError:
                         continue
 
+            # Drain any remaining bytes so httpx can close the connection
+            # cleanly instead of leaving it in a half-open state.
+            try:
+                response.read()  # consumes remaining body
+            except Exception:
+                pass  # already closed / empty — that's fine
+
         content = "".join(content_parts)
         # Estimate tokens (streaming doesn't always return usage)
-        tokens_used = len(content) // 4  # Rough estimate
-        
+        tokens_used = count_tokens(content)
+
         logger.info(
             "Streaming generation complete",
             content_length=len(content),
@@ -293,7 +323,7 @@ class VLLMClient:
                     data_str = line[6:]
 
                     if data_str.strip() == "[DONE]":
-                        return
+                        break
 
                     try:
                         data = json.loads(data_str)
@@ -305,6 +335,12 @@ class VLLMClient:
 
                     except json.JSONDecodeError:
                         continue
+
+            # Drain remaining bytes to release the connection cleanly
+            try:
+                response.read()
+            except Exception:
+                pass
 
     def health_check(self, timeout: float = 5.0) -> bool:
         """Check if vLLM server is healthy (with short timeout)."""
