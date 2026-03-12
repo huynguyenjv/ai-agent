@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from agent.orchestrator import AgentOrchestrator, GenerationRequest, StreamEvent, StreamPhase
+from agent.graph_adapter import GraphOrchestrator, create_graph_orchestrator
 from agent.events import get_event_bus, Event, EventType
 from agent.metrics import MetricsCollector
 from indexer.build_index import IndexBuilder
@@ -38,10 +39,14 @@ logger = structlog.get_logger()
 
 # Global instances
 orchestrator: Optional[AgentOrchestrator] = None
+graph_orchestrator: Optional[GraphOrchestrator] = None  # LangGraph backend
 index_builder: Optional[IndexBuilder] = None
 metrics_collector: Optional[MetricsCollector] = None
 session_manager: SessionManager = SessionManager()
 rate_limiter: Optional[RateLimiter] = None
+
+# Toggle: set USE_LEGACY_ORCHESTRATOR=true to use the old orchestrator
+USE_LEGACY = os.getenv("USE_LEGACY_ORCHESTRATOR", "false").lower() in ("true", "1", "yes")
 
 # Thread pool for running blocking operations
 # Use limited workers to prevent resource exhaustion
@@ -358,9 +363,9 @@ def _resolve_collection(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global orchestrator, index_builder, _executor, metrics_collector, rate_limiter
+    global orchestrator, graph_orchestrator, index_builder, _executor, metrics_collector, rate_limiter
 
-    logger.info("Starting AI Agent server...")
+    logger.info("Starting AI Agent server...", backend="legacy" if USE_LEGACY else "langgraph")
 
     # Initialize thread pool for blocking operations
     _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -376,9 +381,21 @@ async def lifespan(app: FastAPI):
         window_seconds=RATE_LIMIT_WINDOW,
     )
 
-    # Initialize components
+    # Initialize components — legacy orchestrator always created for fallback
     orchestrator = create_orchestrator()
     index_builder = create_index_builder()
+
+    # Initialize LangGraph orchestrator (new backend)
+    if not USE_LEGACY:
+        try:
+            graph_orchestrator = create_graph_orchestrator(
+                rag_client=orchestrator.rag,
+                vllm_client=orchestrator.vllm,
+            )
+            logger.info("LangGraph orchestrator initialized")
+        except Exception as e:
+            logger.error("LangGraph init failed, using legacy", error=str(e))
+            graph_orchestrator = None
 
     # Phase 4: metrics collector is wired via the orchestrator's event bus
     metrics_collector = orchestrator.metrics if orchestrator else None
@@ -386,7 +403,7 @@ async def lifespan(app: FastAPI):
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(_periodic_session_cleanup())
 
-    logger.info("Server initialized successfully")
+    logger.info("Server initialized successfully", backend="langgraph" if graph_orchestrator else "legacy")
 
     yield
 
@@ -688,7 +705,8 @@ async def generate_test(request: GenerateTestRequest):
 
     Returns generated test code with validation results.
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Read source file from disk and embed it as an inline code fence so the
@@ -726,7 +744,7 @@ async def generate_test(request: GenerateTestRequest):
         task_description=task_description_with_source,
     )
 
-    result = await run_in_executor(orchestrator.generate_test, gen_request)
+    result = await run_in_executor(active.generate_test, gen_request)
 
     return GenerateTestResponse(
         success=result.success,
@@ -1123,7 +1141,8 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             "changed_methods": ["createUser", "updateEmail"]
         }
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Validate incremental mode requirements
@@ -1203,7 +1222,7 @@ async def pipeline_generate(request: PipelineGenerateRequest):
         complexity_threshold=request.complexity_threshold,
     )
 
-    result = await run_in_executor(orchestrator.generate_test, gen_request)
+    result = await run_in_executor(active.generate_test, gen_request)
 
     return PipelineGenerateResponse(
         success=result.success,
@@ -1249,7 +1268,8 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
             ]
         }
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     results: list[PipelineBatchItemResult] = []
@@ -1283,7 +1303,7 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
                 source_code=file_req.source_code,
             )
 
-            result = await run_in_executor(orchestrator.generate_test, gen_request)
+            result = await run_in_executor(active.generate_test, gen_request)
 
             results.append(PipelineBatchItemResult(
                 file_path=file_req.file_path,
@@ -1389,7 +1409,8 @@ async def chat_completions(request: ChatCompletionRequest):
       - Multi-collection: resolves Qdrant collection from ``collection``
         field, ``file_path``, or falls back to default.
     """
-    if not orchestrator:
+    active = _get_orchestrator()
+    if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # ── Parse messages ───────────────────────────────────────────────
@@ -1469,7 +1490,7 @@ async def chat_completions(request: ChatCompletionRequest):
             )
 
         # ── Non-streaming: run full pipeline, return complete result ─
-        result = await run_in_executor(orchestrator.generate_test, gen_request)
+        result = await run_in_executor(active.generate_test, gen_request)
 
         if result.success:
             response_content = result.test_code or ""
@@ -1613,7 +1634,8 @@ def _stream_test_generation(
 
         def _run_sync():
             try:
-                for event in orchestrator.generate_test_streaming(gen_request):
+                active = _get_orchestrator()
+                for event in active.generate_test_streaming(gen_request):
                     loop.call_soon_threadsafe(queue.put_nowait, event)
             except Exception as exc:
                 loop.call_soon_threadsafe(
@@ -1762,36 +1784,39 @@ def _build_metadata_block(result) -> str:
     """Build a human-readable metadata block for test generation results."""
     parts = []
     parts.append("---")
-    parts.append(f"**Validation:** {'✅ passed' if result.validation_passed else '❌ failed'}")
+    parts.append(f"**Validation:** {'\u2705 passed' if getattr(result, 'validation_passed', False) else '\u274c failed'}")
 
-    if result.validation_issues:
-        parts.append(f"**Issues:** {', '.join(result.validation_issues[:5])}")
+    issues = getattr(result, 'validation_issues', [])
+    if issues:
+        parts.append(f"**Issues:** {', '.join(issues[:5])}")
 
-    if result.repair_attempts:
-        parts.append(f"**Repair attempts:** {result.repair_attempts}")
+    repair = getattr(result, 'repair_attempts', 0)
+    if repair:
+        parts.append(f"**Repair attempts:** {repair}")
 
-    if result.rag_chunks_used:
-        parts.append(f"**RAG context chunks:** {result.rag_chunks_used}")
+    rag = getattr(result, 'rag_chunks_used', 0)
+    if rag:
+        parts.append(f"**RAG context chunks:** {rag}")
 
-    if result.validation_summary:
-        vs = result.validation_summary
+    vs = getattr(result, 'validation_summary', None)
+    if vs:
         parts.append(
             f"**Details:** {vs.get('errors', 0)} errors, "
             f"{vs.get('warnings', 0)} warnings, "
             f"{vs.get('test_count', '?')} test(s)"
         )
 
-    parts.append(f"**Tokens used:** {result.tokens_used}")
+    parts.append(f"**Tokens used:** {getattr(result, 'tokens_used', 0)}")
     
     # Two-Phase Strategy metadata
     strategy = getattr(result, 'strategy_used', 'single_pass')
     if strategy == "two_phase":
-        parts.append(f"**Strategy:** 🔄 Two-Phase Generation")
+        parts.append(f"**Strategy:** \U0001f504 Two-Phase Generation")
         complexity = getattr(result, 'complexity_score', 0)
         if complexity:
             parts.append(f"**Complexity score:** {complexity}")
     else:
-        parts.append(f"**Strategy:** ⚡ Single-Pass")
+        parts.append(f"**Strategy:** \u26a1 Single-Pass")
     
     return "\n".join(parts)
 
@@ -2163,6 +2188,100 @@ async def pipeline_generate_two_phase(request: PipelineGenerateRequest):
     
     # Delegate to the standard pipeline endpoint
     return await pipeline_generate(request)
+
+
+# ============================================================================
+# LangGraph endpoints (human review + run status)
+# ============================================================================
+
+
+class ReviewRequest(BaseModel):
+    """Request to approve/reject a generated test."""
+    approved: bool
+    feedback: str = ""
+
+
+class RunStatusResponse(BaseModel):
+    """Run status for polling."""
+    run_id: str
+    status: str  # "running" | "interrupted" | "completed" | "failed"
+    class_name: str = ""
+    validation_passed: Optional[bool] = None
+    test_code: Optional[str] = None
+    validation_issues: list[str] = Field(default_factory=list)
+
+
+def _get_orchestrator():
+    """Get the active orchestrator (graph or legacy)."""
+    if graph_orchestrator and not USE_LEGACY:
+        return graph_orchestrator
+    return orchestrator
+
+
+@app.post("/review/{run_id}")
+async def submit_review(run_id: str, request: ReviewRequest):
+    """Resume a paused graph after human review.
+
+    Only available when using LangGraph backend.
+    """
+    if not graph_orchestrator:
+        raise HTTPException(
+            status_code=400,
+            detail="Human review requires LangGraph backend. Set USE_LEGACY_ORCHESTRATOR=false.",
+        )
+
+    def _do_review():
+        return graph_orchestrator.submit_review(
+            run_id=run_id,
+            approved=request.approved,
+            feedback=request.feedback,
+        )
+
+    result = await run_in_executor(_do_review)
+    return {
+        "success": result.success,
+        "test_code": result.test_code,
+        "class_name": result.class_name,
+        "validation_passed": result.validation_passed,
+        "run_id": run_id,
+    }
+
+
+@app.get("/runs/{run_id}", response_model=RunStatusResponse)
+async def get_run_status(run_id: str):
+    """Get the status of a graph run (for polling)."""
+    if not graph_orchestrator:
+        raise HTTPException(
+            status_code=400,
+            detail="Run tracking requires LangGraph backend.",
+        )
+
+    state = graph_orchestrator.get_run_state(run_id)
+    if not state:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # Determine status
+    human_approved = state.get("human_approved")
+    final_code = state.get("final_test_code")
+    error = state.get("error")
+
+    if error:
+        status = "failed"
+    elif final_code:
+        status = "completed"
+    elif human_approved is None and state.get("require_human_review"):
+        status = "interrupted"
+    else:
+        status = "running"
+
+    return RunStatusResponse(
+        run_id=run_id,
+        status=status,
+        class_name=state.get("class_name", ""),
+        validation_passed=state.get("validation_passed"),
+        test_code=final_code,
+        validation_issues=state.get("validation_issues", []),
+    )
 
 
 if __name__ == "__main__":
