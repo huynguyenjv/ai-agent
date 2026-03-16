@@ -111,6 +111,15 @@ class VLLMClient:
             "stream": stream,
         }
 
+        # ── LOG FULL PROMPT ──────────────────────────────────────────
+        logger.info("--- vLLM REQUEST START ---")
+        logger.info(f"SYSTEM: {system_prompt[:500]}..." if len(system_prompt) > 500 else f"SYSTEM: {system_prompt}")
+        logger.info(f"USER: {user_prompt[:500]}..." if len(user_prompt) > 500 else f"USER: {user_prompt}")
+        # Log full for easy copy-paste
+        logger.info(f"FULL_SYSTEM_PROMPT: {system_prompt}")
+        logger.info(f"FULL_USER_PROMPT: {user_prompt}")
+        logger.info("--- vLLM REQUEST END ---")
+
         last_error: Optional[str] = None
 
         for attempt in range(1, max_retries + 1):
@@ -307,6 +316,12 @@ class VLLMClient:
             "top_p": self.top_p,
             "stream": True,
         }
+
+        # ── LOG FULL PROMPT (STREAMING) ──────────────────────────────
+        logger.info("--- vLLM STREAMING REQUEST START ---")
+        logger.info(f"FULL_SYSTEM_PROMPT: {system_prompt}")
+        logger.info(f"FULL_USER_PROMPT: {user_prompt}")
+        logger.info("--- vLLM STREAMING REQUEST END ---")
 
         with self.client.stream(
             "POST",

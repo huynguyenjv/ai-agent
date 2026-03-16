@@ -53,8 +53,16 @@ def build_prompt_node(state: dict, *, prompt_builder, two_phase_strategy=None) -
     # ── Two-phase mode ──
     elif strategy == "two_phase" and two_phase_strategy:
         try:
+            from agent.analysis_prompt import AnalysisResult
+            
+            analysis_data = state.get("analysis_result")
+            if isinstance(analysis_data, dict):
+                analysis_obj = AnalysisResult.from_dict(analysis_data)
+            else:
+                analysis_obj = analysis_data
+                
             system_prompt, user_prompt = two_phase_strategy.build_generation_prompt(
-                analysis_result=state.get("analysis_result"),
+                analysis_result=analysis_obj,
                 class_name=class_name,
                 file_path=file_path,
                 rag_chunks=rag_chunks,

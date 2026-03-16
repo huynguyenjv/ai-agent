@@ -34,6 +34,13 @@ def call_llm_node(state: dict, *, vllm_client) -> dict:
         user_len=len(user_prompt),
     )
 
+    # ── LOG FULL PROMPTS FOR DEBUGGING/REPORTING ─────────────────────
+    logger.info("--- vLLM SYSTEM PROMPT ---")
+    logger.info(system_prompt)
+    logger.info("--- vLLM USER PROMPT ---")
+    logger.info(user_prompt)
+    logger.info("--------------------------------------------------")
+
     try:
         response = vllm_client.generate(
             system_prompt=system_prompt,
