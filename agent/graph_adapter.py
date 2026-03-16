@@ -21,7 +21,7 @@ import structlog
 
 from agent.graph import create_agent_graph
 from agent.state import UnitTestState
-from agent.orchestrator import StreamEvent, StreamPhase
+from agent.models import StreamEvent, StreamPhase
 
 logger = structlog.get_logger()
 
@@ -339,7 +339,7 @@ class GraphOrchestrator:
                     # Emit progress message
                     yield StreamEvent(
                         phase=phase,
-                        content=msg,
+                        content=f"> {msg}\n\n",
                         delta=False,
                     )
 
@@ -364,6 +364,11 @@ class GraphOrchestrator:
                         code = state_update.get("test_code", "")
                         if code:
                             test_code = code
+                            yield StreamEvent(
+                                phase=StreamPhase.GENERATING,
+                                content="```java\n",
+                                delta=True,
+                            )
                             chunk_size = 60
                             for i in range(0, len(code), chunk_size):
                                 yield StreamEvent(
@@ -371,6 +376,11 @@ class GraphOrchestrator:
                                     content=code[i:i + chunk_size],
                                     delta=True,
                                 )
+                            yield StreamEvent(
+                                phase=StreamPhase.GENERATING,
+                                content="\n```\n\n",
+                                delta=True,
+                            )
 
                     # When repair finishes, stream the repaired code
                     if node_name == "repair" and "test_code" in state_update:
@@ -379,7 +389,7 @@ class GraphOrchestrator:
                             test_code = new_code
                             yield StreamEvent(
                                 phase=StreamPhase.REPAIRING,
-                                content="\n\n--- Repaired code ---\n\n",
+                                content="\n\n> 🔧 **Repaired code:**\n\n```java\n",
                                 delta=False,
                             )
                             chunk_size = 60
@@ -389,6 +399,11 @@ class GraphOrchestrator:
                                     content=new_code[i:i + chunk_size],
                                     delta=True,
                                 )
+                            yield StreamEvent(
+                                phase=StreamPhase.GENERATING,
+                                content="\n```\n\n",
+                                delta=True,
+                            )
 
             # Done — emit final event with metadata
             if final_error:

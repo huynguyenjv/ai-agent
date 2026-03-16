@@ -76,57 +76,61 @@ class AnalysisResult:
     raw_json: Optional[str] = None
     
     @classmethod
+    def from_dict(cls, data: dict) -> "AnalysisResult":
+        """Parse analysis result from dictionary payload (e.g., LangGraph state)."""
+        # Parse methods
+        methods = []
+        for m in data.get("methods", []):
+            scenarios = [
+                TestScenario(
+                    name=s.get("name", ""),
+                    description=s.get("description", ""),
+                    expected_behavior=s.get("expected_behavior", ""),
+                    priority=s.get("priority", 1),
+                )
+                for s in m.get("test_scenarios", [])
+            ]
+            
+            methods.append(MethodAnalysis(
+                name=m.get("name", ""),
+                return_type=m.get("return_type", "void"),
+                parameters=[(p.get("type", ""), p.get("name", "")) 
+                           for p in m.get("parameters", [])],
+                dependencies_called=m.get("dependencies_called", []),
+                domain_types_used=m.get("domain_types_used", []),
+                test_scenarios=scenarios,
+                complexity=m.get("complexity", "simple"),
+                has_branching=m.get("has_branching", False),
+                has_exception_handling=m.get("has_exception_handling", False),
+            ))
+        
+        # Calculate totals
+        total_tests = sum(len(m.test_scenarios) for m in methods)
+        priority_1 = sum(
+            len([s for s in m.test_scenarios if s.priority == 1])
+            for m in methods
+        )
+        
+        return cls(
+            service_name=data.get("service_name", ""),
+            service_fqn=data.get("service_fqn", ""),
+            complexity_score=data.get("complexity_score", 0),
+            complexity_level=data.get("complexity_level", "simple"),
+            constructor_dependencies=data.get("constructor_dependencies", []),
+            all_domain_types=data.get("all_domain_types", []),
+            methods=methods,
+            total_test_count=data.get("total_test_count", total_tests),
+            priority_1_count=data.get("priority_1_count", priority_1),
+            raw_json=data.get("raw_json", None),
+        )
+
+    @classmethod
     def from_json(cls, json_str: str) -> "AnalysisResult":
         """Parse analysis result from LLM JSON output."""
         try:
             data = json.loads(json_str)
-            
-            # Parse methods
-            methods = []
-            for m in data.get("methods", []):
-                scenarios = [
-                    TestScenario(
-                        name=s.get("name", ""),
-                        description=s.get("description", ""),
-                        expected_behavior=s.get("expected_behavior", ""),
-                        priority=s.get("priority", 1),
-                    )
-                    for s in m.get("test_scenarios", [])
-                ]
-                
-                methods.append(MethodAnalysis(
-                    name=m.get("name", ""),
-                    return_type=m.get("return_type", "void"),
-                    parameters=[(p.get("type", ""), p.get("name", "")) 
-                               for p in m.get("parameters", [])],
-                    dependencies_called=m.get("dependencies_called", []),
-                    domain_types_used=m.get("domain_types_used", []),
-                    test_scenarios=scenarios,
-                    complexity=m.get("complexity", "simple"),
-                    has_branching=m.get("has_branching", False),
-                    has_exception_handling=m.get("has_exception_handling", False),
-                ))
-            
-            # Calculate totals
-            total_tests = sum(len(m.test_scenarios) for m in methods)
-            priority_1 = sum(
-                len([s for s in m.test_scenarios if s.priority == 1])
-                for m in methods
-            )
-            
-            return cls(
-                service_name=data.get("service_name", ""),
-                service_fqn=data.get("service_fqn", ""),
-                complexity_score=data.get("complexity_score", 0),
-                complexity_level=data.get("complexity_level", "simple"),
-                constructor_dependencies=data.get("constructor_dependencies", []),
-                all_domain_types=data.get("all_domain_types", []),
-                methods=methods,
-                total_test_count=total_tests,
-                priority_1_count=priority_1,
-                raw_json=json_str,
-            )
-            
+            data["raw_json"] = json_str
+            return cls.from_dict(data)
         except json.JSONDecodeError as e:
             logger.error("Failed to parse analysis JSON", error=str(e))
             raise ValueError(f"Invalid analysis JSON: {e}")

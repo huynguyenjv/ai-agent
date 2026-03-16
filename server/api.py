@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from agent.orchestrator import AgentOrchestrator, GenerationRequest, StreamEvent, StreamPhase
+from agent.models import GenerationRequest, StreamEvent, StreamPhase
 from agent.graph_adapter import GraphOrchestrator, create_graph_orchestrator
 from agent.events import get_event_bus, Event, EventType
 from agent.metrics import MetricsCollector
@@ -38,15 +38,11 @@ load_dotenv()
 logger = structlog.get_logger()
 
 # Global instances
-orchestrator: Optional[AgentOrchestrator] = None
-graph_orchestrator: Optional[GraphOrchestrator] = None  # LangGraph backend
+graph_orchestrator: Optional[GraphOrchestrator] = None
 index_builder: Optional[IndexBuilder] = None
 metrics_collector: Optional[MetricsCollector] = None
 session_manager: SessionManager = SessionManager()
 rate_limiter: Optional[RateLimiter] = None
-
-# Toggle: set USE_LEGACY_ORCHESTRATOR=true to use the old orchestrator
-USE_LEGACY = os.getenv("USE_LEGACY_ORCHESTRATOR", "false").lower() in ("true", "1", "yes")
 
 # Thread pool for running blocking operations
 # Use limited workers to prevent resource exhaustion
@@ -273,35 +269,8 @@ class HealthResponse(BaseModel):
     index_stats: Optional[dict] = None
 
 
-def create_orchestrator() -> AgentOrchestrator:
-    """Create and configure the agent orchestrator."""
-    rag_client = RAGClient(
-        qdrant_host=os.getenv("QDRANT_HOST", "localhost"),
-        qdrant_port=int(os.getenv("QDRANT_PORT", "6333")),
-        collection_name=os.getenv("QDRANT_COLLECTION", "java_codebase"),
-        embedding_model=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2-onnx"),
-    )
-
-    vllm_base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
-    vllm_model = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ")
-    
-    logger.info(
-        "Creating vLLM client",
-        base_url=vllm_base_url,
-        model=vllm_model,
-    )
-    
-    vllm_client = VLLMClient(
-        base_url=vllm_base_url,
-        api_key=os.getenv("VLLM_API_KEY", "token-abc123"),
-        model=vllm_model,
-    )
-
-    return AgentOrchestrator(
-        rag_client=rag_client,
-        vllm_client=vllm_client,
-        repo_path=os.getenv("JAVA_REPO_PATH") or None,
-    )
+# create_orchestrator removed — LangGraph-only mode.
+# Use create_graph_orchestrator() from agent.graph_adapter instead.
 
 
 def create_index_builder() -> IndexBuilder:
@@ -363,9 +332,9 @@ def _resolve_collection(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global orchestrator, graph_orchestrator, index_builder, _executor, metrics_collector, rate_limiter
+    global graph_orchestrator, index_builder, _executor, metrics_collector, rate_limiter
 
-    logger.info("Starting AI Agent server...", backend="legacy" if USE_LEGACY else "langgraph")
+    logger.info("Starting AI Agent server...", backend="langgraph")
 
     # Initialize thread pool for blocking operations
     _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -381,29 +350,17 @@ async def lifespan(app: FastAPI):
         window_seconds=RATE_LIMIT_WINDOW,
     )
 
-    # Initialize components — legacy orchestrator always created for fallback
-    orchestrator = create_orchestrator()
+    # Initialize LangGraph graph_orchestrator
+    graph_orchestrator = create_graph_orchestrator()
     index_builder = create_index_builder()
 
-    # Initialize LangGraph orchestrator (new backend)
-    if not USE_LEGACY:
-        try:
-            graph_orchestrator = create_graph_orchestrator(
-                rag_client=orchestrator.rag,
-                vllm_client=orchestrator.vllm,
-            )
-            logger.info("LangGraph orchestrator initialized")
-        except Exception as e:
-            logger.error("LangGraph init failed, using legacy", error=str(e))
-            graph_orchestrator = None
-
-    # Phase 4: metrics collector is wired via the orchestrator's event bus
-    metrics_collector = orchestrator.metrics if orchestrator else None
+    # Phase 4: metrics collector
+    metrics_collector = graph_orchestrator.metrics if graph_orchestrator else None
 
     # Start background task for session cleanup
     cleanup_task = asyncio.create_task(_periodic_session_cleanup())
 
-    logger.info("Server initialized successfully", backend="langgraph" if graph_orchestrator else "legacy")
+    logger.info("Server initialized successfully", backend="langgraph")
 
     yield
 
@@ -418,14 +375,14 @@ async def lifespan(app: FastAPI):
         pass
 
     # Close vLLM client connection
-    if orchestrator and orchestrator.vllm:
-        orchestrator.vllm.close()
+    if graph_orchestrator and graph_orchestrator.vllm:
+        graph_orchestrator.vllm.close()
         logger.info("vLLM client closed")
 
     # Close Qdrant connections
-    if orchestrator and orchestrator.rag:
+    if graph_orchestrator and graph_orchestrator.rag:
         try:
-            orchestrator.rag.qdrant.close()
+            graph_orchestrator.rag.qdrant.close()
             logger.info("Qdrant client (RAG) closed")
         except Exception as e:
             logger.warning("Failed to close RAG Qdrant client", error=str(e))
@@ -623,14 +580,14 @@ async def health_check():
     qdrant_healthy = False
     index_stats = None
 
-    if orchestrator:
+    if graph_orchestrator:
         # Run sync health checks in thread pool to avoid blocking the event loop
         loop = asyncio.get_running_loop()
 
-        vllm_healthy = await loop.run_in_executor(None, orchestrator.vllm.health_check)
+        vllm_healthy = await loop.run_in_executor(None, graph_orchestrator.vllm.health_check)
 
         try:
-            stats = await loop.run_in_executor(None, orchestrator.rag.get_stats)
+            stats = await loop.run_in_executor(None, graph_orchestrator.rag.get_stats)
             # Qdrant status có thể là "green", "yellow", hoặc tên khác tùy version
             qdrant_healthy = stats.status in ("green", "yellow", "Green", "Yellow") or stats.total_points >= 0
             index_stats = {
@@ -644,7 +601,7 @@ async def health_check():
             # Try direct connection check
             try:
                 collections = await loop.run_in_executor(
-                    None, orchestrator.rag.qdrant.get_collections
+                    None, graph_orchestrator.rag.qdrant.get_collections
                 )
                 qdrant_healthy = True
                 index_stats = {"collection": "java_codebase", "total_points": 0, "status": "connected"}
@@ -761,7 +718,7 @@ async def generate_test(request: GenerateTestRequest):
 @app.post("/refine-test", response_model=GenerateTestResponse)
 async def refine_test(request: RefineTestRequest):
     """Refine a previously generated test based on feedback."""
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Verify session exists
@@ -774,7 +731,7 @@ async def refine_test(request: RefineTestRequest):
 
     # Run blocking operation in thread pool
     result = await run_in_executor(
-        orchestrator.refine_test,
+        graph_orchestrator.refine_test,
         request.session_id,
         request.feedback,
     )
@@ -856,10 +813,10 @@ async def get_index_stats(collection: Optional[str] = None):
     Query param ``collection`` lets you check a specific collection.
     If omitted, uses the default collection.
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    stats = await run_in_executor(orchestrator.rag.get_stats, collection)
+    stats = await run_in_executor(graph_orchestrator.rag.get_stats, collection)
     return stats.model_dump()
 
 
@@ -869,11 +826,11 @@ async def list_collections():
 
     Returns both Qdrant-side collections and the registry (repo_path mapping).
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     # Get collections from Qdrant
-    qdrant_collections = await run_in_executor(orchestrator.rag.list_collections)
+    qdrant_collections = await run_in_executor(graph_orchestrator.rag.list_collections)
 
     # Get registry from Redis/memory
     from utils.cache_service import get_cache_service
@@ -907,10 +864,10 @@ async def lookup_class(class_name: str, collection: Optional[str] = None):
     fields, record_components, usage_hint, used_types, has_builder, etc.
     Useful for debugging why the LLM generates wrong construction patterns.
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    rag = orchestrator.rag
+    rag = graph_orchestrator.rag
 
     # Tier 1: metadata scroll (guaranteed find)
     chunk = await run_in_executor(
@@ -1516,7 +1473,7 @@ async def chat_completions(request: ChatCompletionRequest):
     if file_path:
         enhanced_prompt = await _enrich_with_rag(user_content, file_path, resolved_collection)
 
-    effective_system = system_content or orchestrator.prompt_builder.build_system_prompt()
+    effective_system = system_content or graph_orchestrator.prompt_builder.build_system_prompt()
 
     # ── REAL STREAMING (Fix A) ───────────────────────────────────────
     if request.stream:
@@ -1528,7 +1485,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # ── Non-streaming ────────────────────────────────────────────────
     vllm_response = await run_in_executor(
-        lambda: orchestrator.vllm.generate(
+        lambda: graph_orchestrator.vllm.generate(
             system_prompt=effective_system,
             user_prompt=enhanced_prompt,
             temperature=request.temperature,
@@ -1615,7 +1572,7 @@ def _stream_test_generation(
 ) -> StreamingResponse:
     """Stream test generation with progress phases + token-by-token code.
 
-    Pipes ``orchestrator.generate_test_streaming()`` events directly as SSE:
+    Pipes ``graph_orchestrator.generate_test_streaming()`` events directly as SSE:
     - Phase status messages (planning, retrieving, validating) → full text deltas
     - Code tokens (generating) → individual token deltas
     - Done/Error → finish reason
@@ -1659,17 +1616,17 @@ def _stream_test_generation(
 
             if event.phase == StreamPhase.DONE:
                 # Append metadata block
-                meta = event.metadata
-                meta_lines = ["\n\n---"]
+                meta = event.metadata or {}
+                meta_lines = ["\n\n---\n"]
                 meta_lines.append(
-                    f"**Validation:** {'✅ passed' if meta.get('validation_passed') else '❌ failed'}"
+                    f"- **Validation:** {'✅ passed' if meta.get('validation_passed') else '❌ failed'}"
                 )
                 issues = meta.get("validation_issues", [])
                 if issues:
-                    meta_lines.append(f"**Issues:** {', '.join(issues[:5])}")
-                meta_lines.append(f"**RAG context chunks:** {meta.get('rag_chunks_used', 0)}")
-                meta_lines.append(f"**Tokens used:** {meta.get('tokens_used', 0)}")
-                meta_block = "\n".join(meta_lines)
+                    meta_lines.append(f"- **Issues:** {', '.join(issues[:5])}")
+                meta_lines.append(f"- **RAG context chunks:** {meta.get('rag_chunks_used', 0)}")
+                meta_lines.append(f"- **Tokens used:** {meta.get('tokens_used', 0)}")
+                meta_block = "\n".join(meta_lines) + "\n"
                 yield _sse_chunk(response_id, created_time, model,
                                  delta={"content": meta_block})
                 break
@@ -1681,7 +1638,7 @@ def _stream_test_generation(
             else:
                 # Phase status message — send as full content chunk
                 yield _sse_chunk(response_id, created_time, model,
-                                 delta={"content": event.content + "\n"})
+                                 delta={"content": event.content})
 
         # Finish
         yield _sse_chunk(response_id, created_time, model,
@@ -1719,7 +1676,7 @@ def _stream_from_vllm(
 
             def _run_sync_gen():
                 try:
-                    for delta_text in orchestrator.vllm.stream_generate(
+                    for delta_text in graph_orchestrator.vllm.stream_generate(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         temperature=temperature,
@@ -1777,6 +1734,7 @@ def _sse_chunk(
             "finish_reason": finish_reason,
         }],
     }
+    import json
     return f"data: {json.dumps(chunk)}\n\n"
 
 
@@ -1829,7 +1787,7 @@ async def _enrich_with_rag(
     class_name = file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
     try:
         search_result = await run_in_executor(
-            lambda: orchestrator.rag.search(
+            lambda: graph_orchestrator.rag.search(
                 SearchQuery(
                     query=f"{class_name} service methods dependencies",
                     top_k=5,
@@ -1899,17 +1857,17 @@ async def get_rag_context(
     Useful for debugging and transparency — lets callers see
     exactly what context the agent retrieves from the vector DB.
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     session = None
     if session_id:
         session = await run_in_executor(
-            orchestrator.memory_manager.get_session, session_id
+            graph_orchestrator.memory_manager.get_session, session_id
         )
 
     chunks = await run_in_executor(
-        orchestrator._get_rag_context, class_name, file_path, session
+        graph_orchestrator._get_rag_context, class_name, file_path, session
     )
     return chunks
 
@@ -1921,11 +1879,11 @@ async def get_rag_context(
 @app.get("/v1/agent/status")
 async def agent_status():
     """Get agent pipeline status and metrics (Phase 4 observability)."""
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    metrics_data = orchestrator.metrics.get_metrics() if orchestrator.metrics else {}
-    event_bus = orchestrator.event_bus
+    metrics_data = graph_orchestrator.metrics.get_metrics() if graph_orchestrator.metrics else {}
+    event_bus = graph_orchestrator.event_bus
 
     return {
         "status": "running",
@@ -1940,10 +1898,10 @@ async def agent_status():
 @app.get("/v1/agent/metrics")
 async def agent_metrics():
     """Get detailed agent metrics (Phase 4 observability)."""
-    if not orchestrator or not orchestrator.metrics:
+    if not graph_orchestrator or not graph_orchestrator.metrics:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    return orchestrator.metrics.get_metrics()
+    return graph_orchestrator.metrics.get_metrics()
 
 
 @app.get("/v1/agent/events/stream")
@@ -1956,7 +1914,7 @@ async def agent_event_stream():
     import asyncio
     import queue as queue_mod
 
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     event_queue: queue_mod.Queue = queue_mod.Queue(maxsize=100)
@@ -1975,7 +1933,7 @@ async def agent_event_stream():
             logger.debug("Event queue full, dropping event")
 
     # Subscribe to all events
-    orchestrator.event_bus.subscribe_all(_forward_to_queue)
+    graph_orchestrator.event_bus.subscribe_all(_forward_to_queue)
 
     async def _event_generator():
         nonlocal keepalive_counter
@@ -1995,8 +1953,8 @@ async def agent_event_stream():
         finally:
             # Cleanup: thread-safe unsubscribe via EventBus lock
             try:
-                with orchestrator.event_bus._lock:
-                    handlers = orchestrator.event_bus._wildcard_handlers
+                with graph_orchestrator.event_bus._lock:
+                    handlers = graph_orchestrator.event_bus._wildcard_handlers
                     if _forward_to_queue in handlers:
                         handlers.remove(_forward_to_queue)
             except Exception:
@@ -2033,13 +1991,13 @@ async def tabby_events(request: dict):
 @app.get("/v1/two-phase/status")
 async def two_phase_status():
     """Check if Two-Phase Strategy is enabled and get configuration."""
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
     return {
-        "enabled": orchestrator.is_two_phase_enabled(),
-        "domain_registry_available": orchestrator.domain_registry is not None,
-        "complexity_calculator_available": orchestrator.complexity_calculator is not None,
+        "enabled": graph_orchestrator.is_two_phase_enabled(),
+        "domain_registry_available": graph_orchestrator.domain_registry is not None,
+        "complexity_calculator_available": graph_orchestrator.complexity_calculator is not None,
     }
 
 
@@ -2052,11 +2010,11 @@ async def get_complexity(class_name: str, collection: Optional[str] = None):
     
     Example: GET /v1/complexity/OrderService?collection=my_project
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
     score, level = await run_in_executor(
-        orchestrator.get_complexity_score, class_name, collection
+        graph_orchestrator.get_complexity_score, class_name, collection
     )
     
     return {
@@ -2073,19 +2031,19 @@ async def registry_stats(collection: Optional[str] = None):
     
     Shows how many domain types are indexed and their construction patterns.
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
-    if not orchestrator.domain_registry:
+    if not graph_orchestrator.domain_registry:
         return {"error": "Domain registry not available"}
     
-    stats = orchestrator.domain_registry.get_stats(collection)
+    stats = graph_orchestrator.domain_registry.get_stats(collection)
     return {
         "total_types": stats.total_types,
         "by_pattern": stats.by_pattern,
         "by_java_type": stats.by_java_type,
         "build_time_ms": round(stats.build_time_ms, 1),
-        "cached": orchestrator.domain_registry.is_cached(collection),
+        "cached": graph_orchestrator.domain_registry.is_cached(collection),
     }
 
 
@@ -2095,11 +2053,11 @@ async def rebuild_registry(collection: Optional[str] = None):
     
     Call this after reindexing to ensure the registry is up-to-date.
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
     result = await run_in_executor(
-        orchestrator.rebuild_domain_registry, collection
+        graph_orchestrator.rebuild_domain_registry, collection
     )
     return result
 
@@ -2112,11 +2070,11 @@ async def registry_lookup(class_name: str, collection: Optional[str] = None):
     
     Example: GET /v1/registry/lookup/OrderRequest?collection=my_project
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
     result = await run_in_executor(
-        orchestrator.get_domain_type_info, class_name, collection
+        graph_orchestrator.get_domain_type_info, class_name, collection
     )
     return result
 
@@ -2134,16 +2092,16 @@ async def registry_prompt_section(
     
     Example: GET /v1/registry/prompt-section?class_names=OrderRequest,User,Order
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
-    if not orchestrator.domain_registry:
+    if not graph_orchestrator.domain_registry:
         return {"error": "Domain registry not available"}
     
     names = [n.strip() for n in class_names.split(",") if n.strip()]
     
     prompt_section = await run_in_executor(
-        orchestrator.domain_registry.get_prompt_section, names, collection
+        graph_orchestrator.domain_registry.get_prompt_section, names, collection
     )
     
     return {
@@ -2173,10 +2131,10 @@ async def pipeline_generate_two_phase(request: PipelineGenerateRequest):
             "collection": "my_project"
         }
     """
-    if not orchestrator:
+    if not graph_orchestrator:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
-    if not orchestrator.is_two_phase_enabled():
+    if not graph_orchestrator.is_two_phase_enabled():
         raise HTTPException(
             status_code=400,
             detail="Two-Phase Strategy is not enabled. Check server configuration."
@@ -2212,10 +2170,8 @@ class RunStatusResponse(BaseModel):
 
 
 def _get_orchestrator():
-    """Get the active orchestrator (graph or legacy)."""
-    if graph_orchestrator and not USE_LEGACY:
-        return graph_orchestrator
-    return orchestrator
+    """Get the active graph_orchestrator."""
+    return graph_orchestrator
 
 
 @app.post("/review/{run_id}")
