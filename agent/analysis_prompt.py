@@ -232,16 +232,26 @@ OUTPUT FORMAT: Valid JSON only, no markdown, no explanation."""
         source_code: str,
         class_name: str,
         file_path: str,
+        available_types: Optional[list[str]] = None,
     ) -> str:
         """Build the analysis prompt for Phase 1."""
         
+        available_types_section = ""
+        if available_types:
+            available_types_list = "\n".join(f"- {t}" for t in sorted(set(available_types)))
+            available_types_section = f"""
+## Available Types in Context
+(Only select domain types and constructor dependencies that appear in this list, or in the source code directly. Do NOT invent types that don't exist here.)
+{available_types_list}
+"""
+
         return f"""Analyze this Java service and output a JSON test plan.
 
 ## Service Source Code
 ```java
 {source_code}
 ```
-
+{available_types_section}
 ## Output JSON Schema
 {{
     "service_name": "{class_name}",

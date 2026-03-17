@@ -28,6 +28,7 @@ class GenerationRequest:
     force_two_phase: bool = False
     force_single_pass: bool = False
     complexity_threshold: int = 10
+    repo_path: Optional[str] = None
 
 
 @dataclass

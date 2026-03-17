@@ -159,67 +159,81 @@ class SnippetSelector:
 
         # Mock candidates → DEPENDENCY snippets
         for mock in ctx.mock_candidates:
-            chunk = rag_by_class.get(mock.field_type)
-            if chunk:
+            # 1. Try to get exact match from SymbolMap first (Highest Priority & Accuracy)
+            entry = self.symbols.lookup(mock.field_type) if self.symbols else None
+            if entry:
+                summary = self._entry_to_summary(entry)
                 snippets.append(Snippet(
-                    content=chunk.summary,
+                    content=summary,
                     role=SnippetRole.DEPENDENCY,
                     priority=PRIORITY_MAP[SnippetRole.DEPENDENCY],
                     class_name=mock.field_type,
-                    file_path=chunk.file_path,
+                    file_path=entry.file_path,
                     metadata={
                         "field_name": mock.field_name,
                         "is_interface": mock.is_interface,
-                        "fqn": mock.fqn,
+                        "origin": "symbol_map",
                     },
                 ))
-            elif self.symbols:
-                # No RAG chunk but we have the symbol entry
-                entry = self.symbols.lookup(mock.field_type)
-                if entry:
-                    summary = self._entry_to_summary(entry)
+            else:
+                # 2. Fallback to RAG chunk if AST parsing didn't find it (e.g., external library)
+                chunk = rag_by_class.get(mock.field_type)
+                if chunk:
                     snippets.append(Snippet(
-                        content=summary,
+                        content=chunk.summary,
                         role=SnippetRole.DEPENDENCY,
                         priority=PRIORITY_MAP[SnippetRole.DEPENDENCY],
                         class_name=mock.field_type,
-                        file_path=entry.file_path,
+                        file_path=chunk.file_path,
                         metadata={
                             "field_name": mock.field_name,
                             "is_interface": mock.is_interface,
-                            "origin": "symbol_map",
+                            "fqn": mock.fqn,
+                            "origin": "rag",
                         },
                     ))
 
         # Related types → DOMAIN_TYPE snippets
         for related in ctx.related_types:
-            chunk = rag_by_class.get(related.name)
-            content = chunk.summary if chunk else self._entry_to_summary(related)
-            file_path = chunk.file_path if chunk else related.file_path
+            # Prioritize SymbolMap over RAG for accurate domain types
+            content = self._entry_to_summary(related)
             snippets.append(Snippet(
                 content=content,
                 role=SnippetRole.DOMAIN_TYPE,
                 priority=PRIORITY_MAP[SnippetRole.DOMAIN_TYPE],
                 class_name=related.name,
-                file_path=file_path,
+                file_path=related.file_path,
                 metadata={
                     "java_type": related.java_type,
                     "has_builder": related.has_builder,
                     "has_data": related.has_data,
+                    "origin": "symbol_map",
                 },
             ))
 
         # Target class summary from RAG (if no inline source)
-        target_chunk = rag_by_class.get(ctx.target_class)
-        if target_chunk:
+        # Often the target class source is injected in line 111, but if we need a summary:
+        entry = self.symbols.lookup(ctx.target_class) if self.symbols else None
+        if entry:
             snippets.append(Snippet(
-                content=target_chunk.summary,
+                content=self._entry_to_summary(entry),
                 role=SnippetRole.SUMMARY,
-                priority=PRIORITY_MAP[SnippetRole.SOURCE] + 5,  # Just below source
+                priority=PRIORITY_MAP[SnippetRole.SOURCE] + 5,
                 class_name=ctx.target_class,
-                file_path=target_chunk.file_path,
-                metadata={"origin": "rag"},
+                file_path=entry.file_path,
+                metadata={"origin": "symbol_map"},
             ))
+        else:
+            target_chunk = rag_by_class.get(ctx.target_class)
+            if target_chunk:
+                snippets.append(Snippet(
+                    content=target_chunk.summary,
+                    role=SnippetRole.SUMMARY,
+                    priority=PRIORITY_MAP[SnippetRole.SOURCE] + 5,  # Just below source
+                    class_name=ctx.target_class,
+                    file_path=target_chunk.file_path,
+                    metadata={"origin": "rag"},
+                ))
 
         return snippets
 

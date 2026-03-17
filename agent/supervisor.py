@@ -1,117 +1,119 @@
-"""
-Supervisor — intent classifier for the agent.
-
-Uses regex/keyword matching (no LLM overhead) to classify user intent
-and route to the appropriate subgraph.
-
-Currently supports:
-  - unit_test (default) — generate JUnit5+Mockito tests
-
-Future (placeholders):
-  - code_review — analyze code quality
-  - refactor — suggest refactoring
-  - doc_gen — generate documentation
-"""
-
-from __future__ import annotations
-
+import json
 import re
+from typing import Any, Dict, List, Optional
 
 import structlog
+from agent.tools import ToolManager, list_files, grep_search, read_file
+from agent.prompt import TemplateEngine
 
 logger = structlog.get_logger()
 
+# ── Tool Setup ──────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════
-# Intent patterns (regex, case-insensitive)
-# ═══════════════════════════════════════════════════════════════════════
+def create_discovery_tools() -> ToolManager:
+    """Create and register discovery tools."""
+    manager = ToolManager()
+    manager.register_tool("list_files", list_files)
+    manager.register_tool("grep_search", grep_search)
+    manager.register_tool("read_file", read_file)
+    return manager
 
-INTENT_PATTERNS: dict[str, list[str]] = {
-    "unit_test": [
-        r"test",
-        r"junit",
-        r"mock",
-        r"unit\s*test",
-        r"generate.*test",
-        r"gen.*test",
-        r"write.*test",
-        r"create.*test",
-    ],
-    "code_review": [
-        r"review",
-        r"check.*code",
-        r"analyze.*quality",
-        r"code.*review",
-    ],
-    "refactor": [
-        r"refactor",
-        r"clean.*up",
-        r"restructure",
-        r"improve.*code",
-    ],
-    "doc_gen": [
-        r"document",
-        r"javadoc",
-        r"readme",
-        r"generate.*doc",
-    ],
-}
+# ── Agentic Supervisor ──────────────────────────────────────────────────
 
-
-def classify_intent(user_input: str) -> str:
-    """Classify user intent from input text.
-
-    Uses regex pattern matching — no LLM call needed.
-    Default: "unit_test" (backward compatible).
-
-    Args:
-        user_input: User's request text.
-
-    Returns:
-        Intent string: "unit_test", "code_review", "refactor", "doc_gen", or "unknown".
-    """
-    if not user_input:
-        return "unit_test"  # default
-
-    text = user_input.lower().strip()
-
-    # Score each intent by number of matching patterns
-    scores: dict[str, int] = {}
-    for intent, patterns in INTENT_PATTERNS.items():
-        score = 0
-        for pattern in patterns:
-            if re.search(pattern, text, re.IGNORECASE):
-                score += 1
-        if score > 0:
-            scores[intent] = score
-
-    if not scores:
-        # Default to unit_test for backward compatibility
-        return "unit_test"
-
-    # Return intent with highest score
-    best = max(scores, key=scores.get)
-    logger.debug(
-        "supervisor: classified intent",
-        intent=best,
-        scores=scores,
-        input_preview=text[:80],
-    )
-    return best
-
-
-def supervisor_node(state: dict) -> dict:
-    """Supervisor node — classifies intent and prepares routing.
+async def supervisor_node(
+    state: dict,
+    *,
+    vllm_client,
+    template_engine: Optional[TemplateEngine] = None,
+) -> dict:
+    """Agentic Supervisor — uses LLM + Tools to understand intent and codebase.
 
     Args:
         state: AgentState dict.
+        vllm_client: VLLMClient for LLM calls.
+        template_engine: TemplateEngine for prompts.
 
     Returns:
-        State updates: intent.
+        State updates: intent, discovery_context, and any parameters.
     """
     user_input = state.get("user_input", "")
-    intent = classify_intent(user_input)
+    if not user_input:
+        return {"intent": "unit_test"}
 
-    logger.info("supervisor_node: intent classified", intent=intent)
+    if template_engine is None:
+        template_engine = TemplateEngine()
 
-    return {"intent": intent}
+    tools = create_discovery_tools()
+    
+    logger.info("supervisor_node: starting agentic discovery", input_preview=user_input[:50])
+
+    # Initial prompt rendering
+    prompt = template_engine.render(
+        "supervisor_prompt.jinja2",
+        user_input=user_input,
+        current_context=state.get("discovery_context", {})
+    )
+
+    # Tool calling loop (max 3 iterations for discovery)
+    discovery_context = {}
+    intent = "unit_test"
+    params = {}
+
+    for i in range(3):
+        logger.debug("supervisor_node: llm call", iteration=i)
+        
+        # Note: We need a way to pass tools to agenerate.
+        # For now, we'll use a simplified loop where the LLM can ask for a tool.
+        # In a real system, we'd use the VLLM tool-calling API.
+        
+        response = await vllm_client.agenerate(
+            system_prompt="You are a helpful assistant.",
+            user_prompt=prompt
+        )
+
+        try:
+            # Try to parse JSON from the response
+            # Note: This is a simplification. Real tool-calling would use dedicated API.
+            clean_response = _extract_json(response)
+            if not clean_response:
+                logger.warning("supervisor_node: failed to extract JSON", response=response)
+                break
+            
+            data = json.loads(clean_response)
+            
+            # Check if it wants to call a tool (manual simulation for now)
+            if "tool_call" in data:
+                tool_name = data["tool_call"]["name"]
+                tool_args = data["tool_call"]["parameters"]
+                
+                logger.info("supervisor_node: executing discovery tool", tool=tool_name)
+                result = await tools.acall_tool(tool_name, **tool_args)
+                
+                # Feed back to loop
+                prompt += f"\n\nTool Result ({tool_name}):\n{result}"
+                continue
+            
+            # Final result
+            discovery_context = data.get("discovery_context", {})
+            intent = data.get("intent", "unit_test")
+            params = data.get("parameters", {})
+            break
+
+        except Exception as e:
+            logger.error("supervisor_node: loop error", error=str(e))
+            break
+
+    logger.info("supervisor_node: finished", intent=intent, discovered_files=len(discovery_context.get("relevant_files", [])))
+
+    # Merge params into state updates
+    updates = {
+        "intent": intent,
+        "discovery_context": discovery_context,
+    }
+    updates.update(params)
+    return updates
+
+def _extract_json(text: str) -> Optional[str]:
+    """Extract JSON block from LLM text."""
+    match = re.search(r"({.*})", text, re.DOTALL)
+    return match.group(1) if match else None

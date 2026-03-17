@@ -23,7 +23,7 @@ from .metrics import MetricsCollector
 
 # ── LangGraph Architecture ──
 from .state import AgentState, UnitTestState
-from .supervisor import classify_intent, supervisor_node
+from .supervisor import supervisor_node
 from .graph import create_agent_graph
 from .graph_adapter import GraphOrchestrator, create_graph_orchestrator
 

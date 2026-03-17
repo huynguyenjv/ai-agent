@@ -9,8 +9,9 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Optional, Literal
+from typing import Optional, Literal, TypeVar, Callable, Any
 
 import structlog
 from dotenv import load_dotenv
@@ -132,7 +133,7 @@ class ChatCompletionRequest(BaseModel):
     force_two_phase: Optional[bool] = False
     force_single_pass: Optional[bool] = False
     complexity_threshold: Optional[int] = 10
-
+    
     @field_validator("force_two_phase", "force_single_pass", mode="before")
     @classmethod
     def _coerce_bool(cls, v):
@@ -245,7 +246,7 @@ class ReindexRequest(BaseModel):
             "Qdrant collection name. If omitted, auto-derived from repo folder name "
             "(e.g. 'vtrip.core.iam' → 'vtrip_core_iam')."
         ),
-    )
+    )   
 
 
 class ReindexResponse(BaseModel):
@@ -329,6 +330,40 @@ def _resolve_collection(
     return os.getenv("QDRANT_COLLECTION", "java_codebase")
 
 
+def _resolve_repo_path(
+    workspace_path: Optional[str] = None,
+    collection: Optional[str] = None,
+    file_path: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the repository root path (3-tier fallback).
+
+    1. Explicit workspace_path from IDE
+    2. Lookup registry by collection name
+    3. Fallback to JAVA_REPO_PATH env var
+    """
+    # Tier 1: Explicit workspace path (IDE context)
+    if workspace_path and os.path.isdir(workspace_path):
+        return workspace_path
+
+    from utils.cache_service import get_cache_service
+    cache = get_cache_service()
+
+    # Tier 2: Registry lookup
+    reg_coll = collection
+    if not reg_coll and file_path:
+        reg_coll = cache.resolve_collection_by_path(file_path)
+    
+    if reg_coll:
+        registry = cache.get_collection_registry()
+        if reg_coll in registry:
+            rp = registry[reg_coll].get("repo_path")
+            if rp and os.path.isdir(rp):
+                return rp
+
+    # Tier 3: Default env var
+    return os.getenv("JAVA_REPO_PATH")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -351,7 +386,7 @@ async def lifespan(app: FastAPI):
     )
 
     # Initialize LangGraph graph_orchestrator
-    graph_orchestrator = create_graph_orchestrator()
+    graph_orchestrator = await create_graph_orchestrator()
     index_builder = create_index_builder()
 
     # Phase 4: metrics collector
@@ -427,7 +462,9 @@ _active_tasks: int = 0
 _active_tasks_lock = __import__("threading").Lock()
 
 
-async def run_in_executor(func, *args):
+T = TypeVar('T')
+
+async def run_in_executor(func: Callable[..., T], *args: Any) -> T:
     """Run a blocking function in the thread pool with timeout."""
     global _active_tasks
     loop = asyncio.get_running_loop()
@@ -699,9 +736,11 @@ async def generate_test(request: GenerateTestRequest):
     gen_request = GenerationRequest(
         file_path=request.file_path,
         task_description=task_description_with_source,
+        force_two_phase=True,
+        force_single_pass=False,
     )
 
-    result = await run_in_executor(active.generate_test, gen_request)
+    result = await active.generate_test(gen_request)
 
     return GenerateTestResponse(
         success=result.success,
@@ -870,16 +909,12 @@ async def lookup_class(class_name: str, collection: Optional[str] = None):
     rag = graph_orchestrator.rag
 
     # Tier 1: metadata scroll (guaranteed find)
-    chunk = await run_in_executor(
-        rag._scroll_by_class_name, class_name, "class", collection,
-    )
+    chunk = await rag._ascroll_by_class_name(class_name, "class", collection)
     lookup_method = "scroll"
 
     # Tier 2: semantic search fallback
     if not chunk:
-        result = await run_in_executor(
-            rag.search_by_class, class_name, 1, False, collection,
-        )
+        result = await rag.asearch_by_class(class_name, 1, False, collection)
         chunk = result.chunks[0] if result.chunks else None
         lookup_method = "semantic"
 
@@ -1174,12 +1209,12 @@ async def pipeline_generate(request: PipelineGenerateRequest):
             file_path=request.file_path,
         ),
         source_code=request.source_code,
-        force_two_phase=request.force_two_phase,
-        force_single_pass=request.force_single_pass,
+        force_two_phase=True,
+        force_single_pass=False,
         complexity_threshold=request.complexity_threshold,
     )
 
-    result = await run_in_executor(active.generate_test, gen_request)
+    result = await active.generate_test(gen_request)
 
     return PipelineGenerateResponse(
         success=result.success,
@@ -1258,9 +1293,11 @@ async def pipeline_generate_batch(request: PipelineBatchRequest):
                     file_path=file_req.file_path,
                 ),
                 source_code=file_req.source_code,
+                force_two_phase=True,
+                force_single_pass=False,
             )
 
-            result = await run_in_executor(active.generate_test, gen_request)
+            result = await active.generate_test(gen_request)
 
             results.append(PipelineBatchItemResult(
                 file_path=file_req.file_path,
@@ -1401,13 +1438,22 @@ async def chat_completions(request: ChatCompletionRequest):
     if not file_path:
         file_path = _extract_java_file_path_from_message(user_content)
 
-    # ── Resolve Qdrant collection (3-tier) ───────────────────────────
+    # ── Resolve Repository and Collection (3-tier) ───────────────────
     resolved_collection = _resolve_collection(
         explicit=request.collection,
         file_path=file_path,
         workspace_path=request.workspace_path,
     )
-    logger.debug("Resolved collection", collection=resolved_collection)
+    resolved_repo_path = _resolve_repo_path(
+        workspace_path=request.workspace_path,
+        collection=resolved_collection,
+        file_path=file_path,
+    )
+    logger.info(
+        "Resolved context",
+        collection=resolved_collection,
+        repo_path=resolved_repo_path,
+    )
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created_time = int(time.time())
@@ -1434,34 +1480,17 @@ async def chat_completions(request: ChatCompletionRequest):
             task_description=user_content,
             collection_name=resolved_collection,
             source_code=source_code,
-            # Two-Phase Strategy options
-            force_two_phase=request.force_two_phase or False,
-            force_single_pass=request.force_single_pass or False,
+            repo_path=resolved_repo_path,
+            # Two-Phase Strategy: always on
+            force_two_phase=True,
+            force_single_pass=False,
             complexity_threshold=request.complexity_threshold or 10,
         )
 
         # ── REAL STREAMING: progress phases + token-by-token code ────
-        if request.stream:
-            return _stream_test_generation(
-                response_id, created_time, request.model, gen_request,
-            )
-
-        # ── Non-streaming: run full pipeline, return complete result ─
-        result = await run_in_executor(active.generate_test, gen_request)
-
-        if result.success:
-            response_content = result.test_code or ""
-            tokens_used = result.tokens_used
-        else:
-            response_content = f"Error generating test: {result.error}"
-            tokens_used = 0
-
-        meta_block = _build_metadata_block(result)
-        full_content = f"{response_content}\n\n{meta_block}" if meta_block else response_content
-
-        return _non_streaming_response(
-            response_id, created_time, request.model,
-            full_content, user_content, tokens_used,
+        # Chat completions always stream; ignore request.stream here.
+        return _stream_test_generation(
+            response_id, created_time, request.model, gen_request,
         )
 
     # ═════════════════════════════════════════════════════════════════
@@ -1473,36 +1502,14 @@ async def chat_completions(request: ChatCompletionRequest):
     if file_path:
         enhanced_prompt = await _enrich_with_rag(user_content, file_path, resolved_collection)
 
-    effective_system = system_content or graph_orchestrator.prompt_builder.build_system_prompt()
+    effective_system = system_content or active.prompt_builder.build_system_prompt()
 
-    # ── REAL STREAMING (Fix A) ───────────────────────────────────────
-    if request.stream:
-        return _stream_from_vllm(
-            response_id, created_time, request.model,
-            effective_system, enhanced_prompt,
-            request.temperature, request.max_tokens,
-        )
-
-    # ── Non-streaming ────────────────────────────────────────────────
-    vllm_response = await run_in_executor(
-        lambda: graph_orchestrator.vllm.generate(
-            system_prompt=effective_system,
-            user_prompt=enhanced_prompt,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
-    )
-
-    if vllm_response.success:
-        response_content = vllm_response.content
-        tokens_used = vllm_response.tokens_used
-    else:
-        response_content = f"Error: {vllm_response.error}"
-        tokens_used = 0
-
-    return _non_streaming_response(
+    # ── REAL STREAMING ───────────────────────────────────────────────
+    # Chat completions always stream; ignore request.stream here.
+    return _stream_from_vllm(
         response_id, created_time, request.model,
-        response_content, user_content, tokens_used,
+        effective_system, enhanced_prompt,
+        request.temperature, request.max_tokens,
     )
 
 
@@ -1585,60 +1592,47 @@ def _stream_test_generation(
         yield _sse_chunk(response_id, created_time, model,
                          delta={"role": "assistant", "content": ""})
 
-        # Run the sync generator in a thread, ferry events via asyncio.Queue
-        queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        active = _get_orchestrator()
+        if not active:
+            yield _sse_chunk(response_id, created_time, model,
+                             delta={"content": "\n\n❌ Error: Service not initialized"})
+            return
 
-        def _run_sync():
-            try:
-                active = _get_orchestrator()
-                for event in active.generate_test_streaming(gen_request):
-                    loop.call_soon_threadsafe(queue.put_nowait, event)
-            except Exception as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    StreamEvent(phase=StreamPhase.ERROR, content=f"Error: {exc}"),
-                )
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+        try:
+            async for event in active.generate_test_streaming(gen_request):
+                if event.phase == StreamPhase.ERROR:
+                    yield _sse_chunk(response_id, created_time, model,
+                                     delta={"content": f"\n\n❌ {event.content}"})
+                    break
 
-        loop.run_in_executor(None, _run_sync)
+                if event.phase == StreamPhase.DONE:
+                    # Append metadata block
+                    meta = event.metadata or {}
+                    meta_lines = ["\n\n----- \n"]
+                    meta_lines.append(
+                        f"- **Validation:** {'✅ passed' if meta.get('validation_passed') else '❌ failed'}"
+                    )
+                    issues: list[str] = meta.get("validation_issues", [])
+                    if issues:
+                        meta_lines.append(f"- **Issues:** {', '.join(issues[:5])}")
+                    meta_lines.append(f"- **RAG context chunks:** {meta.get('rag_chunks_used', 0)}")
+                    meta_lines.append(f"- **Tokens used:** {meta.get('tokens_used', 0)}")
+                    meta_block = "\n".join(meta_lines) + "\n"
+                    yield _sse_chunk(response_id, created_time, model,
+                                     delta={"content": meta_block})
+                    break
 
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-
-            if event.phase == StreamPhase.ERROR:
-                yield _sse_chunk(response_id, created_time, model,
-                                 delta={"content": f"\n\n❌ {event.content}"})
-                break
-
-            if event.phase == StreamPhase.DONE:
-                # Append metadata block
-                meta = event.metadata or {}
-                meta_lines = ["\n\n---\n"]
-                meta_lines.append(
-                    f"- **Validation:** {'✅ passed' if meta.get('validation_passed') else '❌ failed'}"
-                )
-                issues = meta.get("validation_issues", [])
-                if issues:
-                    meta_lines.append(f"- **Issues:** {', '.join(issues[:5])}")
-                meta_lines.append(f"- **RAG context chunks:** {meta.get('rag_chunks_used', 0)}")
-                meta_lines.append(f"- **Tokens used:** {meta.get('tokens_used', 0)}")
-                meta_block = "\n".join(meta_lines) + "\n"
-                yield _sse_chunk(response_id, created_time, model,
-                                 delta={"content": meta_block})
-                break
-
-            if event.delta:
-                # Token-by-token code delta — forward directly
-                yield _sse_chunk(response_id, created_time, model,
-                                 delta={"content": event.content})
-            else:
-                # Phase status message — send as full content chunk
-                yield _sse_chunk(response_id, created_time, model,
-                                 delta={"content": event.content})
+                if event.delta:
+                    # Token-by-token code delta — forward directly
+                    yield _sse_chunk(response_id, created_time, model,
+                                     delta={"content": event.content})
+                else:
+                    # Phase status message — send as full content chunk
+                    yield _sse_chunk(response_id, created_time, model,
+                                     delta={"content": event.content})
+        except Exception as exc:
+             yield _sse_chunk(response_id, created_time, model,
+                              delta={"content": f"\n\n❌ Error: {exc}"})
 
         # Finish
         yield _sse_chunk(response_id, created_time, model,
@@ -1784,17 +1778,19 @@ async def _enrich_with_rag(
     collection_name: Optional[str] = None,
 ) -> str:
     """Add RAG context to the prompt for general chat."""
+    active = _get_orchestrator()
+    if not active:
+        return user_content
+        
     class_name = file_path.replace("\\", "/").split("/")[-1].replace(".java", "")
     try:
-        search_result = await run_in_executor(
-            lambda: graph_orchestrator.rag.search(
-                SearchQuery(
-                    query=f"{class_name} service methods dependencies",
-                    top_k=5,
-                    score_threshold=0.4,
-                ),
-                collection_name=collection_name,
-            )
+        search_result = await active.rag.asearch(
+            SearchQuery(
+                query=f"{class_name} service methods dependencies",
+                top_k=5,
+                score_threshold=0.4,
+            ),
+            collection_name=collection_name,
         )
         if search_result.chunks:
             rag_context = "\n\n## Codebase Context:\n"
@@ -2186,14 +2182,11 @@ async def submit_review(run_id: str, request: ReviewRequest):
             detail="Human review requires LangGraph backend. Set USE_LEGACY_ORCHESTRATOR=false.",
         )
 
-    def _do_review():
-        return graph_orchestrator.submit_review(
-            run_id=run_id,
-            approved=request.approved,
-            feedback=request.feedback,
-        )
-
-    result = await run_in_executor(_do_review)
+    result = await graph_orchestrator.submit_review(
+        run_id=run_id,
+        approved=request.approved,
+        feedback=request.feedback,
+    )
     return {
         "success": result.success,
         "test_code": result.test_code,
@@ -2212,7 +2205,7 @@ async def get_run_status(run_id: str):
             detail="Run tracking requires LangGraph backend.",
         )
 
-    state = graph_orchestrator.get_run_state(run_id)
+    state = await graph_orchestrator.get_run_state(run_id)
     if not state:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
