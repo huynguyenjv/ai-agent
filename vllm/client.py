@@ -179,14 +179,17 @@ class VLLMClient:
             "stream": stream,
         }
 
-        # ── LOG FULL PROMPT ──────────────────────────────────────────
-        logger.info("--- vLLM REQUEST START ---")
-        logger.info(f"SYSTEM: {system_prompt[:500]}..." if len(system_prompt) > 500 else f"SYSTEM: {system_prompt}")
-        logger.info(f"USER: {user_prompt[:500]}..." if len(user_prompt) > 500 else f"USER: {user_prompt}")
-        # Log full for easy copy-paste
-        logger.info(f"FULL_SYSTEM_PROMPT: {system_prompt}")
-        logger.info(f"FULL_USER_PROMPT: {user_prompt}")
-        logger.info("--- vLLM REQUEST END ---")
+        # ── LOG PROMPT METADATA (avoid dumping full prompt for perf) ──
+        logger.info(
+            "vLLM request",
+            system_len=len(system_prompt),
+            user_len=len(user_prompt),
+            model=self.model,
+            temperature=temperature or self.temperature,
+            max_tokens=max_tokens or self.max_tokens,
+        )
+        logger.debug(f"SYSTEM: {system_prompt[:300]}..." if len(system_prompt) > 300 else f"SYSTEM: {system_prompt}")
+        logger.debug(f"USER: {user_prompt[:300]}..." if len(user_prompt) > 300 else f"USER: {user_prompt}")
 
         last_error: Optional[str] = None
 
@@ -385,11 +388,13 @@ class VLLMClient:
             "stream": True,
         }
 
-        # ── LOG FULL PROMPT (STREAMING) ──────────────────────────────
-        logger.info("--- vLLM STREAMING REQUEST START ---")
-        logger.info(f"FULL_SYSTEM_PROMPT: {system_prompt}")
-        logger.info(f"FULL_USER_PROMPT: {user_prompt}")
-        logger.info("--- vLLM STREAMING REQUEST END ---")
+        # ── LOG PROMPT METADATA (avoid dumping full prompt for perf) ──
+        logger.info(
+            "vLLM streaming request",
+            system_len=len(system_prompt),
+            user_len=len(user_prompt),
+            model=self.model,
+        )
 
         with self.client.stream(
             "POST",

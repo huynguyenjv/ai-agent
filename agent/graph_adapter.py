@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Generator, AsyncGenerator, cast
@@ -329,17 +330,76 @@ class GraphOrchestrator:
     }
 
     _NODE_MSG_MAP = {
-        "supervisor": "🔍 Classifying request intent...",
+        "supervisor": "🔍 Analyzing request...",
         "retrieve": "📚 Retrieving RAG context...",
-        "check_strategy": "🧮 Evaluating complexity and choosing strategy...",
+        "check_strategy": "🧮 Evaluating complexity...",
         "analyze": "🔬 Phase 1: Analyzing service structure...",
         "build_prompt": "📝 Building generation prompt...",
         "call_llm": "🤖 Generating test code...",
-        "validate": "✅ Running 7-pass validation...",
+        "validate": "✅ Validating generated code...",
         "repair": "🔧 Repairing validation issues...",
         "human_review": "👤 Submitting for review...",
         "save_result": "💾 Saving result...",
     }
+
+    # Steps in expected order for progress indicator
+    _NODE_ORDER = [
+        "supervisor", "retrieve", "check_strategy", "analyze",
+        "build_prompt", "call_llm", "validate", "repair", "save_result",
+    ]
+
+    @staticmethod
+    def _build_stream_msg(
+        node_name: str,
+        state_update: dict,
+        step: int,
+        total_steps: int,
+        class_name: str = "",
+        elapsed_ms: float = 0,
+        repair_count: int = 0,
+    ) -> str:
+        """Build rich, context-aware streaming message for a node."""
+        prefix = f"[{step}/{total_steps}]"
+        elapsed_str = f" ({elapsed_ms:.0f}ms)" if elapsed_ms > 0 else ""
+
+        if node_name == "supervisor":
+            return f"🔍 {prefix} Analyzing request for `{class_name}`..."
+        elif node_name == "retrieve":
+            chunks = state_update.get("rag_chunks", [])
+            n_chunks = len(chunks) if chunks else "?"
+            return f"📚 {prefix} Retrieved {n_chunks} RAG context chunks{elapsed_str}"
+        elif node_name == "check_strategy":
+            strategy = state_update.get("strategy", "single_pass")
+            complexity = state_update.get("complexity_score", 0)
+            icon = "🔄" if strategy == "two_phase" else "⚡"
+            label = "Two-Phase" if strategy == "two_phase" else "Single Pass"
+            score_str = f"Complexity: {complexity} → " if complexity else ""
+            return f"🧮 {prefix} {score_str}Strategy: {icon} {label}{elapsed_str}"
+        elif node_name == "analyze":
+            return f"🔬 {prefix} Analyzing `{class_name}` structure{elapsed_str}"
+        elif node_name == "build_prompt":
+            prompt_len = len(state_update.get("user_prompt", "") or "")
+            token_hint = f" (~{prompt_len // 4:,} tokens)" if prompt_len > 0 else ""
+            return f"📝 {prefix} Built generation prompt{token_hint}{elapsed_str}"
+        elif node_name == "call_llm":
+            return f"🤖 {prefix} Generating test code...{elapsed_str}"
+        elif node_name == "validate":
+            passed = state_update.get("validation_passed", None)
+            issues = state_update.get("validation_issues", [])
+            if passed is True:
+                return f"✅ {prefix} Validation passed{elapsed_str}"
+            elif passed is False:
+                n_issues = len(issues) if issues else "?"
+                return f"⚠️ {prefix} Validation found {n_issues} issue(s){elapsed_str}"
+            return f"✅ {prefix} Validating generated code..."
+        elif node_name == "repair":
+            issues = state_update.get("validation_issues", [])
+            n_issues = len(issues) if issues else "?"
+            return f"🔧 {prefix} Repair attempt {repair_count} — fixing {n_issues} issue(s){elapsed_str}"
+        elif node_name == "save_result":
+            return f"💾 {prefix} Done!{elapsed_str}"
+        else:
+            return f"⏳ {prefix} {node_name}{elapsed_str}"
 
     async def generate_test_streaming(self, request) -> AsyncGenerator[StreamEvent]:
         """Stream test generation via LangGraph's .astream() API.
@@ -359,6 +419,11 @@ class GraphOrchestrator:
         test_code = ""
         final_error = None
         strategy_used = "single_pass"
+        complexity_score = 0
+        repair_count = 0
+        step_counter = 0
+        stream_start = time.time()
+        last_step_time = stream_start
 
         try:
             async for event in self._graph.astream(
@@ -384,16 +449,12 @@ class GraphOrchestrator:
                         continue
 
                     phase = self._NODE_PHASE_MAP.get(node_name, StreamPhase.PLANNING)
-                    msg = self._NODE_MSG_MAP.get(node_name, f"Running {node_name}...")
+                    step_counter += 1
+                    now = time.time()
+                    step_elapsed_ms = (now - last_step_time) * 1000
+                    last_step_time = now
 
-                    # Emit progress message
-                    yield StreamEvent(
-                        phase=phase,
-                        content=f"> {msg}\n\n",
-                        delta=False,
-                    )
-
-                    # Track key state values as they flow through
+                    # Track key state values BEFORE building message
                     if "rag_chunks" in state_update and state_update["rag_chunks"]:
                         rag_chunks_used = len(state_update["rag_chunks"])
 
@@ -403,6 +464,9 @@ class GraphOrchestrator:
                     if "strategy" in state_update and state_update["strategy"]:
                         strategy_used = state_update["strategy"]
 
+                    if "complexity_score" in state_update:
+                        complexity_score = state_update.get("complexity_score", 0) or 0
+
                     if "validation_passed" in state_update:
                         validation_passed = state_update["validation_passed"]
 
@@ -411,6 +475,25 @@ class GraphOrchestrator:
 
                     if "error" in state_update and state_update["error"]:
                         final_error = state_update["error"]
+
+                    if node_name == "repair":
+                        repair_count += 1
+
+                    # Build dynamic progress message
+                    total_steps = len(self._NODE_ORDER)
+                    msg = self._build_stream_msg(
+                        node_name, state_update, step_counter, total_steps,
+                        class_name=class_name,
+                        elapsed_ms=step_elapsed_ms if step_counter > 1 else 0,
+                        repair_count=repair_count,
+                    )
+
+                    # Emit progress message
+                    yield StreamEvent(
+                        phase=phase,
+                        content=f"> {msg}\n\n",
+                        delta=False,
+                    )
 
                     # When call_llm finishes, stream the generated code
                     if node_name == "call_llm" and "test_code" in state_update:
@@ -459,6 +542,7 @@ class GraphOrchestrator:
                             )
 
             # Done — emit final event with metadata
+            total_elapsed_ms = (time.time() - stream_start) * 1000
             if final_error:
                 yield StreamEvent(
                     phase=StreamPhase.ERROR,
@@ -475,6 +559,9 @@ class GraphOrchestrator:
                         "tokens_used": tokens_used,
                         "class_name": class_name,
                         "strategy_used": strategy_used,
+                        "complexity_score": complexity_score,
+                        "repair_attempts": repair_count,
+                        "elapsed_ms": round(total_elapsed_ms),
                     },
                 )
 

@@ -1608,15 +1608,41 @@ def _stream_test_generation(
                 if event.phase == StreamPhase.DONE:
                     # Append metadata block
                     meta = event.metadata or {}
-                    meta_lines = ["\n\n----- \n"]
+                    meta_lines = ["\n\n---\n"]
+
+                    # Strategy & complexity
+                    strategy = meta.get("strategy_used", "single_pass")
+                    if strategy == "two_phase":
+                        meta_lines.append("- **Strategy:** 🔄 Two-Phase Generation")
+                    else:
+                        meta_lines.append("- **Strategy:** ⚡ Single Pass")
+                    complexity = meta.get("complexity_score", 0)
+                    if complexity:
+                        meta_lines.append(f"- **Complexity:** {complexity}")
+
+                    # Validation
                     meta_lines.append(
                         f"- **Validation:** {'✅ passed' if meta.get('validation_passed') else '❌ failed'}"
                     )
                     issues: list[str] = meta.get("validation_issues", [])
                     if issues:
                         meta_lines.append(f"- **Issues:** {', '.join(issues[:5])}")
-                    meta_lines.append(f"- **RAG context chunks:** {meta.get('rag_chunks_used', 0)}")
+
+                    # Repairs
+                    repairs = meta.get("repair_attempts", 0)
+                    if repairs:
+                        meta_lines.append(f"- **Repair attempts:** {repairs}")
+
+                    # RAG & tokens
+                    meta_lines.append(f"- **RAG chunks:** {meta.get('rag_chunks_used', 0)}")
                     meta_lines.append(f"- **Tokens used:** {meta.get('tokens_used', 0)}")
+
+                    # Elapsed time
+                    elapsed = meta.get("elapsed_ms", 0)
+                    if elapsed:
+                        elapsed_s = elapsed / 1000
+                        meta_lines.append(f"- **Total time:** {elapsed_s:.1f}s")
+
                     meta_block = "\n".join(meta_lines) + "\n"
                     yield _sse_chunk(response_id, created_time, model,
                                      delta={"content": meta_block})

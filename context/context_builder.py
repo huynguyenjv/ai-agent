@@ -113,6 +113,10 @@ class ContextBuilder:
         self._analyzer: Optional[object] = None
         self._intelligence_ready = False
 
+        # Reusable components (avoid re-creation per call)
+        self._selector = SnippetSelector()
+        self._optimizer = TokenOptimizer(token_budget=token_budget)
+
     # ── Intelligence initialization ──────────────────────────────────
 
     def init_intelligence(self, repo_path: Optional[str] = None) -> bool:
@@ -142,6 +146,12 @@ class ContextBuilder:
             self._symbols = SymbolMap.build(self._snapshot)
             self._analyzer = DependencyAnalyzer(self._graph, self._symbols, self._snapshot)
             self._intelligence_ready = True
+
+            # Update selector with intelligence components
+            self._selector = SnippetSelector(
+                analyzer=self._analyzer,
+                symbols=self._symbols,
+            )
 
             elapsed = (time.time() - start) * 1000
             summary = self._snapshot.get_summary()
@@ -180,21 +190,16 @@ class ContextBuilder:
             # Intelligence layer is currently sync, but fast enough as it's in-memory
             test_context = self._analyzer.test_context_for(class_name)
 
-        # Step 3: Snippet selection
-        selector = SnippetSelector(
-            analyzer=self._analyzer if self._intelligence_ready else None,
-            symbols=self._symbols if self._intelligence_ready else None,
-        )
-        snippets = selector.select(
+        # Step 3: Snippet selection (reuse instance)
+        snippets = self._selector.select(
             class_name=class_name,
             rag_chunks=rag_chunks,
             test_context=test_context,
             inline_source=inline_source,
         )
 
-        # Step 4: Token optimization
-        optimizer = TokenOptimizer(token_budget=self.token_budget)
-        optimized_snippets, budget_report = optimizer.optimize(snippets)
+        # Step 4: Token optimization (reuse instance)
+        optimized_snippets, budget_report = self._optimizer.optimize(snippets)
 
         elapsed = (time.time() - start) * 1000
 
@@ -248,21 +253,16 @@ class ContextBuilder:
         if self._intelligence_ready and self._analyzer:
             test_context = self._analyzer.test_context_for(class_name)
 
-        # Step 3: Snippet selection
-        selector = SnippetSelector(
-            analyzer=self._analyzer if self._intelligence_ready else None,
-            symbols=self._symbols if self._intelligence_ready else None,
-        )
-        snippets = selector.select(
+        # Step 3: Snippet selection (reuse instance)
+        snippets = self._selector.select(
             class_name=class_name,
             rag_chunks=rag_chunks,
             test_context=test_context,
             inline_source=inline_source,
         )
 
-        # Step 4: Token optimization
-        optimizer = TokenOptimizer(token_budget=self.token_budget)
-        optimized_snippets, budget_report = optimizer.optimize(snippets)
+        # Step 4: Token optimization (reuse instance)
+        optimized_snippets, budget_report = self._optimizer.optimize(snippets)
 
         elapsed = (time.time() - start) * 1000
 
@@ -297,18 +297,13 @@ class ContextBuilder:
         if self._intelligence_ready and self._analyzer:
             test_context = self._analyzer.test_context_for(class_name)
 
-        selector = SnippetSelector(
-            analyzer=self._analyzer if self._intelligence_ready else None,
-            symbols=self._symbols if self._intelligence_ready else None,
-        )
-        snippets = selector.select(
+        snippets = self._selector.select(
             class_name=class_name,
             rag_chunks=rag_chunks,
             test_context=test_context,
         )
 
-        optimizer = TokenOptimizer(token_budget=self.token_budget)
-        optimized_snippets, budget_report = optimizer.optimize(snippets)
+        optimized_snippets, budget_report = self._optimizer.optimize(snippets)
 
         elapsed = (time.time() - start) * 1000
 

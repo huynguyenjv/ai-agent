@@ -63,7 +63,9 @@ class TokenOptimizer:
         if not snippets:
             return [], BudgetReport(0, 0, 0, 0, 0, False)
 
-        original_tokens = sum(self.estimate_tokens(s.content) for s in snippets)
+        # Pre-compute token costs once (avoid double-counting)
+        token_costs = [self.estimate_tokens(s.content) for s in snippets]
+        original_tokens = sum(token_costs)
 
         if original_tokens <= self.token_budget:
             return list(snippets), BudgetReport(
@@ -81,8 +83,7 @@ class TokenOptimizer:
         truncated_count = 0
         dropped_count = 0
 
-        for snippet in snippets:
-            token_cost = self.estimate_tokens(snippet.content)
+        for snippet, token_cost in zip(snippets, token_costs):
 
             if token_cost <= remaining_budget:
                 kept.append(snippet)
