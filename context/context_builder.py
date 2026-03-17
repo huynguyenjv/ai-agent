@@ -113,6 +113,10 @@ class ContextBuilder:
         self._analyzer: Optional[object] = None
         self._intelligence_ready = False
 
+        # Reusable components (avoid re-creation per call)
+        self._selector = SnippetSelector()
+        self._optimizer = TokenOptimizer(token_budget=token_budget)
+
     # ── Intelligence initialization ──────────────────────────────────
 
     def init_intelligence(self, repo_path: Optional[str] = None) -> bool:
@@ -130,6 +134,10 @@ class ContextBuilder:
             logger.warning("No repo path provided for intelligence layer")
             return False
 
+        # Update instance path if a new one was provided
+        if repo_path:
+            self.repo_path = repo_path
+
         try:
             start = time.time()
             scanner = RepoScanner()
@@ -138,6 +146,12 @@ class ContextBuilder:
             self._symbols = SymbolMap.build(self._snapshot)
             self._analyzer = DependencyAnalyzer(self._graph, self._symbols, self._snapshot)
             self._intelligence_ready = True
+
+            # Update selector with intelligence components
+            self._selector = SnippetSelector(
+                analyzer=self._analyzer,
+                symbols=self._symbols,
+            )
 
             elapsed = (time.time() - start) * 1000
             summary = self._snapshot.get_summary()
@@ -154,6 +168,59 @@ class ContextBuilder:
             return False
 
     # ── Main API ─────────────────────────────────────────────────────
+
+    async def abuild_context(
+        self,
+        class_name: str,
+        file_path: str = "",
+        inline_source: Optional[str] = None,
+        session=None,
+        top_k: int = 10,
+        collection_name: Optional[str] = None,
+    ) -> ContextResult:
+        """Async version of build_context()."""
+        start = time.time()
+
+        # Step 1: RAG search (always needed for summaries)
+        rag_chunks = await self._arag_search(class_name, file_path, session, inline_source, top_k, collection_name=collection_name)
+
+        # Step 2: Intelligence analysis (if available)
+        test_context = None
+        if self._intelligence_ready and self._analyzer:
+            # Intelligence layer is currently sync, but fast enough as it's in-memory
+            test_context = self._analyzer.test_context_for(class_name)
+
+        # Step 3: Snippet selection (reuse instance)
+        snippets = self._selector.select(
+            class_name=class_name,
+            rag_chunks=rag_chunks,
+            test_context=test_context,
+            inline_source=inline_source,
+        )
+
+        # Step 4: Token optimization (reuse instance)
+        optimized_snippets, budget_report = self._optimizer.optimize(snippets)
+
+        elapsed = (time.time() - start) * 1000
+
+        logger.info(
+            "Async context built",
+            class_name=class_name,
+            rag_chunks=len(rag_chunks),
+            snippets=len(optimized_snippets),
+            intelligence=self._intelligence_ready,
+            elapsed_ms=round(elapsed, 1),
+        )
+
+        return ContextResult(
+            snippets=optimized_snippets,
+            rag_chunks=rag_chunks,
+            test_context=test_context,
+            budget_report=budget_report,
+            elapsed_ms=elapsed,
+            intelligence_available=self._intelligence_ready,
+            class_name=class_name,
+        )
 
     def build_context(
         self,
@@ -186,21 +253,16 @@ class ContextBuilder:
         if self._intelligence_ready and self._analyzer:
             test_context = self._analyzer.test_context_for(class_name)
 
-        # Step 3: Snippet selection
-        selector = SnippetSelector(
-            analyzer=self._analyzer if self._intelligence_ready else None,
-            symbols=self._symbols if self._intelligence_ready else None,
-        )
-        snippets = selector.select(
+        # Step 3: Snippet selection (reuse instance)
+        snippets = self._selector.select(
             class_name=class_name,
             rag_chunks=rag_chunks,
             test_context=test_context,
             inline_source=inline_source,
         )
 
-        # Step 4: Token optimization
-        optimizer = TokenOptimizer(token_budget=self.token_budget)
-        optimized_snippets, budget_report = optimizer.optimize(snippets)
+        # Step 4: Token optimization (reuse instance)
+        optimized_snippets, budget_report = self._optimizer.optimize(snippets)
 
         elapsed = (time.time() - start) * 1000
 
@@ -235,18 +297,13 @@ class ContextBuilder:
         if self._intelligence_ready and self._analyzer:
             test_context = self._analyzer.test_context_for(class_name)
 
-        selector = SnippetSelector(
-            analyzer=self._analyzer if self._intelligence_ready else None,
-            symbols=self._symbols if self._intelligence_ready else None,
-        )
-        snippets = selector.select(
+        snippets = self._selector.select(
             class_name=class_name,
             rag_chunks=rag_chunks,
             test_context=test_context,
         )
 
-        optimizer = TokenOptimizer(token_budget=self.token_budget)
-        optimized_snippets, budget_report = optimizer.optimize(snippets)
+        optimized_snippets, budget_report = self._optimizer.optimize(snippets)
 
         elapsed = (time.time() - start) * 1000
 
@@ -275,6 +332,28 @@ class ContextBuilder:
         return self._symbols
 
     # ── Internal ─────────────────────────────────────────────────────
+
+    async def _arag_search(
+        self,
+        class_name: str,
+        file_path: str,
+        session,
+        inline_source: Optional[str],
+        top_k: int,
+        collection_name: Optional[str] = None,
+    ) -> list[CodeChunk]:
+        """Perform RAG search for a class and its dependencies."""
+        try:
+            result = await self.rag.asearch_by_class(
+                class_name=class_name,
+                top_k=top_k,
+                include_dependencies=True,
+                collection_name=collection_name,
+            )
+            return result.chunks
+        except Exception as e:
+            logger.error("Async RAG search failed", class_name=class_name, error=str(e))
+            return []
 
     def _rag_search(
         self,

@@ -43,11 +43,17 @@ def analyze_node(state: dict, *, two_phase_strategy, domain_registry=None) -> di
     registry_context = ""
 
     try:
+        # Extract available types from pre-fetched RAG chunks
+        # Reconstruct CodeChunk objects for attribute access
+        rag_chunks = _deserialize_chunks(state.get("rag_chunks", []))
+        available_types = [chunk.class_name for chunk in rag_chunks] if rag_chunks else []
+        
         # Phase 1: Analyze the service
         result = two_phase_strategy.analyze(
             source_code=source_code,
             class_name=class_name,
             file_path=file_path,
+            available_types=available_types,
         )
 
         if result:
@@ -57,18 +63,32 @@ def analyze_node(state: dict, *, two_phase_strategy, domain_registry=None) -> di
             try:
                 enriched_chunks = two_phase_strategy.search_missing_context(
                     analysis_result=result,
-                    rag_chunks=state.get("rag_chunks", []),
+                    rag_chunks=rag_chunks,
                     source_code=source_code,
                     collection_name=collection_name,
                 )
                 if enriched_chunks:
-                    # Merge with existing chunks
-                    existing_rag = list(state.get("rag_chunks", []))
-                    existing_rag.extend(enriched_chunks)
+                    # Merge with existing chunks and serialize
+                    # existing_rag is a list of dicts from state
+                    current_serialized = list(state.get("rag_chunks", []))
+                    
+                    # Serialize new chunks
+                    new_serialized = []
+                    for c in enriched_chunks:
+                        if hasattr(c, "model_dump"):
+                            new_serialized.append(c.model_dump())
+                        else:
+                            new_serialized.append(c.__dict__)
+                            
+                    current_serialized.extend(new_serialized)
+                    
+                    # Update state with enriched list
+                    enriched_rag_to_save = current_serialized
+                    
                     logger.info(
                         "analyze_node: enriched context",
                         new_chunks=len(enriched_chunks),
-                        total=len(existing_rag),
+                        total=len(enriched_rag_to_save),
                     )
             except Exception as e:
                 logger.warning("analyze_node: context enrichment failed", error=str(e))
@@ -89,14 +109,31 @@ def analyze_node(state: dict, *, two_phase_strategy, domain_registry=None) -> di
         try:
             domain_registry.build_from_collection(collection_name=collection_name)
             # Get construction patterns for types used by this class
-            if hasattr(analysis_result, "all_domain_types"):
-                registry_context = domain_registry.build_context_for_types(
-                    analysis_result.all_domain_types
-                )
+            # analysis_result is a dict here
+            all_types = analysis_result.get("all_domain_types", [])
+            if all_types:
+                registry_context = domain_registry.build_context_for_types(all_types)
         except Exception as e:
             logger.warning("analyze_node: registry context failed", error=str(e))
 
-    return {
+    updates = {
         "analysis_result": analysis_result,
         "registry_context": registry_context,
     }
+    if 'enriched_rag_to_save' in locals():
+        updates["rag_chunks"] = enriched_rag_to_save
+        
+    return updates
+
+
+def _deserialize_chunks(raw_chunks: list) -> list:
+    """Reconstruct CodeChunk objects from serialized dicts."""
+    if not raw_chunks:
+        return []
+    if hasattr(raw_chunks[0], "class_name"):
+        return raw_chunks
+    try:
+        from rag.schema import CodeChunk
+        return [CodeChunk(**c) for c in raw_chunks]
+    except Exception:
+        return raw_chunks

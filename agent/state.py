@@ -9,7 +9,7 @@ Defines typed state dicts used by:
 
 from __future__ import annotations
 
-from typing import TypedDict, Literal, Annotated
+from typing import TypedDict, Literal, Annotated, Optional
 from operator import add
 
 
@@ -42,11 +42,15 @@ class AgentState(TypedDict, total=False):
     complexity_threshold: int
     retry_count: int
     max_retries: int
+    repo_path: str
 
     # ── Routing ──
     intent: Literal[
         "unit_test", "code_review", "refactor", "doc_gen", "unknown"
     ]
+
+    # ── Discovery (Option A) ──
+    discovery_context: Optional[dict] = None  # Context gathered by supervisor discovery tools
 
     # ── Output ──
     subgraph_result: str  # JSON-serialized result from whichever subgraph ran
@@ -79,6 +83,7 @@ class UnitTestState(TypedDict, total=False):
     existing_test_code: str         # for incremental mode
     changed_methods: list[str]      # for incremental mode
     require_human_review: bool      # whether to interrupt for human approval
+    repo_path: str                 # resolved repository root path
 
     # ── Strategy Routing ──
     strategy: Literal["single_pass", "two_phase"]
@@ -118,6 +123,12 @@ class UnitTestState(TypedDict, total=False):
     # ── Human Review ──
     human_approved: bool            # True = approve, False = reject
     human_feedback: str             # rejection reason / additional instructions
+
+    # ── Tool Execution (Option C) ──
+    tool_request: dict             # {"name": "...", "parameters": {...}}
+    tool_result: dict
+    execution_passed: bool
+    execution_output: str
 
     # ── Output ──
     final_test_code: str            # accepted test code

@@ -6,8 +6,9 @@ import os
 import time
 from typing import Optional
 
+import asyncio
 import structlog
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, AsyncQdrantClient
 from qdrant_client.http import models
 
 from utils.embedding import ONNXEmbedder
@@ -27,6 +28,7 @@ class RAGClient:
         embedding_model: str = "all-MiniLM-L6-v2-onnx",
     ):
         self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
+        self.aqdrant = AsyncQdrantClient(host=qdrant_host, port=qdrant_port)
         self.collection_name = collection_name
         self.embedder = ONNXEmbedder(embedding_model)
         logger.info(
@@ -35,6 +37,133 @@ class RAGClient:
             port=qdrant_port,
             collection=collection_name,
         )
+
+    async def asearch(self, query: SearchQuery, collection_name: Optional[str] = None) -> SearchResult:
+        """Async version of search()."""
+        start_time = time.time()
+        effective_collection = collection_name or self.collection_name
+
+        # Generate query embedding
+        query_vector = self.embedder.encode(query.query).tolist()
+
+        # Build filter conditions
+        filter_conditions = self._build_filter(query.filters)
+
+        # Execute search
+        results = await self.aqdrant.search(
+            collection_name=effective_collection,
+            query_vector=query_vector,
+            limit=query.top_k,
+            score_threshold=query.score_threshold,
+            query_filter=filter_conditions,
+        )
+
+        chunks = self._process_results(results)
+        search_time_ms = (time.time() - start_time) * 1000
+
+        logger.info(
+            "Async search completed",
+            query=query.query[:50],
+            collection=effective_collection,
+            results=len(chunks),
+            time_ms=f"{search_time_ms:.2f}",
+        )
+
+        return SearchResult(query=query.query, chunks=chunks, total_found=len(chunks), search_time_ms=search_time_ms)
+
+    def _process_results(self, results) -> list[CodeChunk]:
+        """Convert Qdrant results to CodeChunk objects."""
+        chunks = []
+        for result in results:
+            payload = result.payload
+            fields_data = payload.get("fields", [])
+            fields = [
+                FieldSchema(type=f.get("type", ""), name=f.get("name", ""), annotations=f.get("annotations", []))
+                for f in fields_data if isinstance(f, dict)
+            ]
+            record_components_data = payload.get("record_components", [])
+            record_components = [
+                FieldSchema(type=f.get("type", ""), name=f.get("name", ""), annotations=f.get("annotations", []))
+                for f in record_components_data if isinstance(f, dict)
+            ]
+            chunks.append(CodeChunk(
+                id=result.id, summary=payload.get("summary", ""), score=result.score,
+                type=payload.get("type", "unknown"), layer=payload.get("layer", "unknown"),
+                class_name=payload.get("class_name", ""), package=payload.get("package", ""),
+                file_path=payload.get("file_path", ""), fully_qualified_name=payload.get("fully_qualified_name", ""),
+                dependencies=payload.get("dependencies", []), annotations=payload.get("annotations", []),
+                element_type=payload.get("element_type", "class"), java_type=payload.get("java_type"),
+                method_name=payload.get("method_name"), start_line=payload.get("start_line"), end_line=payload.get("end_line"),
+                extends=payload.get("extends"), implements=payload.get("implements", []),
+                method_count=payload.get("method_count", 0), modifiers=payload.get("modifiers", []),
+                used_types=payload.get("used_types", []), has_builder=payload.get("has_builder", False),
+                has_builder_to_builder=payload.get("has_builder_to_builder", False),
+                has_data=payload.get("has_data", False), has_getter=payload.get("has_getter", False),
+                has_setter=payload.get("has_setter", False), has_value=payload.get("has_value", False),
+                is_immutable=payload.get("is_immutable", False),
+                has_no_args_constructor=payload.get("has_no_args_constructor", False),
+                has_all_args_constructor=payload.get("has_all_args_constructor", False),
+                has_required_args_constructor=payload.get("has_required_args_constructor", False),
+                field_count=payload.get("field_count", 0), fields=fields, record_components=record_components,
+            ))
+        return chunks
+
+    async def asearch_by_class(
+        self, class_name: str, top_k: int = 10, include_dependencies: bool = True,
+        collection_name: Optional[str] = None,
+    ) -> SearchResult:
+        """Async version of search_by_class()."""
+        start_time = time.time()
+        effective_collection = collection_name or self.collection_name
+
+        query = SearchQuery(query=f"class {class_name}", top_k=1, score_threshold=0.3, filters=MetadataFilter(class_name=class_name))
+        result = await self.asearch(query, collection_name=effective_collection)
+
+        if not result.chunks:
+            logger.debug("Tier-1 miss, trying metadata scroll", class_name=class_name)
+            chunk = await self._ascroll_by_class_name(class_name, collection_name=effective_collection)
+            if chunk: result = SearchResult(query=f"class {class_name} (scroll)", chunks=[chunk], total_found=1, search_time_ms=(time.time() - start_time) * 1000)
+
+        if not result.chunks: return result
+
+        if include_dependencies:
+            main_chunk = result.chunks[0]
+            all_chunks = [main_chunk]
+            types_to_fetch = set()
+            for dep_fqn in (main_chunk.dependencies or []):
+                types_to_fetch.add(dep_fqn.rsplit(".", 1)[-1] if "." in dep_fqn else dep_fqn)
+            for ut in (main_chunk.used_types or []): types_to_fetch.add(ut)
+            types_to_fetch -= {main_chunk.class_name}
+
+            if types_to_fetch:
+                tasks = [self.asearch(SearchQuery(query=f"class {t}", top_k=1, score_threshold=0.3), collection_name=effective_collection) for t in types_to_fetch]
+                dep_results: list[SearchResult] = await asyncio.gather(*tasks)
+                
+                unfound = []
+                for idx, dr in enumerate(dep_results):
+                    type_name = list(types_to_fetch)[idx]
+                    if dr.chunks: all_chunks.extend(dr.chunks)
+                    else:
+                        dc = await self._ascroll_by_class_name(type_name, collection_name=effective_collection)
+                        if dc: all_chunks.append(dc)
+                        else: unfound.append(type_name)
+                if unfound: main_chunk.unfound_types = sorted(unfound)
+            
+            return SearchResult(query=f"class {class_name} with dependencies", chunks=all_chunks, total_found=len(all_chunks), search_time_ms=result.search_time_ms)
+        return result
+
+    async def _ascroll_by_class_name(self, class_name: str, collection_name: Optional[str] = None) -> Optional[CodeChunk]:
+        """Async version of _scroll_by_class_name()."""
+        try:
+            effective_collection = collection_name or self.collection_name
+            scroll_filter = models.Filter(must=[models.FieldCondition(key="class_name", match=models.MatchValue(value=class_name))])
+            points, _ = await self.aqdrant.scroll(collection_name=effective_collection, scroll_filter=scroll_filter, limit=5, with_payload=True)
+            if not points: return None
+            class_points = [p for p in points if p.payload.get("element_type") == "class"]
+            chosen = class_points[0] if class_points else points[0]
+            res = self._process_results([chosen])
+            return res[0] if res else None
+        except Exception: return None
 
     def search(self, query: SearchQuery, collection_name: Optional[str] = None) -> SearchResult:
         """Perform semantic search with optional metadata filtering.
@@ -61,72 +190,8 @@ class RAGClient:
             query_filter=filter_conditions,
         )
 
-        # Convert to CodeChunk objects
-        chunks = []
-        for result in results:
-            payload = result.payload
-            # Parse fields from payload
-            fields_data = payload.get("fields", [])
-            fields = [
-                FieldSchema(
-                    type=f.get("type", ""),
-                    name=f.get("name", ""),
-                    annotations=f.get("annotations", [])
-                )
-                for f in fields_data if isinstance(f, dict)
-            ]
-            # Parse record_components from payload (for Java records)
-            record_components_data = payload.get("record_components", [])
-            record_components = [
-                FieldSchema(
-                    type=f.get("type", ""),
-                    name=f.get("name", ""),
-                    annotations=f.get("annotations", [])
-                )
-                for f in record_components_data if isinstance(f, dict)
-            ]
-            chunk = CodeChunk(
-                id=result.id,
-                summary=payload.get("summary", ""),
-                score=result.score,
-                type=payload.get("type", "unknown"),
-                layer=payload.get("layer", "unknown"),
-                class_name=payload.get("class_name", ""),
-                package=payload.get("package", ""),
-                file_path=payload.get("file_path", ""),
-                fully_qualified_name=payload.get("fully_qualified_name", ""),
-                dependencies=payload.get("dependencies", []),
-                annotations=payload.get("annotations", []),
-                element_type=payload.get("element_type", "class"),
-                java_type=payload.get("java_type"),
-                method_name=payload.get("method_name"),
-                start_line=payload.get("start_line"),
-                end_line=payload.get("end_line"),
-                # Inheritance
-                extends=payload.get("extends"),
-                implements=payload.get("implements", []),
-                # Class meta
-                method_count=payload.get("method_count", 0),
-                modifiers=payload.get("modifiers", []),
-                # Domain types used (models, DTOs, entities)
-                used_types=payload.get("used_types", []),
-                # Lombok info
-                has_builder=payload.get("has_builder", False),
-                has_builder_to_builder=payload.get("has_builder_to_builder", False),
-                has_data=payload.get("has_data", False),
-                has_getter=payload.get("has_getter", False),
-                has_setter=payload.get("has_setter", False),
-                has_value=payload.get("has_value", False),
-                is_immutable=payload.get("is_immutable", False),
-                has_no_args_constructor=payload.get("has_no_args_constructor", False),
-                has_all_args_constructor=payload.get("has_all_args_constructor", False),
-                has_required_args_constructor=payload.get("has_required_args_constructor", False),
-                # Fields info
-                field_count=payload.get("field_count", 0),
-                fields=fields,
-                record_components=record_components,
-            )
-            chunks.append(chunk)
+        # Convert to CodeChunk objects using shared _process_results
+        chunks = self._process_results(results)
 
         search_time_ms = (time.time() - start_time) * 1000
 
@@ -135,7 +200,7 @@ class RAGClient:
             query=query.query[:50],
             collection=effective_collection,
             results=len(chunks),
-            time_ms=round(search_time_ms, 2),
+            time_ms=f"{search_time_ms:.2f}",
         )
 
         return SearchResult(
@@ -182,33 +247,6 @@ class RAGClient:
                     chunks=[chunk],
                     total_found=1,
                     search_time_ms=(time.time() - start_time) * 1000,
-                )
-
-        # ── Tier 3: broad semantic search (no filter) ──
-        if not result.chunks:
-            logger.debug("Tier-2 miss, trying broad semantic", class_name=class_name)
-            fallback_query = SearchQuery(
-                query=f"class {class_name}",
-                top_k=top_k,
-                score_threshold=0.0,
-                filters=None,
-            )
-            fallback_result = self.search(fallback_query, collection_name=effective_collection)
-            # Filter to prefer chunks whose class_name actually matches
-            matching = [c for c in fallback_result.chunks if c.class_name == class_name]
-            if matching:
-                result = SearchResult(
-                    query=f"class {class_name} (broad-match)",
-                    chunks=matching[:1],
-                    total_found=len(matching),
-                    search_time_ms=fallback_result.search_time_ms,
-                )
-            elif fallback_result.chunks:
-                result = SearchResult(
-                    query=f"class {class_name} (broad-fallback)",
-                    chunks=fallback_result.chunks[:top_k],
-                    total_found=len(fallback_result.chunks),
-                    search_time_ms=fallback_result.search_time_ms,
                 )
 
         if not result.chunks:
@@ -269,6 +307,42 @@ class RAGClient:
 
         return result
 
+    async def _ascroll_by_class_name(
+        self, class_name: str, prefer_type: str = "class",
+        collection_name: Optional[str] = None,
+    ) -> Optional[CodeChunk]:
+        """Async version of _scroll_by_class_name."""
+        try:
+            effective_collection = collection_name or self.collection_name
+            scroll_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="class_name",
+                        match=models.MatchValue(value=class_name),
+                    )
+                ]
+            )
+            points, _ = await self.aqdrant.scroll(
+                collection_name=effective_collection,
+                scroll_filter=scroll_filter,
+                limit=10,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                return None
+
+            # Prefer class-level chunks over method chunks
+            class_points = [p for p in points if p.payload.get("element_type") == "class"]
+            chosen = class_points[0] if class_points else points[0]
+            
+            # Use shared _process_results
+            chunks = self._process_results([chosen])
+            return chunks[0] if chunks else None
+        except Exception as e:
+            logger.error("Failed to scroll by class name (async)", class_name=class_name, error=str(e))
+            return None
+
     def _scroll_by_class_name(
         self, class_name: str, prefer_type: str = "class",
         collection_name: Optional[str] = None,
@@ -292,7 +366,7 @@ class RAGClient:
             points, _ = self.qdrant.scroll(
                 collection_name=effective_collection,
                 scroll_filter=scroll_filter,
-                limit=10,
+                limit=5,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -302,63 +376,10 @@ class RAGClient:
             # Prefer class-level chunks over method chunks
             class_points = [p for p in points if p.payload.get("element_type") == "class"]
             chosen = class_points[0] if class_points else points[0]
-            payload = chosen.payload
 
-            # Build CodeChunk
-            fields_data = payload.get("fields", [])
-            fields = [
-                FieldSchema(type=f.get("type", ""), name=f.get("name", ""), annotations=f.get("annotations", []))
-                for f in fields_data if isinstance(f, dict)
-            ]
-            record_components_data = payload.get("record_components", [])
-            record_components = [
-                FieldSchema(type=f.get("type", ""), name=f.get("name", ""), annotations=f.get("annotations", []))
-                for f in record_components_data if isinstance(f, dict)
-            ]
-
-            chunk = CodeChunk(
-                id=chosen.id,
-                summary=payload.get("summary", ""),
-                score=1.0,  # metadata-exact match
-                type=payload.get("type", "unknown"),
-                layer=payload.get("layer", "unknown"),
-                class_name=payload.get("class_name", ""),
-                package=payload.get("package", ""),
-                file_path=payload.get("file_path", ""),
-                fully_qualified_name=payload.get("fully_qualified_name", ""),
-                dependencies=payload.get("dependencies", []),
-                annotations=payload.get("annotations", []),
-                element_type=payload.get("element_type", "class"),
-                java_type=payload.get("java_type"),
-                method_name=payload.get("method_name"),
-                start_line=payload.get("start_line"),
-                end_line=payload.get("end_line"),
-                extends=payload.get("extends"),
-                implements=payload.get("implements", []),
-                method_count=payload.get("method_count", 0),
-                modifiers=payload.get("modifiers", []),
-                used_types=payload.get("used_types", []),
-                has_builder=payload.get("has_builder", False),
-                has_builder_to_builder=payload.get("has_builder_to_builder", False),
-                has_data=payload.get("has_data", False),
-                has_getter=payload.get("has_getter", False),
-                has_setter=payload.get("has_setter", False),
-                has_value=payload.get("has_value", False),
-                is_immutable=payload.get("is_immutable", False),
-                has_no_args_constructor=payload.get("has_no_args_constructor", False),
-                has_all_args_constructor=payload.get("has_all_args_constructor", False),
-                has_required_args_constructor=payload.get("has_required_args_constructor", False),
-                field_count=payload.get("field_count", 0),
-                fields=fields,
-                record_components=record_components,
-            )
-            logger.info(
-                "Found class via metadata scroll",
-                class_name=class_name,
-                fqn=chunk.fully_qualified_name,
-                element_type=chunk.element_type,
-            )
-            return chunk
+            # Use shared _process_results
+            chunks = self._process_results([chosen])
+            return chunks[0] if chunks else None
         except Exception as e:
             logger.warning("Scroll lookup failed", class_name=class_name, error=str(e))
             return None

@@ -210,6 +210,7 @@ class TwoPhaseStrategy:
         source_code: str,
         class_name: str,
         file_path: str,
+        available_types: Optional[list[str]] = None,
     ) -> Optional[AnalysisResult]:
         """Phase 1: Analyze the service structure.
 
@@ -224,6 +225,7 @@ class TwoPhaseStrategy:
             source_code=source_code,
             class_name=class_name,
             file_path=file_path,
+            available_types=available_types,
         )
 
         logger.debug("Phase 1: Running analysis", class_name=class_name)
@@ -542,7 +544,7 @@ Start your response with the issues found as comments, then the corrected code."
         for attempt in range(1, self.config.max_repair_attempts + 1):
             self._state = TwoPhaseState.REPAIRING
 
-            issues_before = current_validation.error_messages
+            issues_before = current_validation.all_messages
 
             # Determine escalation level
             level = self.repair_selector.determine_level(
@@ -570,7 +572,7 @@ Start your response with the issues found as comments, then the corrected code."
             reasoning = None
             if level == RepairLevel.REASONING and self.config.reasoning_enabled:
                 reasoning = self._run_reasoning(
-                    current_code, current_validation.error_messages, memory,
+                    current_code, current_validation.all_messages, memory,
                 )
 
             # Build repair plan (uses memory + reasoning)
@@ -589,14 +591,14 @@ Start your response with the issues found as comments, then the corrected code."
                 f"{repair_section}\n\n"
                 f"Repair attempt {attempt}/{self.config.max_repair_attempts} "
                 f"(Level: {level.value}). Fix these validation issues:\n"
-                + "\n".join(f"- {msg}" for msg in current_validation.error_messages)
+                + "\n".join(f"- {msg}" for msg in current_validation.all_messages)
             )
 
             system_prompt = self.prompt_builder.build_system_prompt()
             user_prompt = self.prompt_builder.build_refinement_prompt(
                 original_code=current_code,
                 feedback=feedback,
-                validation_issues=current_validation.error_messages,
+                validation_issues=current_validation.all_messages,
                 rag_chunks=rag_chunks,
             )
 
@@ -631,7 +633,7 @@ Start your response with the issues found as comments, then the corrected code."
                 strategy=level.value,
                 instructions_used=[inst.description for inst in repair_plan.instructions],
                 issues_before=issues_before,
-                issues_after=current_validation.error_messages,
+                issues_after=current_validation.all_messages,
                 reasoning=reasoning.get("overall_strategy") if reasoning else None,
             )
 
@@ -782,7 +784,7 @@ Start your response with the issues found as comments, then the corrected code."
             validation_result = self.validator.validate(test_code, rag_chunks=all_chunks)
             result.validation_result = validation_result
             result.validation_passed = validation_result.passed
-            result.validation_issues = validation_result.error_messages
+            result.validation_issues = validation_result.all_messages
 
             self._publish_event(EventType.VALIDATION_COMPLETED, {
                 "passed": validation_result.passed,
@@ -806,7 +808,7 @@ Start your response with the issues found as comments, then the corrected code."
                 validation_result = self.validator.validate(repaired_code, rag_chunks=all_chunks)
                 result.validation_result = validation_result
                 result.validation_passed = validation_result.passed
-                result.validation_issues = validation_result.error_messages
+                result.validation_issues = validation_result.all_messages
 
             # ── Success ───────────────────────────────────────────────
             result.success = True

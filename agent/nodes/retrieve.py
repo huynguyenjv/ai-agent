@@ -10,14 +10,13 @@ from __future__ import annotations
 
 import re
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor
 
 import structlog
 
 logger = structlog.get_logger()
 
 
-def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_service=None) -> dict:
+async def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_service=None) -> dict:
     """Fetch RAG context and optionally enrich with ContextBuilder.
 
     Args:
@@ -49,8 +48,18 @@ def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_servic
 
     # Try ContextBuilder first (richer context pipeline)
     if context_builder:
+        # Dynamic re-initialization if repo_path changed
+        current_repo = state.get("repo_path")
+        if current_repo and current_repo != context_builder.repo_path:
+            logger.info(
+                "retrieve_node: repo_path changed, re-initializing intelligence",
+                old=context_builder.repo_path,
+                new=current_repo,
+            )
+            context_builder.init_intelligence(current_repo)
+
         try:
-            ctx_result = context_builder.build_context(
+            ctx_result = await context_builder.abuild_context(
                 class_name=class_name,
                 file_path=file_path,
                 top_k=10,
@@ -70,10 +79,10 @@ def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_servic
             )
         except Exception as e:
             logger.warning("retrieve_node: ContextBuilder failed, falling back to RAG", error=str(e))
-            rag_chunks = _get_rag_context(rag_client, class_name, file_path, collection_name, cache_service)
+            rag_chunks = await _get_rag_context_async(rag_client, class_name, file_path, collection_name, cache_service)
     else:
         # RAG-only path
-        rag_chunks = _get_rag_context(rag_client, class_name, file_path, collection_name, cache_service)
+        rag_chunks = await _get_rag_context_async(rag_client, class_name, file_path, collection_name, cache_service)
 
     # Serialize chunks for state (must be JSON-serializable)
     serialized_chunks = []
@@ -94,6 +103,43 @@ def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_servic
     }
 
 
+async def _get_rag_context_async(rag_client, class_name: str, file_path: str,
+                           collection_name: Optional[str], cache_service=None) -> list:
+    """Async variant of _get_rag_context."""
+    # Check Redis cache first (assuming cache_service is sync for now)
+    cache_key = f"{class_name}:{file_path}"
+    if cache_service:
+        try:
+            cached = cache_service.get_rag_context(cache_key)
+            if cached:
+                logger.debug("retrieve_node: using cached RAG context", class_name=class_name)
+                from rag.schema import CodeChunk
+                return [CodeChunk(**c) for c in cached]
+        except Exception:
+            pass
+
+    try:
+        result = await rag_client.asearch_by_class(
+            class_name=class_name,
+            top_k=10,
+            include_dependencies=True,
+            collection_name=collection_name,
+        )
+        chunks = result.chunks
+        
+        # Cache in Redis
+        if cache_service and chunks:
+            try:
+                serialized = [c.model_dump() if hasattr(c, "model_dump") else c.__dict__ for c in chunks]
+                cache_service.cache_rag_context(cache_key, serialized, ttl=3600)
+            except Exception:
+                pass
+        return chunks
+    except Exception as e:
+        logger.error("Async RAG search failed", class_name=class_name, error=str(e))
+        return []
+
+
 def _extract_class_name(file_path: str) -> Optional[str]:
     """Extract class name from Java file path."""
     if not file_path:
@@ -104,94 +150,3 @@ def _extract_class_name(file_path: str) -> Optional[str]:
         return name[:-5]
     return name
 
-
-def _get_rag_context(rag_client, class_name: str, file_path: str,
-                     collection_name: Optional[str], cache_service=None) -> list:
-    """Exact graph traversal: target class → deps → used_types.
-
-    Mirrors the logic from AgentOrchestrator._get_rag_context().
-    """
-    # Check Redis cache first
-    cache_key = f"{class_name}:{file_path}"
-    if cache_service:
-        cached = cache_service.get_rag_context(cache_key)
-        if cached:
-            logger.debug("retrieve_node: using cached RAG context", class_name=class_name)
-            from rag.schema import CodeChunk
-            return [CodeChunk(**c) for c in cached]
-
-    chunks = []
-    existing_fqns = set()
-
-    # Query 1: target class
-    main_result = rag_client.search_by_class(
-        class_name=class_name,
-        top_k=1,
-        include_dependencies=False,
-        collection_name=collection_name,
-    )
-    main_chunk = main_result.chunks[0] if main_result.chunks else None
-    if not main_chunk:
-        logger.warning("retrieve_node: target not found in index", class_name=class_name)
-        return []
-    chunks.append(main_chunk)
-    existing_fqns.add(main_chunk.fully_qualified_name)
-
-    # Collect types to fetch (deps + used_types)
-    dep_simple = set()
-    for dep_fqn in (main_chunk.dependencies or []):
-        simple = dep_fqn.rsplit(".", 1)[-1] if "." in dep_fqn else dep_fqn
-        dep_simple.add(simple)
-    used = set(main_chunk.used_types or [])
-    types_to_fetch = (dep_simple | used) - {main_chunk.class_name, class_name}
-
-    if not types_to_fetch:
-        return chunks
-
-    # Parallel fetch
-    unfound_types = set()
-
-    def _fetch_one(type_name):
-        try:
-            result = rag_client.search_by_class(
-                class_name=type_name, top_k=1,
-                include_dependencies=False,
-                collection_name=collection_name,
-            )
-            return result.chunks[0] if result.chunks else None
-        except Exception:
-            return None
-
-    with ThreadPoolExecutor(max_workers=min(5, len(types_to_fetch))) as executor:
-        futures = {executor.submit(_fetch_one, t): t for t in types_to_fetch}
-        for future in futures:
-            type_name = futures[future]
-            try:
-                chunk = future.result(timeout=10)
-                if chunk and chunk.fully_qualified_name not in existing_fqns:
-                    chunks.append(chunk)
-                    existing_fqns.add(chunk.fully_qualified_name)
-                elif not chunk:
-                    unfound_types.add(type_name)
-            except Exception:
-                unfound_types.add(type_name)
-
-    # Annotate main chunk with unfound types
-    if unfound_types and main_chunk:
-        main_chunk.unfound_types = sorted(unfound_types)
-
-    # Cache in Redis
-    if cache_service:
-        try:
-            serialized = [c.model_dump() if hasattr(c, "model_dump") else c.__dict__ for c in chunks]
-            cache_service.cache_rag_context(cache_key, serialized, ttl=3600)
-        except Exception:
-            pass
-
-    logger.info(
-        "retrieve_node: RAG context fetched",
-        class_name=class_name,
-        total=len(chunks),
-        unfound=sorted(unfound_types) if unfound_types else [],
-    )
-    return chunks

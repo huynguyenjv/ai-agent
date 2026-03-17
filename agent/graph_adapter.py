@@ -13,15 +13,18 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional, Generator
+from typing import Optional, Generator, AsyncGenerator, cast
 
 import structlog
 
 from agent.graph import create_agent_graph
 from agent.state import UnitTestState
-from agent.orchestrator import StreamEvent, StreamPhase
+from agent.models import StreamEvent, StreamPhase
+from rag.client import RAGClient
+from vllm.client import VLLMClient
 
 logger = structlog.get_logger()
 
@@ -156,10 +159,21 @@ class GraphOrchestrator:
         except ImportError:
             self.cache_service = None
 
-        # Create the LangGraph
-        self._graph = create_agent_graph(
-            rag_client=rag_client,
-            vllm_client=vllm_client,
+        # LangGraph instance (initialized via initialize())
+        self._graph = None
+
+    async def initialize(self, checkpoint_db: str = "checkpoints.db"):
+        """Initialize the LangGraph instance asynchronously.
+        
+        Required because AsyncSqliteSaver requires async setup.
+        """
+        if self._graph is not None:
+            return
+
+        from agent.graph import create_agent_graph
+        self._graph = await create_agent_graph(
+            rag_client=self.rag,
+            vllm_client=self.vllm,
             prompt_builder=self.prompt_builder,
             validation_pipeline=self.validator,
             repair_selector=self.repair_selector,
@@ -170,7 +184,6 @@ class GraphOrchestrator:
             cache_service=self.cache_service,
             checkpoint_db=checkpoint_db,
         )
-
         logger.info("GraphOrchestrator initialized (LangGraph backend)")
 
     def _build_input_state(self, request, run_id: str) -> dict:
@@ -197,10 +210,11 @@ class GraphOrchestrator:
             "complexity_threshold": getattr(request, "complexity_threshold", 10),
             "retry_count": 0,
             "max_retries": self.max_repair_attempts,
+            "repo_path": getattr(request, "repo_path", None) or os.getenv("JAVA_REPO_PATH", ""),
         }
 
-    def generate_test(self, request) -> GraphGenerationResult:
-        """Generate unit tests via LangGraph.
+    async def generate_test(self, request) -> GraphGenerationResult:
+        """Generate unit tests via LangGraph (async).
 
         Accepts either GraphGenerationRequest or the legacy GenerationRequest.
         Handles GraphInterrupt — returns partial result with run_id for resume.
@@ -211,7 +225,7 @@ class GraphOrchestrator:
         config = {"configurable": {"thread_id": run_id}}
 
         try:
-            result_state = self._graph.invoke(input_state, config=config)
+            result_state = await self._graph.ainvoke(input_state, config=config)
 
             # Parse subgraph result
             subgraph_json = result_state.get("subgraph_result", "{}")
@@ -221,18 +235,18 @@ class GraphOrchestrator:
                 result_data = {}
 
             return GraphGenerationResult(
-                success=result_data.get("success", True),
-                test_code=result_data.get("test_code", result_state.get("final_test_code", "")),
-                class_name=result_data.get("class_name", class_name),
-                validation_passed=result_data.get("validation_passed", True),
-                validation_issues=result_data.get("validation_issues", []),
-                error=result_data.get("error"),
-                rag_chunks_used=result_data.get("rag_chunks_used", 0),
-                tokens_used=result_data.get("tokens_used", 0),
-                strategy_used=result_data.get("strategy_used", "single_pass"),
-                complexity_score=result_data.get("complexity_score", 0),
-                repair_attempts=result_data.get("repair_attempts", 0),
-                analysis_result=result_data.get("analysis_result"),
+                success=bool(result_data.get("success", True)),
+                test_code=str(result_data.get("test_code", result_state.get("final_test_code", ""))) or None,
+                class_name=str(result_data.get("class_name", class_name)),
+                validation_passed=bool(result_data.get("validation_passed", True)),
+                validation_issues=cast(list[str], result_data.get("validation_issues", [])),
+                error=str(result_data.get("error", "")) or None,
+                rag_chunks_used=int(result_data.get("rag_chunks_used", 0)),
+                tokens_used=int(result_data.get("tokens_used", 0)),
+                strategy_used=str(result_data.get("strategy_used", "single_pass")),
+                complexity_score=int(result_data.get("complexity_score", 0)),
+                repair_attempts=int(result_data.get("repair_attempts", 0)),
+                analysis_result=cast(Optional[dict], result_data.get("analysis_result")) if isinstance(result_data.get("analysis_result"), dict) else None,
                 run_id=run_id,
             )
 
@@ -241,7 +255,7 @@ class GraphOrchestrator:
             if "GraphInterrupt" in type(e).__name__ or "interrupt" in str(type(e)).lower():
                 logger.info("Graph interrupted for human review", run_id=run_id)
                 # Get partial state — return test_code generated so far
-                state = self.get_run_state(run_id)
+                state = await self.get_run_state(run_id)
                 test_code = ""
                 if state:
                     test_code = state.get("test_code", "")
@@ -261,6 +275,46 @@ class GraphOrchestrator:
                 run_id=run_id,
             )
 
+    async def refine_test(self, session_id: str, feedback: str) -> GraphGenerationResult:
+        """Refine a previously generated test based on feedback (async)."""
+        config = {"configurable": {"thread_id": session_id}}
+        
+        # Get current state to preserve context
+        current_state = await self.get_run_state(session_id)
+        if not current_state:
+            return GraphGenerationResult(success=False, error="Session not found", run_id=session_id)
+
+        # Update state with feedback
+        input_update = {
+            "human_feedback": feedback,
+            "human_approved": False, # Treat refinement as a "not yet approved" state
+            "retry_count": 0, # Reset retry count for fresh refinement
+        }
+
+        try:
+            # resume the graph with feedback
+            result_state = await self._graph.ainvoke(input_update, config=config)
+            
+            subgraph_json = result_state.get("subgraph_result", "{}")
+            try:
+                result_data = json.loads(subgraph_json) if isinstance(subgraph_json, str) else subgraph_json
+            except (json.JSONDecodeError, TypeError):
+                result_data = {}
+
+            return GraphGenerationResult(
+                success=bool(result_data.get("success", True)),
+                test_code=str(result_data.get("test_code", result_state.get("final_test_code", ""))) or None,
+                class_name=str(result_data.get("class_name", current_state.get("class_name", ""))),
+                validation_passed=bool(result_data.get("validation_passed", True)),
+                validation_issues=cast(list[str], result_data.get("validation_issues", [])),
+                error=str(result_data.get("error", "")) or None,
+                run_id=session_id,
+                tokens_used=int(result_data.get("tokens_used", 0)),
+            )
+        except Exception as e:
+            logger.error("Refine test failed", error=str(e), session_id=session_id)
+            return GraphGenerationResult(success=False, error=str(e), run_id=session_id)
+
     # ── Node name → StreamPhase mapping ─────────────────────────────
     _NODE_PHASE_MAP = {
         "supervisor": StreamPhase.PLANNING,
@@ -276,27 +330,82 @@ class GraphOrchestrator:
     }
 
     _NODE_MSG_MAP = {
-        "supervisor": "🔍 Classifying request intent...",
+        "supervisor": "🔍 Analyzing request...",
         "retrieve": "📚 Retrieving RAG context...",
-        "check_strategy": "🧮 Evaluating complexity and choosing strategy...",
+        "check_strategy": "🧮 Evaluating complexity...",
         "analyze": "🔬 Phase 1: Analyzing service structure...",
         "build_prompt": "📝 Building generation prompt...",
         "call_llm": "🤖 Generating test code...",
-        "validate": "✅ Running 7-pass validation...",
+        "validate": "✅ Validating generated code...",
         "repair": "🔧 Repairing validation issues...",
         "human_review": "👤 Submitting for review...",
         "save_result": "💾 Saving result...",
     }
 
-    def generate_test_streaming(self, request) -> Generator:
-        """Stream test generation via LangGraph's .stream() API.
+    # Steps in expected order for progress indicator
+    _NODE_ORDER = [
+        "supervisor", "retrieve", "check_strategy", "analyze",
+        "build_prompt", "call_llm", "validate", "repair", "save_result",
+    ]
+
+    @staticmethod
+    def _build_stream_msg(
+        node_name: str,
+        state_update: dict,
+        step: int,
+        total_steps: int,
+        class_name: str = "",
+        elapsed_ms: float = 0,
+        repair_count: int = 0,
+    ) -> str:
+        """Build rich, context-aware streaming message for a node."""
+        prefix = f"[{step}/{total_steps}]"
+        elapsed_str = f" ({elapsed_ms:.0f}ms)" if elapsed_ms > 0 else ""
+
+        if node_name == "supervisor":
+            return f"🔍 {prefix} Analyzing request for `{class_name}`..."
+        elif node_name == "retrieve":
+            chunks = state_update.get("rag_chunks", [])
+            n_chunks = len(chunks) if chunks else "?"
+            return f"📚 {prefix} Retrieved {n_chunks} RAG context chunks{elapsed_str}"
+        elif node_name == "check_strategy":
+            strategy = state_update.get("strategy", "single_pass")
+            complexity = state_update.get("complexity_score", 0)
+            icon = "🔄" if strategy == "two_phase" else "⚡"
+            label = "Two-Phase" if strategy == "two_phase" else "Single Pass"
+            score_str = f"Complexity: {complexity} → " if complexity else ""
+            return f"🧮 {prefix} {score_str}Strategy: {icon} {label}{elapsed_str}"
+        elif node_name == "analyze":
+            return f"🔬 {prefix} Analyzing `{class_name}` structure{elapsed_str}"
+        elif node_name == "build_prompt":
+            prompt_len = len(state_update.get("user_prompt", "") or "")
+            token_hint = f" (~{prompt_len // 4:,} tokens)" if prompt_len > 0 else ""
+            return f"📝 {prefix} Built generation prompt{token_hint}{elapsed_str}"
+        elif node_name == "call_llm":
+            return f"🤖 {prefix} Generating test code...{elapsed_str}"
+        elif node_name == "validate":
+            passed = state_update.get("validation_passed", None)
+            issues = state_update.get("validation_issues", [])
+            if passed is True:
+                return f"✅ {prefix} Validation passed{elapsed_str}"
+            elif passed is False:
+                n_issues = len(issues) if issues else "?"
+                return f"⚠️ {prefix} Validation found {n_issues} issue(s){elapsed_str}"
+            return f"✅ {prefix} Validating generated code..."
+        elif node_name == "repair":
+            issues = state_update.get("validation_issues", [])
+            n_issues = len(issues) if issues else "?"
+            return f"🔧 {prefix} Repair attempt {repair_count} — fixing {n_issues} issue(s){elapsed_str}"
+        elif node_name == "save_result":
+            return f"💾 {prefix} Done!{elapsed_str}"
+        else:
+            return f"⏳ {prefix} {node_name}{elapsed_str}"
+
+    async def generate_test_streaming(self, request) -> AsyncGenerator[StreamEvent]:
+        """Stream test generation via LangGraph's .astream() API.
 
         Yields StreamEvent objects compatible with the existing
         ``_stream_test_generation`` SSE pipeline in server/api.py.
-
-        Uses ``stream_mode='updates'`` + ``subgraphs=True`` so that
-        each inner node (retrieve, call_llm, validate, etc.) emits
-        its own event, giving per-node progress visibility.
         """
         run_id = str(uuid.uuid4())
         input_state = self._build_input_state(request, run_id)
@@ -309,9 +418,15 @@ class GraphOrchestrator:
         validation_issues = []
         test_code = ""
         final_error = None
+        strategy_used = "single_pass"
+        complexity_score = 0
+        repair_count = 0
+        step_counter = 0
+        stream_start = time.time()
+        last_step_time = stream_start
 
         try:
-            for event in self._graph.stream(
+            async for event in self._graph.astream(
                 input_state,
                 config=config,
                 stream_mode="updates",
@@ -334,21 +449,23 @@ class GraphOrchestrator:
                         continue
 
                     phase = self._NODE_PHASE_MAP.get(node_name, StreamPhase.PLANNING)
-                    msg = self._NODE_MSG_MAP.get(node_name, f"Running {node_name}...")
+                    step_counter += 1
+                    now = time.time()
+                    step_elapsed_ms = (now - last_step_time) * 1000
+                    last_step_time = now
 
-                    # Emit progress message
-                    yield StreamEvent(
-                        phase=phase,
-                        content=msg,
-                        delta=False,
-                    )
-
-                    # Track key state values as they flow through
+                    # Track key state values BEFORE building message
                     if "rag_chunks" in state_update and state_update["rag_chunks"]:
                         rag_chunks_used = len(state_update["rag_chunks"])
 
                     if "tokens_used" in state_update:
                         tokens_used = state_update.get("tokens_used", 0) or 0
+
+                    if "strategy" in state_update and state_update["strategy"]:
+                        strategy_used = state_update["strategy"]
+
+                    if "complexity_score" in state_update:
+                        complexity_score = state_update.get("complexity_score", 0) or 0
 
                     if "validation_passed" in state_update:
                         validation_passed = state_update["validation_passed"]
@@ -359,11 +476,35 @@ class GraphOrchestrator:
                     if "error" in state_update and state_update["error"]:
                         final_error = state_update["error"]
 
+                    if node_name == "repair":
+                        repair_count += 1
+
+                    # Build dynamic progress message
+                    total_steps = len(self._NODE_ORDER)
+                    msg = self._build_stream_msg(
+                        node_name, state_update, step_counter, total_steps,
+                        class_name=class_name,
+                        elapsed_ms=step_elapsed_ms if step_counter > 1 else 0,
+                        repair_count=repair_count,
+                    )
+
+                    # Emit progress message
+                    yield StreamEvent(
+                        phase=phase,
+                        content=f"> {msg}\n\n",
+                        delta=False,
+                    )
+
                     # When call_llm finishes, stream the generated code
                     if node_name == "call_llm" and "test_code" in state_update:
                         code = state_update.get("test_code", "")
                         if code:
                             test_code = code
+                            yield StreamEvent(
+                                phase=StreamPhase.GENERATING,
+                                content="```java\n",
+                                delta=True,
+                            )
                             chunk_size = 60
                             for i in range(0, len(code), chunk_size):
                                 yield StreamEvent(
@@ -371,6 +512,11 @@ class GraphOrchestrator:
                                     content=code[i:i + chunk_size],
                                     delta=True,
                                 )
+                            yield StreamEvent(
+                                phase=StreamPhase.GENERATING,
+                                content="\n```\n\n",
+                                delta=True,
+                            )
 
                     # When repair finishes, stream the repaired code
                     if node_name == "repair" and "test_code" in state_update:
@@ -379,7 +525,7 @@ class GraphOrchestrator:
                             test_code = new_code
                             yield StreamEvent(
                                 phase=StreamPhase.REPAIRING,
-                                content="\n\n--- Repaired code ---\n\n",
+                                content="\n\n> 🔧 **Repaired code:**\n\n```java\n",
                                 delta=False,
                             )
                             chunk_size = 60
@@ -389,8 +535,14 @@ class GraphOrchestrator:
                                     content=new_code[i:i + chunk_size],
                                     delta=True,
                                 )
+                            yield StreamEvent(
+                                phase=StreamPhase.GENERATING,
+                                content="\n```\n\n",
+                                delta=True,
+                            )
 
             # Done — emit final event with metadata
+            total_elapsed_ms = (time.time() - stream_start) * 1000
             if final_error:
                 yield StreamEvent(
                     phase=StreamPhase.ERROR,
@@ -406,7 +558,10 @@ class GraphOrchestrator:
                         "rag_chunks_used": rag_chunks_used,
                         "tokens_used": tokens_used,
                         "class_name": class_name,
-                        "strategy_used": "single_pass",
+                        "strategy_used": strategy_used,
+                        "complexity_score": complexity_score,
+                        "repair_attempts": repair_count,
+                        "elapsed_ms": round(total_elapsed_ms),
                     },
                 )
 
@@ -417,29 +572,33 @@ class GraphOrchestrator:
                 content=f"Error: {e}",
             )
 
-    def get_run_state(self, run_id: str) -> Optional[dict]:
+    async def get_run_state(self, run_id: str) -> Optional[dict]:
         """Get the state of a graph run (for polling/review endpoints)."""
         config = {"configurable": {"thread_id": run_id}}
         try:
-            state = self._graph.get_state(config)
+            state = await self._graph.aget_state(config)
             return state.values if state else None
         except Exception as e:
             logger.error("Failed to get run state", run_id=run_id, error=str(e))
             return None
 
-    def submit_review(self, run_id: str, approved: bool, feedback: str = "") -> GraphGenerationResult:
-        """Resume a paused graph after human review."""
+    async def submit_review(self, run_id: str, approved: bool, feedback: str = "") -> GraphGenerationResult:
+        """Resume a paused graph after human review (async)."""
         config = {"configurable": {"thread_id": run_id}}
 
         try:
+            # Get current state to preserve class_name
+            current_state = await self.get_run_state(run_id)
+            initial_class_name = current_state.get("class_name", "") if current_state else ""
+
             # Update state with review decision
-            self._graph.update_state(
+            await self._graph.aupdate_state(
                 config,
                 {"human_approved": approved, "human_feedback": feedback},
             )
 
             # Resume execution
-            result_state = self._graph.invoke(None, config=config)
+            result_state = await self._graph.ainvoke(None, config=config)
 
             subgraph_json = result_state.get("subgraph_result", "{}")
             try:
@@ -448,11 +607,12 @@ class GraphOrchestrator:
                 result_data = {}
 
             return GraphGenerationResult(
-                success=result_data.get("success", True),
-                test_code=result_data.get("test_code", ""),
-                class_name=result_data.get("class_name", ""),
-                validation_passed=result_data.get("validation_passed", True),
-                validation_issues=result_data.get("validation_issues", []),
+                success=bool(result_data.get("success", True)),
+                test_code=str(result_data.get("test_code", "")) or None,
+                class_name=str(result_data.get("class_name", initial_class_name)),
+                validation_passed=bool(result_data.get("validation_passed", True)),
+                validation_issues=cast(list[str], result_data.get("validation_issues", [])),
+                error=str(result_data.get("error", "")) or None,
                 run_id=run_id,
             )
 
@@ -461,7 +621,7 @@ class GraphOrchestrator:
             return GraphGenerationResult(success=False, error=str(e), run_id=run_id)
 
 
-def create_graph_orchestrator(
+async def create_graph_orchestrator(
     rag_client=None,
     vllm_client=None,
 ) -> GraphOrchestrator:
@@ -486,9 +646,14 @@ def create_graph_orchestrator(
             model=os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"),
         )
 
-    return GraphOrchestrator(
+    orchestrator = GraphOrchestrator(
         rag_client=rag_client,
         vllm_client=vllm_client,
         repo_path=os.getenv("JAVA_REPO_PATH") or None,
-        checkpoint_db=os.getenv("LANGGRAPH_CHECKPOINT_DB", "checkpoints.db"),
     )
+    
+    await orchestrator.initialize(
+        checkpoint_db=os.getenv("LANGGRAPH_CHECKPOINT_DB", "checkpoints.db")
+    )
+    
+    return orchestrator

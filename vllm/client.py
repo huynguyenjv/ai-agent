@@ -61,7 +61,7 @@ class VLLMClient:
         )
 
         # Use longer timeouts for connect and read
-        client_kwargs = ssl_config.configure_httpx_client(
+        self._client_kwargs = ssl_config.configure_httpx_client(
             timeout=httpx.Timeout(
                 connect=30.0,
                 read=timeout,
@@ -76,7 +76,8 @@ class VLLMClient:
             http2=False,  # Disable HTTP/2 for better compatibility with vLLM
         )
         
-        self.client = httpx.Client(**client_kwargs)
+        self.client = httpx.Client(**self._client_kwargs)
+        self.aclient = httpx.AsyncClient(**self._client_kwargs)
 
         logger.info(
             "vLLM client initialized",
@@ -84,6 +85,73 @@ class VLLMClient:
             model=model,
             max_connections=max_connections,
         )
+
+    async def agenerate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stream: bool = True,
+        max_retries: int = 2,
+    ) -> GenerationResponse:
+        """Async variant of generate()."""
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature or self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "top_p": self.top_p,
+            "stream": stream,
+        }
+
+        last_error: Optional[str] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                if stream:
+                    return await self._agenerate_streaming(payload)
+                else:
+                    return await self._agenerate_non_streaming(payload)
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                last_error = f"Async request failed (attempt {attempt}): {e}"
+                if attempt < max_retries:
+                    import asyncio
+                    await asyncio.sleep(min(2 ** attempt, 10))
+                continue
+        return GenerationResponse(success=False, error=last_error)
+
+    async def _agenerate_streaming(self, payload: dict) -> GenerationResponse:
+        content_parts = []
+        finish_reason = ""
+        async with self.aclient.stream("POST", f"{self.base_url}/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":"): continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]": break
+                    try:
+                        data = json.loads(data_str)
+                        choice = data.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        if "content" in delta: content_parts.append(delta["content"])
+                        if choice.get("finish_reason"): finish_reason = choice["finish_reason"]
+                    except json.JSONDecodeError: continue
+            try: await response.aread()
+            except Exception: pass
+        content = "".join(content_parts)
+        return GenerationResponse(success=True, content=content, tokens_used=count_tokens(content), finish_reason=finish_reason)
+
+    async def _agenerate_non_streaming(self, payload: dict) -> GenerationResponse:
+        payload["stream"] = False
+        response = await self.aclient.post(f"{self.base_url}/chat/completions", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        choice = data["choices"][0]
+        return GenerationResponse(success=True, content=choice["message"]["content"], tokens_used=data.get("usage", {}).get("total_tokens", 0), finish_reason=choice.get("finish_reason", ""))
 
     def generate(
         self,
@@ -110,6 +178,18 @@ class VLLMClient:
             "top_p": self.top_p,
             "stream": stream,
         }
+
+        # ── LOG PROMPT METADATA (avoid dumping full prompt for perf) ──
+        logger.info(
+            "vLLM request",
+            system_len=len(system_prompt),
+            user_len=len(user_prompt),
+            model=self.model,
+            temperature=temperature or self.temperature,
+            max_tokens=max_tokens or self.max_tokens,
+        )
+        logger.debug(f"SYSTEM: {system_prompt[:300]}..." if len(system_prompt) > 300 else f"SYSTEM: {system_prompt}")
+        logger.debug(f"USER: {user_prompt[:300]}..." if len(user_prompt) > 300 else f"USER: {user_prompt}")
 
         last_error: Optional[str] = None
 
@@ -308,6 +388,14 @@ class VLLMClient:
             "stream": True,
         }
 
+        # ── LOG PROMPT METADATA (avoid dumping full prompt for perf) ──
+        logger.info(
+            "vLLM streaming request",
+            system_len=len(system_prompt),
+            user_len=len(user_prompt),
+            model=self.model,
+        )
+
         with self.client.stream(
             "POST",
             f"{self.base_url}/chat/completions",
@@ -370,6 +458,15 @@ class VLLMClient:
         if not self._closed:
             self._closed = True
             self.client.close()
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.aclient.aclose())
+                else:
+                    loop.run_until_complete(self.aclient.aclose())
+            except Exception:
+                pass
             logger.info("vLLM client closed")
 
     def is_closed(self) -> bool:

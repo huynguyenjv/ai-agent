@@ -1,0 +1,43 @@
+{% if changed_methods %}
+## Task
+The following methods were changed/added in `{{ class_name }}`: {{ changed_methods_str }}.
+Generate ONLY the additional test methods needed for these changes.
+{% else %}
+## Task
+Generate additional unit tests for `{{ class_name }}` covering methods NOT yet tested in the existing test file.
+{% endif %}
+
+{% if task_description %}
+Additional instructions: {{ task_description }}
+{% endif %}
+
+## Target Class
+- Class: `{{ class_name }}`
+- File: `{{ file_path }}`
+
+## Existing Test File
+This test file already exists. DO NOT regenerate tests for methods already covered.
+
+```java
+{{ existing_test_code }}
+```
+
+{% if tested_methods_str %}
+## Already Tested Methods
+The following methods already have tests — DO NOT duplicate them: {{ tested_methods_str }}
+{% endif %}
+
+{% if context_summary %}
+## Codebase Context
+{{ context_summary }}
+{% endif %}
+
+## Output Requirements
+1. Generate ONLY new test methods — not a complete test class
+2. Follow the EXACT same style, naming conventions, and patterns as the existing test file
+3. Use the same @Mock fields already declared in the existing test
+4. If new @Mock fields are needed, list them at the top with a comment: // NEW MOCK FIELDS NEEDED
+5. Each test method must have @Test and @DisplayName
+6. Follow AAA pattern with comments: // Arrange, // Act, // Assert
+7. DO NOT include class declaration, imports, or @BeforeEach — only new test methods
+8. Use method naming: methodName_WhenCondition_ShouldExpectedResult
