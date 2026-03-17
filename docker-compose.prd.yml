@@ -1,14 +1,7 @@
 version: '3.8'
 
 # =============================================================================
-# AI Agent Docker Compose — PRODUCTION (External vLLM)
-# =============================================================================
-# Usage:
-#   docker-compose -f docker-compose.prd.yml --env-file .env.prd up -d
-#
-# This configuration assumes vLLM is running externally (e.g., on the host
-# or a separate specialized GPU node). Connectivity is handled via 
-# host.docker.internal or a direct IP.
+# AI Agent Docker Compose — PRODUCTION (External vLLM, EC2 Ready)
 # =============================================================================
 
 services:
@@ -21,50 +14,61 @@ services:
     container_name: ai-agent
     ports:
       - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
+
     environment:
-      # Server
-      - SERVER_HOST=${SERVER_HOST:-0.0.0.0}
-      - SERVER_PORT=${SERVER_PORT:-8080}
-      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
-      - MAX_WORKERS=${MAX_WORKERS:-8}
-      # vLLM (External Instance)
-      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://host.docker.internal:8000/v1}
-      - VLLM_API_KEY=${VLLM_API_KEY}
-      - VLLM_MODEL=${VLLM_MODEL}
-      # Qdrant
-      - QDRANT_HOST=${QDRANT_HOST:-qdrant}
-      - QDRANT_PORT=${QDRANT_PORT:-6333}
-      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-java_codebase}
-      # Embedding (ONNX in-process)
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2-onnx}
-      - SENTENCE_TRANSFORMERS_HOME=/app/models
-      # Redis (Memory Backend)
-      - MEMORY_BACKEND=${MEMORY_BACKEND:-redis}
-      - REDIS_HOST=${REDIS_HOST:-redis}
-      - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - REDIS_DB=${REDIS_DB:-0}
-      # Rate Limiting
-      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-30}
-      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW:-60}
-      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-300}
-      # Security
-      - CORS_ORIGINS=${CORS_ORIGINS}
-      - DISABLE_SSL_VERIFY=${DISABLE_SSL_VERIFY:-false}
-    # For Linux: host.docker.internal support
+      # ---------------- Server ----------------
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: ${SERVER_PORT:-8080}
+      LOG_LEVEL: ${LOG_LEVEL:-WARNING}
+      MAX_WORKERS: ${MAX_WORKERS:-8}
+
+      # ---------------- vLLM (External) ----------------
+      # ⚠️ EC2: nên dùng private IP thay vì host.docker.internal
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://172.29.2.158:8000/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY}
+      VLLM_MODEL: ${VLLM_MODEL}
+
+      # ---------------- Qdrant ----------------
+      QDRANT_HOST: ${QDRANT_HOST:-qdrant}
+      QDRANT_PORT: ${QDRANT_PORT:-6333}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-java_codebase}
+
+      # ---------------- Embedding ----------------
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2-onnx}
+      SENTENCE_TRANSFORMERS_HOME: /app/models
+
+      # ---------------- Redis ----------------
+      MEMORY_BACKEND: ${MEMORY_BACKEND:-redis}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB: ${REDIS_DB:-0}
+
+      # ---------------- Rate Limit ----------------
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-30}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-60}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-300}
+
+      # ---------------- Security ----------------
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      DISABLE_SSL_VERIFY: ${DISABLE_SSL_VERIFY:-false}
+
+    # Support EC2 Linux networking
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
     volumes:
       - ./models:/app/models
-      # Optional: persistent logs or checkpoints if not using external DB
       - ./checkpoints.db:/app/checkpoints.db
+
+    # ❗ KHÔNG block startup
     depends_on:
-      qdrant:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - qdrant
+      - redis
+
     command: ["python", "main.py"]
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${SERVER_PORT:-8080}/health"]
       interval: 30s
@@ -77,40 +81,54 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: ai-agent-qdrant
+
     ports:
       - "6333:6333"
+
     volumes:
       - qdrant_data:/qdrant/storage
+
     restart: unless-stopped
+
+    # ✅ FIX: endpoint đúng (KHÔNG phải /health)
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:6333/collections"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # Redis (Session Memory Store)
+  # Redis (Memory Store)
   # ---------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     container_name: ai-agent-redis
+
     ports:
       - "${REDIS_PORT:-6379}:6379"
+
     volumes:
       - redis_data:/data
+
     command: >
       redis-server
       --appendonly yes
       --maxmemory ${REDIS_MAXMEMORY:-512mb}
       --maxmemory-policy allkeys-lru
       ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
 
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
 volumes:
   qdrant_data:
     driver: local
