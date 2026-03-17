@@ -1,0 +1,102 @@
+## Task
+{{ task_text }}
+
+{% if source_code %}
+## Source Code Under Test
+```java
+{{ source_code }}
+```
+{% endif %}
+
+## Target Class
+- Class: `{{ class_name }}`
+- File: `{{ file_path }}`
+
+{% if layer != "unknown" %}
+- Layer: {{ layer }}
+- Testing Focus: {{ focus }}
+{% endif %}
+
+{% if rag_chunks %}
+## Codebase Context
+Use this context to understand the class and its dependencies:
+
+{% if main_class %}
+### Target Class Summary
+{% if main_class_lombok %}// Lombok: {{ main_class_lombok }}{% endif %}
+```java
+{{ main_class.summary }}
+```
+{% endif %}
+
+{% if domain_types %}
+### Domain Types Used by This Class
+⚠️ Use ONLY the construction pattern shown for each type. DO NOT guess.
+
+{% for dt in domain_types %}
+// [Domain Type/DTO] {{ dt.class_name }} ({{ dt.type_label }})
+{% if dt.construction %}{{ dt.construction_comments }}{% endif %}
+{% if dt.comp_str %}// Record components (EXACT — do not add/change): `{{ dt.comp_str }}`{% endif %}
+{% if dt.field_str %}// Fields (EXACT — do not add/change): `{{ dt.field_str }}`{% endif %}
+```java
+{{ dt.summary }}
+```
+{% endfor %}
+{% endif %}
+
+{% if unfound %}
+### ⚠️ Domain Types NOT FOUND in Codebase Index
+The following types are referenced by imports/dependencies but their source code is NOT available. **DO NOT guess their fields, constructors, or builder patterns.** Use `mock(Type.class)` and stub ONLY the accessors actually called in the method body.
+
+{% for uf in unfound %}
+- **{{ uf }}** → `{{ uf }} obj = mock({{ uf }}.class);` then `when(obj.field()).thenReturn(value);`
+{% endfor %}
+{% endif %}
+
+{% if dependencies %}
+### Service Dependencies (Mocks)
+{% for dep in dependencies %}
+// [Dependency] {{ dep.class_name }} ({{ dep.type_info }})
+```java
+{{ dep.summary_truncated }}
+```
+{% endfor %}
+{% endif %}
+
+{% if related %}
+### Related Code
+{% for rel in related %}
+// [Related] {{ rel.class_name }} ({{ rel.type_info }})
+```java
+{{ rel.summary_truncated }}
+```
+{% endfor %}
+{% endif %}
+{% endif %}
+
+{% if session_context %}
+## Previous Context
+{{ session_context }}
+{% endif %}
+
+{% if reference_test %}
+## Reference: Previous Test Style
+Follow similar patterns as the previously generated test for `{{ reference_test_class }}`
+{% endif %}
+
+## Requirements
+1. Use JUnit 5 + Mockito ONLY (no Spring test context)
+2. Follow AAA pattern with comments: // Arrange, // Act, // Assert
+3. Include @DisplayName for all tests
+4. Verify all mock interactions
+5. Test ONLY behaviors visible in the source code — do NOT invent exceptions
+6. Generate complete, compilable code with correct imports (COPY imports from source)
+7. If method just delegates, test delegation only (no failure path)
+8. ALL constructor dependencies MUST have @Mock — count them before writing
+9. SecurityContextHolder / static utilities → MUST use MockedStatic with try-with-resources
+10. NEVER use LocalDateTime.now() in expected test data — use ArgumentCaptor or any()
+11. Keep literal values consistent: same value in setUp/when/verify/assertEquals
+12. If domain type source NOT provided → use mock(Type.class) + stub only accessed fields
+13. Mock ALL intermediate dependency calls (e.g., buildClaims before createToken)
+14. Verify MockedStatic via mock object variables, NOT chained static calls
+15. Use enum constants from source, NOT raw int/string equivalents

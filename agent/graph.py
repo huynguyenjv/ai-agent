@@ -30,6 +30,7 @@ Usage::
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import Optional
 
 from langgraph.graph import StateGraph, END
@@ -66,7 +67,7 @@ def route_to_subgraph(state: dict) -> str:
 # Graph factory
 # ═══════════════════════════════════════════════════════════════════════
 
-def create_agent_graph(
+async def create_agent_graph(
     *,
     rag_client,
     vllm_client,
@@ -80,12 +81,12 @@ def create_agent_graph(
     cache_service=None,
     checkpoint_db: str = "checkpoints.db",
 ):
-    """Create the main agent graph with all dependencies wired in.
+    """Build and compile the LangGraph agent for Java unit test generation.
 
     Args:
-        rag_client: RAGClient instance.
-        vllm_client: VLLMClient instance.
-        prompt_builder: PromptBuilder (auto-created if None).
+        rag_client: RAG client for context retrieval.
+        vllm_client: VLLM client for LLM interaction.
+        prompt_builder: Prompt template builder.
         validation_pipeline: ValidationPipeline (auto-created if None).
         repair_selector: RepairStrategySelector (auto-created if None).
         context_builder: Optional ContextBuilder.
@@ -128,8 +129,16 @@ def create_agent_graph(
     # ── Build Supervisor graph ──────────────────────────────────────
     supervisor_graph = StateGraph(AgentState)
 
+    from agent.prompt import TemplateEngine
+    template_engine = TemplateEngine()
+
     # Supervisor node classifies intent
-    supervisor_graph.add_node("supervisor", supervisor_node)
+    supervisor = partial(
+        supervisor_node,
+        vllm_client=vllm_client,
+        template_engine=template_engine
+    )
+    supervisor_graph.add_node("supervisor", supervisor)
 
     # SubGraph nodes (each is a compiled subgraph)
     supervisor_graph.add_node("unit_test", unit_test_compiled)
@@ -152,7 +161,7 @@ def create_agent_graph(
     supervisor_graph.add_edge("unit_test", END)
 
     # ── Compile with checkpointer ───────────────────────────────────
-    checkpointer = _create_checkpointer(checkpoint_db)
+    checkpointer = await _create_checkpointer(checkpoint_db)
 
     compiled = supervisor_graph.compile(checkpointer=checkpointer)
 
@@ -165,19 +174,16 @@ def create_agent_graph(
     return compiled
 
 
-def _create_checkpointer(db_path: str):
+async def _create_checkpointer(db_path: str):
     """Create SQLite checkpointer for persistent state.
 
     Falls back to in-memory if SQLite fails.
     """
     try:
-        import sqlite3
-        from langgraph.checkpoint.sqlite import SqliteSaver
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
         
-        # Create a persistent connection and pass it to SqliteSaver
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        checkpointer = SqliteSaver(conn)
-        logger.info("Checkpointer: SQLite", db=db_path)
+        checkpointer = await AsyncSqliteSaver.from_conn_string(db_path)
+        logger.info("Checkpointer: Async SQLite", db=db_path)
         return checkpointer
     except Exception as e:
         logger.warning("SQLite checkpointer failed, using MemorySaver", error=str(e))

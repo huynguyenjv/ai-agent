@@ -13,16 +13,8 @@ import structlog
 logger = structlog.get_logger()
 
 
-def call_llm_node(state: dict, *, vllm_client) -> dict:
-    """Call vLLM with system + user prompts, extract Java code.
-
-    Args:
-        state: UnitTestState dict.
-        vllm_client: VLLMClient instance.
-
-    Returns:
-        State updates: llm_output, test_code, tokens_used, retry_count.
-    """
+async def call_llm_node(state: dict, *, vllm_client) -> dict:
+    """Call vLLM with system + user prompts, extract Java code."""
     system_prompt = state.get("system_prompt", "")
     user_prompt = state.get("user_prompt", "")
     retry_count = state.get("retry_count", 0)
@@ -34,15 +26,8 @@ def call_llm_node(state: dict, *, vllm_client) -> dict:
         user_len=len(user_prompt),
     )
 
-    # ── LOG FULL PROMPTS FOR DEBUGGING/REPORTING ─────────────────────
-    logger.info("--- vLLM SYSTEM PROMPT ---")
-    logger.info(system_prompt)
-    logger.info("--- vLLM USER PROMPT ---")
-    logger.info(user_prompt)
-    logger.info("--------------------------------------------------")
-
     try:
-        response = vllm_client.generate(
+        response = await vllm_client.agenerate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )

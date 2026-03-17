@@ -21,7 +21,7 @@ from typing import Optional
 
 import structlog
 
-from .validation import ValidationResult, ValidationIssue, IssueCategory, IssueSeverity
+from .validation_schema import ValidationResult, ValidationIssue, IssueCategory, IssueSeverity
 
 logger = structlog.get_logger()
 
