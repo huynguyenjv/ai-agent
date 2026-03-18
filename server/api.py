@@ -1644,12 +1644,36 @@ async def chat_completions(request: ChatCompletionRequest):
         tool_rules = tool_orchestrator.build_tool_system_prompt(request.tools)
         effective_system += f"\n\n{tool_rules}"
 
+    # ── Build multi-turn messages for tool calling ──────────────────
+    # When Continue sends tool results, we need the full conversation
+    # history (system + user + assistant + tool messages) so vLLM can
+    # see the tool results and continue the conversation.
+    multi_turn_messages: Optional[list] = None
+    if tool_messages:
+        multi_turn_messages = [{"role": "system", "content": effective_system}]
+        for msg in request.messages:
+            if msg.role == "system":
+                continue  # already added above
+            m: dict = {"role": msg.role, "content": msg.content or ""}
+            # Preserve tool_call_id for tool result messages
+            if msg.tool_call_id:
+                m["tool_call_id"] = msg.tool_call_id
+            # Preserve tool_calls from assistant messages (as text content)
+            if msg.role == "assistant" and msg.tool_calls:
+                tc_text = "\n".join(
+                    f'<tool_call>\n{{"name": "{tc.function.name}", "arguments": {tc.function.arguments}}}\n</tool_call>'
+                    for tc in msg.tool_calls
+                )
+                m["content"] = (m["content"] or "") + "\n" + tc_text
+            multi_turn_messages.append(m)
+
     # ── REAL STREAMING ───────────────────────────────────────────────
     # Chat completions always stream; ignore request.stream here.
     return _stream_from_vllm(
         response_id, created_time, request.model,
         effective_system, enhanced_prompt,
         request.temperature, request.max_tokens,
+        messages=multi_turn_messages,
     )
 
 
@@ -1820,17 +1844,20 @@ def _stream_from_vllm(
     user_prompt: str,
     temperature: Optional[float],
     max_tokens: Optional[int],
+    messages: Optional[list] = None,
 ) -> StreamingResponse:
-    """Pipe vLLM streaming directly to the client — real TTFT."""
+    """Pipe vLLM streaming directly to the client — real TTFT.
+
+    Includes tool-call interception: when the model outputs ``<tool_call>``
+    XML, the server buffers it, parses the JSON, and emits an
+    OpenAI-compatible ``tool_calls`` delta so Continue can execute the tool.
+    """
 
     async def _generate():
         # Role chunk
         yield _sse_chunk(response_id, created_time, model,
                          delta={"role": "assistant", "content": ""})
         try:
-            # stream_generate() is a sync generator (httpx sync client),
-            # so we run it in a thread and ferry deltas via an asyncio.Queue
-            # to avoid blocking the event loop.
             queue: asyncio.Queue[str | None] = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
@@ -1841,6 +1868,7 @@ def _stream_from_vllm(
                         user_prompt=user_prompt,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        messages=messages,
                     ):
                         loop.call_soon_threadsafe(queue.put_nowait, delta_text)
                 except Exception as exc:
@@ -1852,73 +1880,157 @@ def _stream_from_vllm(
 
             loop.run_in_executor(None, _run_sync_gen)
 
-            full_text = ""
-            current_tool_call: Optional[Dict[str, Any]] = None
-            tool_call_buffer = ""
-            in_tool_tag = False
+            # ── Tool-call interception state ─────────────────────────
+            START_TAG = "<tool_call>"
+            END_TAG = "</tool_call>"
+            TAG_MAX_LEN = len(START_TAG)  # 11
+
+            full_text = ""        # entire accumulated response
+            in_tool_tag = False   # True while buffering inside <tool_call>
+            tool_buffer = ""      # content between tags
+            tool_call_index = 0   # increments for each parsed call
+            has_tool_calls = False # any tool call emitted?
+            pending_text = ""     # text waiting to be yielded (may contain partial tag)
 
             while True:
                 item = await queue.get()
                 if item is None:
+                    # Stream ended — flush any pending text
+                    if pending_text and not in_tool_tag:
+                        yield _sse_chunk(response_id, created_time, model,
+                                         delta={"content": pending_text})
                     break
 
                 full_text += item
-                
-                # Check for start of tool tag
-                if not in_tool_tag and "<tool_call>" in full_text[-(len(item) + 12):]:
-                    in_tool_tag = True
-                    # Split item into "pre-tag text" and "post-tag marker"
-                    # For simplicity, if we detect the tag start, we stop yielding raw text
-                    # and start collecting the tool call.
-                    continue
 
                 if in_tool_tag:
-                    tool_call_buffer += item
-                    if "</tool_call>" in tool_call_buffer:
+                    # Accumulate inside <tool_call> buffer
+                    tool_buffer += item
+                    if END_TAG in tool_buffer:
                         # Full tool call received
-                        raw_call = tool_call_buffer.split("</tool_call>")[0].strip()
+                        raw_call = tool_buffer.split(END_TAG)[0].strip()
+                        remainder = tool_buffer.split(END_TAG, 1)[1] if END_TAG in tool_buffer else ""
+
                         try:
-                            # Try to find the JSON start { if the model output text before it
+                            # Find JSON object start
                             if "{" in raw_call:
                                 raw_call = raw_call[raw_call.find("{"):]
-                            
                             call_data = json.loads(raw_call)
                             call_id = f"call_{uuid.uuid4().hex[:12]}"
-                            
-                            # Yield tool_calls delta (OpenAI format)
+
+                            # Emit tool_calls delta (OpenAI format)
                             yield _sse_chunk(response_id, created_time, model,
                                 delta={
                                     "tool_calls": [{
-                                        "index": 0,
+                                        "index": tool_call_index,
                                         "id": call_id,
                                         "type": "function",
                                         "function": {
-                                            "name": call_data.get("name"),
-                                            "arguments": json.dumps(call_data.get("arguments", {}))
+                                            "name": call_data.get("name", ""),
+                                            "arguments": json.dumps(
+                                                call_data.get("arguments", {}),
+                                                ensure_ascii=False,
+                                            )
                                         }
                                     }]
                                 })
+                            tool_call_index += 1
+                            has_tool_calls = True
                         except Exception as exc:
-                            logger.error("Failed to parse pseudo-tool-call", error=str(exc), raw=raw_call)
+                            logger.error("Failed to parse tool call",
+                                         error=str(exc), raw=raw_call[:200])
                             yield _sse_chunk(response_id, created_time, model,
                                              delta={"content": f"\n\n[Error parsing tool call: {exc}]"})
-                        
-                        # Reset for next call (if any) or text
+
+                        # Reset state
                         in_tool_tag = False
-                        tool_call_buffer = ""
+                        tool_buffer = ""
+                        # If there's text after </tool_call>, put it back as pending
+                        if remainder.strip():
+                            pending_text = remainder
                     continue
 
-                # Normal text streaming
-                yield _sse_chunk(response_id, created_time, model,
-                                 delta={"content": item})
+                # ── Not inside a tool tag — check for tag start ──────
+                pending_text += item
+
+                # Look for <tool_call> in the pending text
+                if START_TAG in pending_text:
+                    # Split: yield text before the tag, buffer after
+                    before, after = pending_text.split(START_TAG, 1)
+                    if before:
+                        yield _sse_chunk(response_id, created_time, model,
+                                         delta={"content": before})
+                    pending_text = ""
+
+                    # If after already contains the end tag, process immediately
+                    # (happens when tag was split across chunks and reassembled)
+                    if END_TAG in after:
+                        raw_call = after.split(END_TAG)[0].strip()
+                        remainder = after.split(END_TAG, 1)[1]
+                        try:
+                            if "{" in raw_call:
+                                raw_call = raw_call[raw_call.find("{"):]
+                            call_data = json.loads(raw_call)
+                            call_id = f"call_{uuid.uuid4().hex[:12]}"
+                            yield _sse_chunk(response_id, created_time, model,
+                                delta={
+                                    "tool_calls": [{
+                                        "index": tool_call_index,
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call_data.get("name", ""),
+                                            "arguments": json.dumps(
+                                                call_data.get("arguments", {}),
+                                                ensure_ascii=False,
+                                            )
+                                        }
+                                    }]
+                                })
+                            tool_call_index += 1
+                            has_tool_calls = True
+                        except Exception as exc:
+                            logger.error("Failed to parse tool call",
+                                         error=str(exc), raw=raw_call[:200])
+                            yield _sse_chunk(response_id, created_time, model,
+                                             delta={"content": f"\n\n[Error parsing tool call: {exc}]"})
+                        if remainder.strip():
+                            pending_text = remainder
+                    else:
+                        in_tool_tag = True
+                        tool_buffer = after
+                    continue
+
+                # Check if pending_text ends with a partial tag start
+                # e.g. "<tool_" or "<tool_ca" — don't yield yet, wait for more
+                might_be_tag = False
+                for i in range(1, min(TAG_MAX_LEN, len(pending_text) + 1)):
+                    if pending_text.endswith(START_TAG[:i]):
+                        might_be_tag = True
+                        break
+
+                if might_be_tag:
+                    # Hold the potential partial tag — yield everything before it
+                    safe_end = len(pending_text) - TAG_MAX_LEN
+                    if safe_end > 0:
+                        yield _sse_chunk(response_id, created_time, model,
+                                         delta={"content": pending_text[:safe_end]})
+                        pending_text = pending_text[safe_end:]
+                else:
+                    # No tag in sight — yield everything
+                    yield _sse_chunk(response_id, created_time, model,
+                                     delta={"content": pending_text})
+                    pending_text = ""
 
         except Exception as e:
             logger.error("Streaming generation error", error=str(e))
             yield _sse_chunk(response_id, created_time, model,
                              delta={"content": f"\n\n[Error: {e}]"})
-        # Finish
+
+        # Finish — use "tool_calls" finish reason if any tool was emitted
+        finish = "tool_calls" if has_tool_calls else "stop"
         yield _sse_chunk(response_id, created_time, model,
-                         delta={}, finish_reason="stop")
+                         delta={}, finish_reason=finish)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

@@ -364,6 +364,7 @@ class VLLMClient:
         user_prompt: str,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        messages: Optional[list] = None,
     ) -> Generator[str, None, None]:
         """Yield content delta strings as they arrive from vLLM.
 
@@ -371,17 +372,25 @@ class VLLMClient:
         Each ``yield`` is a small text delta that can be forwarded
         immediately to an SSE client (Continue / Tabby / etc.).
 
+        When ``messages`` is provided (e.g. for multi-turn tool calling),
+        it is used as-is instead of building the default [system, user] pair.
+
         Usage::
 
             for chunk in vllm.stream_generate(sys, usr):
                 send_sse(chunk)
         """
-        payload = {
-            "model": self.model,
-            "messages": [
+        if messages:
+            msg_list = messages
+        else:
+            msg_list = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ],
+            ]
+
+        payload = {
+            "model": self.model,
+            "messages": msg_list,
             "temperature": temperature or self.temperature,
             "max_tokens": max_tokens or self.max_tokens,
             "top_p": self.top_p,
