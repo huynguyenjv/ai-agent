@@ -192,6 +192,160 @@ class IndexBuilder:
         return len(points)
 
     # ------------------------------------------------------------------
+    # Single-file indexing (for Continue.dev / IDE integration)
+    # ------------------------------------------------------------------
+
+    def index_single_file(
+        self,
+        source_code: str,
+        file_path: str,
+        collection_name: Optional[str] = None,
+    ) -> dict:
+        """Index a single Java file's content into Qdrant.
+
+        Reuses the same Java-aware parsing, summarization, and embedding
+        pipeline as ``index_repository()`` but operates on one file.
+
+        Steps:
+            1. Parse source_code with JavaParser.parse_source()
+            2. Delete old points for this file_path (idempotent update)
+            3. Create class + method points
+            4. Upsert to Qdrant
+
+        Note:
+            Cross-class dependency graph is *not* resolved here because
+            we only have one file.  For full graph resolution, use
+            ``index_repository()`` or ``/reindex``.
+
+        Returns:
+            dict with ``success``, ``classes_indexed``, ``points_created``,
+            and ``error`` (if any).
+        """
+        effective_collection = collection_name or self.collection_name
+        logger.info(
+            "Indexing single file",
+            file_path=file_path,
+            collection=effective_collection,
+        )
+
+        try:
+            # Ensure collection exists
+            self.create_collection(recreate=False, collection_name=effective_collection)
+
+            # 1. Parse
+            class_info = self.parser.parse_source(source_code, file_path)
+            if not class_info:
+                return {
+                    "success": False,
+                    "classes_indexed": 0,
+                    "points_created": 0,
+                    "error": f"No Java class found in {file_path}",
+                }
+
+            classes = [class_info]
+            # Include inner classes if present
+            if class_info.inner_classes:
+                classes.extend(class_info.inner_classes)
+
+            # 2. Delete old points for this file_path
+            self._delete_points_by_file_path(effective_collection, file_path)
+
+            # 3. Build minimal dependency graph (single-file scope)
+            name_map = {c.name: c for c in classes}
+            fqn_map = {c.fully_qualified_name: c for c in classes}
+            graph = self._build_dependency_graph(classes, name_map, fqn_map)
+
+            # 4. Create points — use UUIDs for point IDs to avoid collisions
+            import hashlib
+
+            points: list[models.PointStruct] = []
+            for cls in classes:
+                # Deterministic ID from FQN so re-indexing replaces the same point
+                point_id = self._fqn_to_point_id(cls.fully_qualified_name)
+                class_point = self._create_class_point(
+                    cls, point_id, name_map, fqn_map, graph,
+                )
+                if class_point:
+                    points.append(class_point)
+
+                # Index methods individually for large classes
+                if len(cls.methods) > 5:
+                    for method in cls.methods:
+                        method_id = self._fqn_to_point_id(
+                            f"{cls.fully_qualified_name}.{method.name}"
+                        )
+                        method_point = self._create_method_point(method, cls, method_id)
+                        if method_point:
+                            points.append(method_point)
+
+            # 5. Upsert
+            if points:
+                self.qdrant.upsert(
+                    collection_name=effective_collection, points=points,
+                )
+
+            logger.info(
+                "Single file indexed",
+                file_path=file_path,
+                classes=len(classes),
+                points=len(points),
+            )
+            return {
+                "success": True,
+                "classes_indexed": len(classes),
+                "points_created": len(points),
+                "error": None,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Single file indexing failed",
+                file_path=file_path,
+                error=str(e),
+            )
+            return {
+                "success": False,
+                "classes_indexed": 0,
+                "points_created": 0,
+                "error": str(e),
+            }
+
+    def _delete_points_by_file_path(
+        self, collection_name: str, file_path: str,
+    ) -> None:
+        """Delete all existing points for a given file_path (idempotent)."""
+        try:
+            self.qdrant.delete(
+                collection_name=collection_name,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="file_path",
+                                match=models.MatchValue(value=file_path),
+                            )
+                        ]
+                    )
+                ),
+            )
+            logger.debug("Deleted old points", file_path=file_path)
+        except Exception as e:
+            # Collection may not exist yet or no points match — safe to ignore
+            logger.debug("Delete old points skipped", file_path=file_path, reason=str(e))
+
+    @staticmethod
+    def _fqn_to_point_id(fqn: str) -> int:
+        """Convert a fully-qualified name to a deterministic Qdrant point ID.
+
+        Uses a hash to produce a positive integer that fits Qdrant's
+        uint64 point ID range.
+        """
+        import hashlib
+        digest = hashlib.sha256(fqn.encode()).hexdigest()
+        # Take first 15 hex chars → fits in a positive 64-bit integer
+        return int(digest[:15], 16)
+
+    # ------------------------------------------------------------------
     # Dependency graph construction
     # ------------------------------------------------------------------
 
