@@ -35,7 +35,7 @@ services:
 
       # ---------------- Embedding ----------------
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2-onnx}
-      SENTENCE_TRANSFORMERS_HOME: /app/models
+      SENTENCE_TRANSFORMERS_HOME: ./models
 
       # ---------------- Redis ----------------
       MEMORY_BACKEND: ${MEMORY_BACKEND:-redis}
@@ -58,12 +58,12 @@ services:
       - "host.docker.internal:host-gateway"
 
     volumes:
-      - ./models:/app/models
-      - ./checkpoints.db:/app/checkpoints.db
+      - models_data:/app/models
+      - checkpoint_data:/app/checkpoints.db
 
     # ❗ KHÔNG block startup
     depends_on:
-      - qdrant
+      - qdrantpython -m py_compile server/api.py
       - redis
 
     command: ["python", "main.py"]
@@ -133,4 +133,8 @@ volumes:
   qdrant_data:
     driver: local
   redis_data:
+    driver: local
+  models_data:
+    driver: local
+  checkpoint_data:
     driver: local

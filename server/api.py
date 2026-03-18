@@ -25,6 +25,7 @@ from agent.models import GenerationRequest, StreamEvent, StreamPhase
 from agent.graph_adapter import GraphOrchestrator, create_graph_orchestrator
 from agent.events import get_event_bus, Event, EventType
 from agent.metrics import MetricsCollector
+from agent.tool_orchestrator import ToolOrchestrator
 from indexer.build_index import IndexBuilder
 from rag.client import RAGClient
 from rag.schema import SearchQuery
@@ -44,6 +45,7 @@ index_builder: Optional[IndexBuilder] = None
 metrics_collector: Optional[MetricsCollector] = None
 session_manager: SessionManager = SessionManager()
 rate_limiter: Optional[RateLimiter] = None
+tool_orchestrator: ToolOrchestrator = ToolOrchestrator()
 
 # Thread pool for running blocking operations
 # Use limited workers to prevent resource exhaustion
@@ -257,6 +259,62 @@ class ReindexResponse(BaseModel):
     collection: str = ""
     points_indexed: int = 0
     error: Optional[str] = None
+
+
+class IndexFileRequest(BaseModel):
+    """Request to index a single Java file into Qdrant."""
+
+    file_path: str = Field(..., description="Original file path (stored as metadata)")
+    content: str = Field(..., description="Java source code content")
+    collection: Optional[str] = Field(
+        None,
+        description="Qdrant collection name. Defaults to QDRANT_COLLECTION env.",
+    )
+
+
+class IndexFileResponse(BaseModel):
+    """Response from single-file indexing."""
+
+    success: bool
+    file_path: str = ""
+    collection: str = ""
+    classes_indexed: int = 0
+    points_created: int = 0
+    error: Optional[str] = None
+
+
+# ── OpenAI-Compatible Embeddings ─────────────────────────────────────
+
+class EmbeddingRequest(BaseModel):
+    """OpenAI-compatible embedding request."""
+
+    input: str | list[str] = Field(..., description="Text(s) to embed")
+    model: str = Field("all-MiniLM-L6-v2-onnx", description="Model name (informational)")
+    encoding_format: Optional[str] = Field("float", description="'float' or 'base64'")
+
+
+class EmbeddingObject(BaseModel):
+    """Single embedding in the response."""
+
+    object: str = "embedding"
+    embedding: list[float]
+    index: int
+
+
+class EmbeddingUsage(BaseModel):
+    """Token usage info for embeddings."""
+
+    prompt_tokens: int
+    total_tokens: int
+
+
+class EmbeddingResponse(BaseModel):
+    """OpenAI-compatible embedding response."""
+
+    object: str = "list"
+    data: list[EmbeddingObject]
+    model: str
+    usage: EmbeddingUsage
 
 
 class HealthResponse(BaseModel):
@@ -843,6 +901,83 @@ async def reindex(request: ReindexRequest, background_tasks: BackgroundTasks):
             message="Reindexing failed",
             error=str(e),
         )
+
+
+# ============================================================================
+# Per-File Indexing & Embeddings (Continue.dev / IDE integration)
+# ============================================================================
+
+@app.post("/v1/index-file", response_model=IndexFileResponse)
+async def index_file(request: IndexFileRequest):
+    """Index a single Java file into Qdrant using Java-aware parsing.
+
+    Continue.dev or any IDE client sends file content here.
+    Server parses Java → creates embeddings → pushes to Qdrant.
+
+    Unlike the built-in Continue indexing (generic chunking), this
+    endpoint uses the full Java parser with:
+    - Dependency tracking
+    - Lombok/annotation awareness
+    - Model/DTO detection
+    - Smart summarization
+    """
+    if not index_builder:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    collection = request.collection or os.getenv("QDRANT_COLLECTION", "java_codebase")
+
+    result = await run_in_executor(
+        index_builder.index_single_file,
+        request.content,
+        request.file_path,
+        collection,
+    )
+
+    return IndexFileResponse(
+        success=result["success"],
+        file_path=request.file_path,
+        collection=collection,
+        classes_indexed=result["classes_indexed"],
+        points_created=result["points_created"],
+        error=result.get("error"),
+    )
+
+
+@app.post("/v1/embeddings", response_model=EmbeddingResponse)
+async def create_embeddings(request: EmbeddingRequest):
+    """OpenAI-compatible embeddings endpoint.
+
+    Uses the local ONNX embedding model (all-MiniLM-L6-v2, 384 dims).
+    Compatible with Continue.dev ``embeddingsProvider`` config::
+
+        provider: openai
+        apiBase: http://localhost:8080/v1
+        model: all-MiniLM-L6-v2-onnx
+    """
+    if not index_builder:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    texts = [request.input] if isinstance(request.input, str) else request.input
+
+    embeddings_np = await run_in_executor(index_builder.embedder.encode, texts)
+
+    # encode() returns 1D for single input, 2D for batch
+    import numpy as np
+    if embeddings_np.ndim == 1:
+        embeddings_np = embeddings_np.reshape(1, -1)
+
+    data = [
+        EmbeddingObject(embedding=emb.tolist(), index=i)
+        for i, emb in enumerate(embeddings_np)
+    ]
+
+    total_tokens = sum(len(t) for t in texts) // 4  # rough estimate
+
+    return EmbeddingResponse(
+        data=data,
+        model=request.model,
+        usage=EmbeddingUsage(prompt_tokens=total_tokens, total_tokens=total_tokens),
+    )
 
 
 @app.get("/index/stats")
@@ -1504,6 +1639,11 @@ async def chat_completions(request: ChatCompletionRequest):
 
     effective_system = system_content or active.prompt_builder.build_system_prompt()
 
+    # ── ADVANCED: Inject tool-calling instructions ──────────────────
+    if request.tools:
+        tool_rules = tool_orchestrator.build_tool_system_prompt(request.tools)
+        effective_system += f"\n\n{tool_rules}"
+
     # ── REAL STREAMING ───────────────────────────────────────────────
     # Chat completions always stream; ignore request.stream here.
     return _stream_from_vllm(
@@ -1712,10 +1852,63 @@ def _stream_from_vllm(
 
             loop.run_in_executor(None, _run_sync_gen)
 
+            full_text = ""
+            current_tool_call: Optional[Dict[str, Any]] = None
+            tool_call_buffer = ""
+            in_tool_tag = False
+
             while True:
                 item = await queue.get()
                 if item is None:
                     break
+
+                full_text += item
+                
+                # Check for start of tool tag
+                if not in_tool_tag and "<tool_call>" in full_text[-(len(item) + 12):]:
+                    in_tool_tag = True
+                    # Split item into "pre-tag text" and "post-tag marker"
+                    # For simplicity, if we detect the tag start, we stop yielding raw text
+                    # and start collecting the tool call.
+                    continue
+
+                if in_tool_tag:
+                    tool_call_buffer += item
+                    if "</tool_call>" in tool_call_buffer:
+                        # Full tool call received
+                        raw_call = tool_call_buffer.split("</tool_call>")[0].strip()
+                        try:
+                            # Try to find the JSON start { if the model output text before it
+                            if "{" in raw_call:
+                                raw_call = raw_call[raw_call.find("{"):]
+                            
+                            call_data = json.loads(raw_call)
+                            call_id = f"call_{uuid.uuid4().hex[:12]}"
+                            
+                            # Yield tool_calls delta (OpenAI format)
+                            yield _sse_chunk(response_id, created_time, model,
+                                delta={
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call_data.get("name"),
+                                            "arguments": json.dumps(call_data.get("arguments", {}))
+                                        }
+                                    }]
+                                })
+                        except Exception as exc:
+                            logger.error("Failed to parse pseudo-tool-call", error=str(exc), raw=raw_call)
+                            yield _sse_chunk(response_id, created_time, model,
+                                             delta={"content": f"\n\n[Error parsing tool call: {exc}]"})
+                        
+                        # Reset for next call (if any) or text
+                        in_tool_tag = False
+                        tool_call_buffer = ""
+                    continue
+
+                # Normal text streaming
                 yield _sse_chunk(response_id, created_time, model,
                                  delta={"content": item})
 
@@ -1762,7 +1955,7 @@ def _build_metadata_block(result) -> str:
     """Build a human-readable metadata block for test generation results."""
     parts = []
     parts.append("---")
-    parts.append(f"**Validation:** {'\u2705 passed' if getattr(result, 'validation_passed', False) else '\u274c failed'}")
+    parts.append(f"**Validation:** {'✅ passed' if getattr(result, 'validation_passed', False) else ' failed'}")
 
     issues = getattr(result, 'validation_issues', [])
     if issues:
@@ -1789,12 +1982,12 @@ def _build_metadata_block(result) -> str:
     # Two-Phase Strategy metadata
     strategy = getattr(result, 'strategy_used', 'single_pass')
     if strategy == "two_phase":
-        parts.append(f"**Strategy:** \U0001f504 Two-Phase Generation")
+        parts.append(f"**Strategy:** ✅ Two-Phase Generation")
         complexity = getattr(result, 'complexity_score', 0)
         if complexity:
             parts.append(f"**Complexity score:** {complexity}")
     else:
-        parts.append(f"**Strategy:** \u26a1 Single-Pass")
+        parts.append(f"**Strategy:** ✅ Single-Pass")
     
     return "\n".join(parts)
 
