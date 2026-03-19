@@ -1527,17 +1527,16 @@ def _extract_java_file_path_from_message(content: str) -> Optional[str]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """OpenAI-compatible chat completions endpoint.
+    """OpenAI-compatible chat completions endpoint."""
+    # ── DEBUGGING: Log incoming request from Continue ────────────────
+    logger.debug("Incoming ChatCompletionRequest",
+                 model=request.model,
+                 stream=request.stream,
+                 msg_count=len(request.messages),
+                 has_tools=bool(request.tools))
+    if request.tools:
+        logger.debug("Tools provided by IDE", count=len(request.tools), tools=[t.function.name for t in request.tools])
 
-    This is the main endpoint for Continue IDE / Tabby integration.
-    Supports:
-      - Non-streaming and real SSE streaming (piped from vLLM)
-      - Tool calling (tools in request, tool_calls in response)
-      - Test generation pipeline (with RAG + validation + repair)
-      - General chat with RAG context enhancement
-      - Multi-collection: resolves Qdrant collection from ``collection``
-        field, ``file_path``, or falls back to default.
-    """
     active = _get_orchestrator()
     if not active:
         raise HTTPException(status_code=503, detail="Service not initialized")
@@ -1556,6 +1555,7 @@ async def chat_completions(request: ChatCompletionRequest):
         "<important_rules>", "You are in agent mode",
         "TOOL_NAME:", "read_file tool", "create_new_file tool",
     ]):
+        logger.debug("Filtering overly-long IDE system prompt", original_len=len(system_content))
         system_content = ""
 
     # ── Handle tool calls from Continue ──────────────────────────────
@@ -1637,38 +1637,48 @@ async def chat_completions(request: ChatCompletionRequest):
     if file_path:
         enhanced_prompt = await _enrich_with_rag(user_content, file_path, resolved_collection)
 
-    effective_system = system_content or active.prompt_builder.build_system_prompt()
+    # ── Resolve System Prompt ────────────────────────────────────────
+    # If system_content was filtered (empty), use a concise default.
+    if not system_content:
+        effective_system = (
+            "You are a Senior Java Backend Developer (Java 21, Spring Boot 3.x).\n"
+            "Provide concise, high-quality code and answers. "
+            "Use available tools when necessary to fulfill user requests."
+        )
+    else:
+        effective_system = system_content
+
+    logger.info("Effective system prompt resolved", length=len(effective_system))
+    logger.debug("Effective system prompt content", content=effective_system[:200] + "...")
 
     # ── ADVANCED: Inject tool-calling instructions ──────────────────
     if request.tools:
         tool_rules = tool_orchestrator.build_tool_system_prompt(request.tools)
         effective_system += f"\n\n{tool_rules}"
+        logger.info("Injected tool calling instructions", tool_count=len(request.tools))
+        logger.debug("Effective System Prompt", content=effective_system[:500] + "...")
 
-    # ── Build multi-turn messages for tool calling ──────────────────
-    # When Continue sends tool results, we need the full conversation
-    # history (system + user + assistant + tool messages) so vLLM can
-    # see the tool results and continue the conversation.
-    multi_turn_messages: Optional[list] = None
-    if tool_messages:
-        multi_turn_messages = [{"role": "system", "content": effective_system}]
-        for msg in request.messages:
-            if msg.role == "system":
-                continue  # already added above
-            m: dict = {"role": msg.role, "content": msg.content or ""}
-            # Preserve tool_call_id for tool result messages
-            if msg.tool_call_id:
-                m["tool_call_id"] = msg.tool_call_id
-            # Preserve tool_calls from assistant messages (as text content)
-            if msg.role == "assistant" and msg.tool_calls:
-                tc_text = "\n".join(
-                    f'<tool_call>\n{{"name": "{tc.function.name}", "arguments": {tc.function.arguments}}}\n</tool_call>'
-                    for tc in msg.tool_calls
-                )
-                m["content"] = (m["content"] or "") + "\n" + tc_text
-            multi_turn_messages.append(m)
+    # ── Build multi-turn messages ───────────────────────────────────
+    # We maintain full history so vLLM sees previous user/assistant 
+    # messages and tool results.
+    multi_turn_messages = [{"role": "system", "content": effective_system}]
+    for msg in request.messages:
+        if msg.role == "system":
+            continue
+        m: dict = {"role": msg.role, "content": msg.content or ""}
+        if msg.tool_call_id:
+            m["tool_call_id"] = msg.tool_call_id
+        
+        # Convert assistant's tool_calls back to XML for model context
+        if msg.role == "assistant" and msg.tool_calls:
+            tc_text = "\n".join(
+                f'<tool_call>\n{{"name": "{tc.function.name}", "arguments": {tc.function.arguments}}}\n</tool_call>'
+                for tc in msg.tool_calls
+            )
+            m["content"] = (m["content"] or "") + "\n" + tc_text
+        multi_turn_messages.append(m)
 
     # ── REAL STREAMING ───────────────────────────────────────────────
-    # Chat completions always stream; ignore request.stream here.
     return _stream_from_vllm(
         response_id, created_time, request.model,
         effective_system, enhanced_prompt,
@@ -1857,48 +1867,29 @@ def _stream_from_vllm(
         # Role chunk
         yield _sse_chunk(response_id, created_time, model,
                          delta={"role": "assistant", "content": ""})
+
+        # ── Tool-call interception state ─────────────────────────
+        START_TAG = "<tool_call>"
+        END_TAG = "</tool_call>"
+        TAG_MAX_LEN = 20
+
+        full_text = ""        # entire accumulated response
+        in_tool_tag = False   # True while buffering inside <tool_call>
+        tool_buffer = ""      # content between tags
+        tool_call_index = 0   # increments for each parsed call
+        has_tool_calls = False # any tool call emitted?
+        pending_text = ""     # text waiting to be yielded (may contain partial tag)
+        json_warn_logged = False # flag to suppress repetitive warnings
+
         try:
-            queue: asyncio.Queue[str | None] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
-            def _run_sync_gen():
-                try:
-                    for delta_text in graph_orchestrator.vllm.stream_generate(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        messages=messages,
-                    ):
-                        loop.call_soon_threadsafe(queue.put_nowait, delta_text)
-                except Exception as exc:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, f"\n\n[Error: {exc}]"
-                    )
-                finally:
-                    loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
-
-            loop.run_in_executor(None, _run_sync_gen)
-
-            # ── Tool-call interception state ─────────────────────────
-            START_TAG = "<tool_call>"
-            END_TAG = "</tool_call>"
-            TAG_MAX_LEN = len(START_TAG)  # 11
-
-            full_text = ""        # entire accumulated response
-            in_tool_tag = False   # True while buffering inside <tool_call>
-            tool_buffer = ""      # content between tags
-            tool_call_index = 0   # increments for each parsed call
-            has_tool_calls = False # any tool call emitted?
-            pending_text = ""     # text waiting to be yielded (may contain partial tag)
-
-            while True:
-                item = await queue.get()
+            async for item in graph_orchestrator.vllm.astream_generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=messages,
+            ):
                 if item is None:
-                    # Stream ended — flush any pending text
-                    if pending_text and not in_tool_tag:
-                        yield _sse_chunk(response_id, created_time, model,
-                                         delta={"content": pending_text})
                     break
 
                 full_text += item
@@ -1912,13 +1903,11 @@ def _stream_from_vllm(
                         remainder = tool_buffer.split(END_TAG, 1)[1] if END_TAG in tool_buffer else ""
 
                         try:
-                            # Find JSON object start
+                            # Robustness: sometimes model adds text before JSON in the tag
                             if "{" in raw_call:
                                 raw_call = raw_call[raw_call.find("{"):]
                             call_data = json.loads(raw_call)
                             call_id = f"call_{uuid.uuid4().hex[:12]}"
-
-                            # Emit tool_calls delta (OpenAI format)
                             yield _sse_chunk(response_id, created_time, model,
                                 delta={
                                     "tool_calls": [{
@@ -1941,8 +1930,7 @@ def _stream_from_vllm(
                                          error=str(exc), raw=raw_call[:200])
                             yield _sse_chunk(response_id, created_time, model,
                                              delta={"content": f"\n\n[Error parsing tool call: {exc}]"})
-
-                        # Reset state
+                        
                         in_tool_tag = False
                         tool_buffer = ""
                         # If there's text after </tool_call>, put it back as pending
@@ -1952,7 +1940,12 @@ def _stream_from_vllm(
 
                 # ── Not inside a tool tag — check for tag start ──────
                 pending_text += item
-
+                
+                if not has_tool_calls and not json_warn_logged and pending_text.strip().startswith("{"):
+                     # Heuristic: Model output raw JSON instead of XML
+                     logger.warning("Model seems to be outputting raw JSON without <tool_call> tags", text=pending_text[:50])
+                     json_warn_logged = True
+                
                 # Look for <tool_call> in the pending text
                 if START_TAG in pending_text:
                     # Split: yield text before the tag, buffer after
@@ -2016,11 +2009,48 @@ def _stream_from_vllm(
                         yield _sse_chunk(response_id, created_time, model,
                                          delta={"content": pending_text[:safe_end]})
                         pending_text = pending_text[safe_end:]
-                else:
-                    # No tag in sight — yield everything
-                    yield _sse_chunk(response_id, created_time, model,
-                                     delta={"content": pending_text})
-                    pending_text = ""
+                    continue
+
+                # ── FALLBACK: Buffer potential raw JSON if it starts with { ──
+                stripped_pending = pending_text.strip()
+                if not has_tool_calls and stripped_pending.startswith("{"):
+                    # We have something that looks like JSON — buffer until it closes or gets too long
+                    if "}" in stripped_pending:
+                        try:
+                            # Try to parse the WHOLE stripped buffer
+                            call_data = json.loads(stripped_pending)
+                            if "name" in call_data:
+                                logger.info("Fallback: Detected multi-chunk JSON tool call", name=call_data.get("name"))
+                                call_id = f"call_{uuid.uuid4().hex[:12]}"
+                                yield _sse_chunk(response_id, created_time, model,
+                                    delta={
+                                        "tool_calls": [{
+                                            "index": tool_call_index,
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": call_data.get("name", ""),
+                                                "arguments": json.dumps(call_data.get("arguments", {}), ensure_ascii=False)
+                                            }
+                                        }]
+                                    })
+                                tool_call_index += 1
+                                has_tool_calls = True
+                                pending_text = ""
+                                continue
+                        except json.JSONDecodeError:
+                            # Still incomplete or not valid JSON yet — keep buffering
+                            pass
+
+                    # If it doesn't close or isn't valid yet, we might want to wait
+                    # BUT we shouldn't wait forever if it's just regular text starting with {
+                    if len(stripped_pending) < 1000: # Max buffer for raw JSON
+                        continue
+
+                # No tag or valid JSON tool call — yield everything
+                yield _sse_chunk(response_id, created_time, model,
+                                 delta={"content": pending_text})
+                pending_text = ""
 
         except Exception as e:
             logger.error("Streaming generation error", error=str(e))

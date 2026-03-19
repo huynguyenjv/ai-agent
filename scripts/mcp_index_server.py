@@ -27,7 +27,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 # ── Configuration ──────────────────────────────────────────────────
-AI_AGENT_URL = os.getenv("AI_AGENT_URL", "http://localhost:8080/v1")
+AI_AGENT_URL = os.getenv("AI_AGENT_URL", "http://localhost:8080")
 DEFAULT_COLLECTION = os.getenv("QDRANT_COLLECTION", "java_codebase")
 
 mcp = FastMCP(

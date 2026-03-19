@@ -358,7 +358,7 @@ class VLLMClient:
     # Streaming iterator — yields delta strings for real SSE passthrough
     # -----------------------------------------------------------------
 
-    def stream_generate(
+    async def astream_generate(
         self,
         system_prompt: str,
         user_prompt: str,
@@ -366,20 +366,7 @@ class VLLMClient:
         max_tokens: Optional[int] = None,
         messages: Optional[list] = None,
     ) -> Generator[str, None, None]:
-        """Yield content delta strings as they arrive from vLLM.
-
-        Unlike ``generate()`` this does **not** buffer the full response.
-        Each ``yield`` is a small text delta that can be forwarded
-        immediately to an SSE client (Continue / Tabby / etc.).
-
-        When ``messages`` is provided (e.g. for multi-turn tool calling),
-        it is used as-is instead of building the default [system, user] pair.
-
-        Usage::
-
-            for chunk in vllm.stream_generate(sys, usr):
-                send_sse(chunk)
-        """
+        """Async variant of stream_generate()."""
         if messages:
             msg_list = messages
         else:
@@ -397,47 +384,41 @@ class VLLMClient:
             "stream": True,
         }
 
-        # ── LOG PROMPT METADATA (avoid dumping full prompt for perf) ──
         logger.info(
-            "vLLM streaming request",
+            "vLLM async streaming request",
             system_len=len(system_prompt),
             user_len=len(user_prompt),
             model=self.model,
         )
 
-        with self.client.stream(
+        async with self.aclient.stream(
             "POST",
             f"{self.base_url}/chat/completions",
             json=payload,
         ) as response:
             response.raise_for_status()
 
-            for line in response.iter_lines():
+            async for line in response.aiter_lines():
                 if not line or line.startswith(":"):
                     continue
 
                 if line.startswith("data: "):
                     data_str = line[6:]
-
                     if data_str.strip() == "[DONE]":
                         break
-
                     try:
                         data = json.loads(data_str)
                         choice = data.get("choices", [{}])[0]
                         delta = choice.get("delta", {})
-
                         if "content" in delta and delta["content"]:
                             yield delta["content"]
-
                     except json.JSONDecodeError:
                         continue
-
-            # Drain remaining bytes to release the connection cleanly
             try:
-                response.read()
+                await response.aread()
             except Exception:
                 pass
+
 
     def health_check(self, timeout: float = 5.0) -> bool:
         """Check if vLLM server is healthy (with short timeout)."""
