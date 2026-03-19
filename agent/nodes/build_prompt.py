@@ -34,7 +34,8 @@ def build_prompt_node(state: dict, *, prompt_builder, two_phase_strategy=None) -
     file_path = state.get("file_path", "")
 
     # Reconstruct RAG chunks from serialized state
-    rag_chunks = _deserialize_chunks(state.get("rag_chunks", []))
+    # P2: rag_chunks are now raw CodeChunk objects from retrieve_node
+    rag_chunks = _ensure_chunk_objects(state.get("rag_chunks", []))
 
     system_prompt = prompt_builder.build_system_prompt()
 
@@ -105,31 +106,26 @@ def _build_single_pass_prompt(prompt_builder, state, class_name, file_path, rag_
             f"```"
         )
 
+    # P6: Wrap user input in delimiters to prevent prompt injection
+    sanitized_task = f"<user_task>\n{task_desc}\n</user_task>" if task_desc else ""
+
     return prompt_builder.build_test_generation_prompt(
         class_name=class_name,
         file_path=file_path,
         rag_chunks=rag_chunks,
-        task_description=task_desc,
+        task_description=sanitized_task,
     )
 
 
-def _deserialize_chunks(raw_chunks: list) -> list:
-    """Reconstruct CodeChunk objects from serialized dicts.
-
-    If chunks are already objects, return as-is.
-    If they are dicts, try to create CodeChunk objects.
-    """
-    if not raw_chunks:
+def _ensure_chunk_objects(chunks: list) -> list:
+    """Ensure chunks are CodeChunk objects (P2: usually a no-op now)."""
+    if not chunks:
         return []
-
-    # Check if already objects
-    if hasattr(raw_chunks[0], "class_name"):
-        return raw_chunks
-
-    # Try to reconstruct
+    if hasattr(chunks[0], "class_name"):
+        return chunks
+    # Fallback for legacy/external callers passing dicts
     try:
         from rag.schema import CodeChunk
-        return [CodeChunk(**c) for c in raw_chunks]
+        return [CodeChunk(**c) for c in chunks]
     except Exception:
-        # Return as-is if reconstruction fails (nodes should handle dicts)
-        return raw_chunks
+        return chunks

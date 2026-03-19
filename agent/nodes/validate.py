@@ -13,6 +13,7 @@ logger = structlog.get_logger()
 
 from dataclasses import asdict
 from ..validation_schema import ValidationResult
+from typing import Any
 
 def validate_node(state: dict, *, validation_pipeline) -> dict:
     """Run 7-pass validation on generated test code.
@@ -44,8 +45,8 @@ def validate_node(state: dict, *, validation_pipeline) -> dict:
             "validation_issues_raw": [],
         }
 
-    # Reconstruct CodeChunk objects for RAG-aware validation (Pass 7)
-    chunk_objects = _deserialize_chunks(rag_chunks)
+    # P2: rag_chunks are now raw CodeChunk objects from retrieve_node
+    chunk_objects = _ensure_chunk_objects(rag_chunks)
 
     logger.info("validate_node: running 7-pass validation", code_len=len(test_code))
 
@@ -83,14 +84,16 @@ def validate_node(state: dict, *, validation_pipeline) -> dict:
     }
 
 
-def _deserialize_chunks(raw_chunks: list) -> list:
-    """Reconstruct CodeChunk objects from serialized dicts."""
-    if not raw_chunks:
+def _ensure_chunk_objects(chunks: list) -> list:
+    """Ensure chunks are CodeChunk objects (P2: usually a no-op now)."""
+    if not chunks:
         return []
-    if hasattr(raw_chunks[0], "class_name"):
-        return raw_chunks
+    # Already objects — fast path
+    if hasattr(chunks[0], "class_name"):
+        return chunks
+    # Fallback: deserialize dicts (legacy or external callers)
     try:
         from rag.schema import CodeChunk
-        return [CodeChunk(**c) for c in raw_chunks]
+        return [CodeChunk(**c) for c in chunks]
     except Exception:
-        return raw_chunks
+        return chunks
