@@ -56,7 +56,11 @@ async def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_
                 old=context_builder.repo_path,
                 new=current_repo,
             )
-            context_builder.init_intelligence(current_repo)
+            # P5: Offload heavy sync I/O (RepoScanner.scan, FileGraph.build)
+            # to a thread so the FastAPI event loop is not blocked.
+            import asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, context_builder.init_intelligence, current_repo)
 
         try:
             ctx_result = await context_builder.abuild_context(
@@ -84,20 +88,13 @@ async def retrieve_node(state: dict, *, rag_client, context_builder=None, cache_
         # RAG-only path
         rag_chunks = await _get_rag_context_async(rag_client, class_name, file_path, collection_name, cache_service)
 
-    # Serialize chunks for state (must be JSON-serializable)
-    serialized_chunks = []
-    for chunk in rag_chunks:
-        if hasattr(chunk, "model_dump"):
-            serialized_chunks.append(chunk.model_dump())
-        elif hasattr(chunk, "__dict__"):
-            serialized_chunks.append(chunk.__dict__)
-        else:
-            serialized_chunks.append(chunk)
-
-    logger.info("retrieve_node: done", class_name=class_name, chunks=len(serialized_chunks))
+    # P2: Return raw CodeChunk objects — downstream nodes consume
+    # them directly. Serialization is deferred to the LangGraph
+    # checkpoint boundary (if needed), not done per-node.
+    logger.info("retrieve_node: done", class_name=class_name, chunks=len(rag_chunks))
 
     return {
-        "rag_chunks": serialized_chunks,
+        "rag_chunks": rag_chunks,
         "context_result": context_result,
         "class_name": class_name,
     }

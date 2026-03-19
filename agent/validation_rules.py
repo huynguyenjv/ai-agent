@@ -1,9 +1,13 @@
 """
 Default validation rules for Java test generation.
 Separates framework-specific patterns from the core validation logic.
+
+P4: Rules are now registered in RulesRegistry for decoupled access.
+Module-level lists remain for backward compatibility.
 """
 
 from .validation_schema import IssueSeverity, IssueCategory
+from .rules_registry import RulesRegistry
 
 # Forbidden patterns (ERROR — must fix)
 FORBIDDEN_PATTERNS = [
@@ -66,3 +70,18 @@ STATIC_UTILS = [
     {"pattern": r"\bInstant\.now\(\)", "name": "Instant.now()", "class": "Instant"},
     {"pattern": r"\bUUID\.randomUUID\(\)", "name": "UUID.randomUUID()", "class": "UUID"},
 ]
+
+# ── P4: Register all rules in the central registry ────────────────────
+RulesRegistry.clear()  # Idempotent on re-import
+
+for _p, _s in FORBIDDEN_PATTERNS:
+    RulesRegistry.register_forbidden(_p, _s)
+
+for _p, _sev, _cat in REQUIRED_PATTERNS:
+    RulesRegistry.register_required(_p, _sev, _cat)
+
+for _ap in ANTI_PATTERNS:
+    RulesRegistry.register_anti_pattern(_ap)
+
+for _su in STATIC_UTILS:
+    RulesRegistry.register_static_util(_su)

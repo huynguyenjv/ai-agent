@@ -25,6 +25,20 @@ logger = structlog.get_logger()
 class ValidationPipeline:
     """Multi-pass code validation with dynamic rule loading."""
 
+    # Pre-compiled regex patterns (avoid re-compilation per validate() call)
+    _RE_CLASS_DECL = re.compile(r"\bclass\s+\w+")
+    _RE_TEST_ANN = re.compile(r"@Test\b")
+    _RE_MOCK_ANN = re.compile(r"@Mock\b")
+
+    def __init__(self):
+        # Cache tree-sitter parser for P1 syntax validation
+        self._java_parser = None
+        try:
+            from indexer.parse_java import JavaParser
+            self._java_parser = JavaParser()
+        except ImportError:
+            logger.info("tree-sitter JavaParser unavailable, using fallback brace counting")
+
     def validate(self, code: str, rag_chunks: list[Any] | None = None) -> ValidationResult:
         result = ValidationResult(code_length=len(code))
 
@@ -53,9 +67,9 @@ class ValidationPipeline:
         if rag_chunks:
             self._check_construction_patterns(code, rag_chunks, result)
 
-        # Metrics
-        result.test_count = len(re.findall(r"@Test\b", code))
-        result.mock_count = len(re.findall(r"@Mock\b", code))
+        # Metrics (use pre-compiled patterns)
+        result.test_count = len(self._RE_TEST_ANN.findall(code))
+        result.mock_count = len(self._RE_MOCK_ANN.findall(code))
 
         logger.info("Validation complete", summary=result.get_summary())
         return result
@@ -63,11 +77,30 @@ class ValidationPipeline:
     # ── Internal Pass Implementations ─────────────────────────────────
 
     def _check_structure(self, code: str, result: ValidationResult) -> None:
-        if not re.search(r"\bclass\s+\w+", code):
+        if not self._RE_CLASS_DECL.search(code):
             result.issues.append(ValidationIssue("No class declaration found", IssueSeverity.ERROR, IssueCategory.STRUCTURAL))
 
-        if code.count("{") != code.count("}"):
-            result.issues.append(ValidationIssue("Unbalanced braces found", IssueSeverity.ERROR, IssueCategory.STRUCTURAL, suggestion="Check for missing or extra braces"))
+        # P1: Use tree-sitter for syntax validation (much more reliable
+        # than brace counting, handles strings/comments correctly)
+        if self._java_parser:
+            try:
+                parsed = self._java_parser.parse_source(code)
+                if parsed is None:
+                    result.issues.append(ValidationIssue(
+                        "Syntax error: tree-sitter failed to parse valid class structure",
+                        IssueSeverity.ERROR,
+                        IssueCategory.STRUCTURAL,
+                        suggestion="Check for syntax errors such as unbalanced braces, missing semicolons, or invalid declarations",
+                    ))
+            except Exception as exc:
+                logger.debug("tree-sitter parse exception, falling back", error=str(exc))
+                # Fallback to brace counting
+                if code.count("{") != code.count("}"):
+                    result.issues.append(ValidationIssue("Unbalanced braces found", IssueSeverity.ERROR, IssueCategory.STRUCTURAL, suggestion="Check for missing or extra braces"))
+        else:
+            # Fallback: simple brace counting (unreliable but better than nothing)
+            if code.count("{") != code.count("}"):
+                result.issues.append(ValidationIssue("Unbalanced braces found", IssueSeverity.ERROR, IssueCategory.STRUCTURAL, suggestion="Check for missing or extra braces"))
 
         if "import " not in code:
             result.issues.append(ValidationIssue("No import statements found", IssueSeverity.ERROR, IssueCategory.MISSING_IMPORT))

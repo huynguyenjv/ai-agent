@@ -1,7 +1,10 @@
 import json
 import re
+import structlog
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
+
+logger = structlog.get_logger()
 
 # Re-use models from api.py if possible, but for standalone logic we define them or import them.
 # To avoid circular imports, we'll use simple dicts or define minimal structures here.
@@ -56,19 +59,72 @@ To call a tool, use the following format:
 """
 
     def parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Extract tool calls from model output text."""
+        """Extract tool calls from model output text.
+        
+        P3: Uses multi-strategy JSON extraction with schema validation
+        for robustness against malformed model output.
+        """
         calls = []
         matches = self.tool_call_pattern.finditer(text)
         for match in matches:
             content = match.group(1).strip()
             try:
-                call_data = json.loads(content)
-                if "name" in call_data:
+                call_data = self._extract_json(content)
+                if call_data and self._validate_tool_schema(call_data):
                     calls.append(call_data)
-            except json.JSONDecodeError:
-                # Log or handle malformed JSON
-                pass
+                else:
+                    logger.warning("Tool call failed schema validation",
+                                   raw=content[:200])
+            except Exception as exc:
+                logger.warning("Malformed tool call content",
+                               error=str(exc), raw=content[:200])
         return calls
+
+    def _extract_json(self, content: str) -> Optional[Dict[str, Any]]:
+        """Multi-strategy JSON extraction from tool call content.
+        
+        Strategies (in order):
+        1. Direct JSON parse
+        2. Find first '{' to last '}' and parse
+        3. Strip markdown code fence then parse
+        """
+        content = content.strip()
+
+        # Strategy 1: Direct parse
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: Extract outermost JSON object
+        first_brace = content.find("{")
+        last_brace = content.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            try:
+                return json.loads(content[first_brace:last_brace + 1])
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: Strip markdown code fence (```json ... ```)
+        fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', content, re.DOTALL)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    @staticmethod
+    def _validate_tool_schema(data: Any) -> bool:
+        """Validate that parsed data has the required tool call structure."""
+        if not isinstance(data, dict):
+            return False
+        if "name" not in data or not isinstance(data["name"], str):
+            return False
+        if "arguments" in data and not isinstance(data["arguments"], dict):
+            return False
+        return True
 
     def extract_partial_tool_call(self, text: str) -> Optional[str]:
         """Detect if the text contains an opening <tool_call> tag but no closing tag yet.
