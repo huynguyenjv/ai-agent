@@ -473,3 +473,29 @@ async def test_count_by_file_returns_zero_on_exception():
 
     result = await svc.count_by_file("src/UserService.java")
     assert result == 0
+
+
+def test_tool_calls_event_format():
+    """tool_calls_event must emit two SSE data lines per OpenAI spec."""
+    import json
+    from server.streaming.sse import tool_calls_event
+
+    tool_calls = [
+        {"index": 0, "id": "call_1", "type": "function",
+         "function": {"name": "index_with_deps", "arguments": '{"file_path": "src/A.java"}'}},
+    ]
+    result = tool_calls_event(tool_calls)
+
+    # Must have exactly two data lines
+    data_lines = [l for l in result.split("\n") if l.startswith("data: ")]
+    assert len(data_lines) == 2, f"Expected 2 data lines, got {len(data_lines)}"
+
+    # Chunk 1: has tool_calls, finish_reason null
+    chunk1 = json.loads(data_lines[0][6:])
+    assert chunk1["choices"][0]["delta"]["tool_calls"] == tool_calls
+    assert chunk1["choices"][0]["finish_reason"] is None
+
+    # Chunk 2: empty delta, finish_reason "tool_calls"
+    chunk2 = json.loads(data_lines[1][6:])
+    assert chunk2["choices"][0]["delta"] == {}
+    assert chunk2["choices"][0]["finish_reason"] == "tool_calls"
