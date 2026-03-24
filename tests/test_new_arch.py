@@ -654,3 +654,36 @@ async def test_tool_selector_cap():
 
     assert result["pending_tool_calls"] == []
     assert result["tool_turns_used"] == 1  # not incremented again
+
+
+@pytest.mark.asyncio
+async def test_emit_tool_calls_sse_format():
+    """emit_tool_calls streams thinking comment + two-chunk tool_calls + DONE."""
+    import json
+    from server.agent.emit_tool_calls import emit_tool_calls
+
+    emitted = []
+
+    async def mock_sse_callback(event_type: str, content: str) -> None:
+        emitted.append((event_type, content))
+
+    tool_calls = [
+        {"index": 0, "id": "call_1", "type": "function",
+         "function": {"name": "index_with_deps", "arguments": '{"file_path": "A.java"}'}},
+    ]
+    state = {"pending_tool_calls": tool_calls}
+    result = await emit_tool_calls(state, sse_callback=mock_sse_callback)
+
+    # Node returns empty dict (pure side-effect)
+    assert result == {}
+
+    # Must have emitted thinking + tool_calls events
+    event_types = [e[0] for e in emitted]
+    assert "thinking" in event_types
+    assert "tool_calls" in event_types
+
+    # tool_calls content is JSON-serialized tool call list
+    tc_events = [e for e in emitted if e[0] == "tool_calls"]
+    assert len(tc_events) == 1
+    parsed = json.loads(tc_events[0][1])
+    assert parsed[0]["function"]["name"] == "index_with_deps"
