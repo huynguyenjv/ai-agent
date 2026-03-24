@@ -687,3 +687,19 @@ async def test_emit_tool_calls_sse_format():
     assert len(tc_events) == 1
     parsed = json.loads(tc_events[0][1])
     assert parsed[0]["function"]["name"] == "index_with_deps"
+
+
+def test_chat_message_accepts_null_content():
+    """ChatMessage must accept content=None for Turn 2 assistant messages."""
+    from server.routers.chat import ChatMessage
+
+    # Turn 2 assistant message (tool_calls response)
+    msg = ChatMessage(role="assistant", content=None, tool_calls=[
+        {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    ])
+    assert msg.content is None
+    assert msg.tool_calls is not None
+
+    # Turn 2 tool result message
+    msg2 = ChatMessage(role="tool", content='{"result": "ok"}', tool_call_id="call_1")
+    assert msg2.tool_call_id == "call_1"
