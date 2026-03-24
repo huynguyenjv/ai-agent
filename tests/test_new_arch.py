@@ -703,3 +703,137 @@ def test_chat_message_accepts_null_content():
     # Turn 2 tool result message
     msg2 = ChatMessage(role="tool", content='{"result": "ok"}', tool_call_id="call_1")
     assert msg2.tool_call_id == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_graph_routes_to_emit_tool_calls():
+    """Graph routes to emit_tool_calls when pending_tool_calls is non-empty."""
+    from unittest.mock import AsyncMock, patch
+    from server.agent.graph import build_agent_graph
+    from langchain_core.messages import HumanMessage
+
+    mock_qdrant = AsyncMock()
+    mock_qdrant.count_by_file = AsyncMock(return_value=0)
+
+    emitted_events = []
+
+    async def mock_sse_callback(event_type, content):
+        emitted_events.append(event_type)
+
+    mock_vllm = AsyncMock()
+
+    with patch("server.agent.tool_selector.tool_selector") as mock_selector:
+        mock_selector.return_value = {
+            "pending_tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                                     "function": {"name": "get_project_skeleton", "arguments": "{}"}}],
+            "tool_turns_used": 1,
+        }
+
+        agent = build_agent_graph(
+            vllm_client=mock_vllm,
+            model="test",
+            qdrant=mock_qdrant,
+            embedder=None,
+            sse_callback=mock_sse_callback,
+        )
+
+        result = await agent.ainvoke({
+            "messages": [HumanMessage(content="analyze architecture")],
+            "intent": "", "active_file": None, "mentioned_files": [], "freshness_signal": False,
+            "force_reindex": False, "rag_chunks": [], "rag_hit": False, "hash_verified": False,
+            "tool_results": [], "context_assembled": "", "draft": "", "emitted_steps": [],
+            "volatile_rejected": False, "pending_tool_calls": [], "is_tool_result_turn": False,
+            "tool_turns_used": 0,
+        })
+
+    assert "tool_calls" in emitted_events
+
+
+@pytest.mark.asyncio
+async def test_graph_skips_to_rag_search():
+    """Graph completes without emitting tool_calls when pending_tool_calls is empty."""
+    from unittest.mock import AsyncMock, patch
+    from server.agent.graph import build_agent_graph
+    from langchain_core.messages import HumanMessage
+
+    mock_qdrant = AsyncMock()
+    mock_qdrant.count_by_file = AsyncMock(return_value=10)
+
+    emitted_events = []
+
+    async def mock_sse_callback(event_type, content):
+        emitted_events.append(event_type)
+
+    mock_vllm = AsyncMock()
+
+    with patch("server.agent.tool_selector.tool_selector") as mock_selector:
+        mock_selector.return_value = {"pending_tool_calls": [], "tool_turns_used": 0}
+
+        agent = build_agent_graph(
+            vllm_client=mock_vllm,
+            model="test",
+            qdrant=mock_qdrant,
+            embedder=None,
+            sse_callback=mock_sse_callback,
+        )
+
+        result = await agent.ainvoke({
+            "messages": [HumanMessage(content="explain this code")],
+            "intent": "", "active_file": None, "mentioned_files": [], "freshness_signal": False,
+            "force_reindex": False, "rag_chunks": [], "rag_hit": False, "hash_verified": False,
+            "tool_results": [], "context_assembled": "", "draft": "", "emitted_steps": [],
+            "volatile_rejected": False, "pending_tool_calls": [], "is_tool_result_turn": False,
+            "tool_turns_used": 0,
+        })
+
+    assert "tool_calls" not in emitted_events
+    assert isinstance(result, dict)
+
+
+@pytest.mark.asyncio
+async def test_graph_turn2_skips_route_context():
+    """Turn 2 (is_tool_result_turn=True) skips route_context, goes classify_intent -> tool_selector -> rag_search."""
+    from unittest.mock import AsyncMock, patch
+    from server.agent.graph import build_agent_graph
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    mock_qdrant = AsyncMock()
+    mock_qdrant.count_by_file = AsyncMock(return_value=5)
+
+    async def mock_sse_callback(event_type, content):
+        pass
+
+    mock_vllm = AsyncMock()
+
+    with patch("server.agent.route_context.route_context") as mock_rc, \
+         patch("server.agent.tool_selector.tool_selector") as mock_ts:
+        mock_rc.return_value = {
+            "mentioned_files": [], "force_reindex": False, "freshness_signal": False,
+        }
+        mock_ts.return_value = {"pending_tool_calls": [], "tool_turns_used": 0}
+
+        agent = build_agent_graph(
+            vllm_client=mock_vllm,
+            model="test",
+            qdrant=mock_qdrant,
+            embedder=None,
+            sse_callback=mock_sse_callback,
+        )
+
+        result = await agent.ainvoke({
+            "messages": [
+                HumanMessage(content="generate tests for UserService"),
+                ToolMessage(content='{"chunks": 5}', tool_call_id="call_1"),
+            ],
+            "intent": "unit_test",
+            "active_file": None, "mentioned_files": [], "freshness_signal": False,
+            "force_reindex": False, "rag_chunks": [], "rag_hit": False, "hash_verified": False,
+            "tool_results": [], "context_assembled": "", "draft": "", "emitted_steps": [],
+            "volatile_rejected": False, "pending_tool_calls": [], "is_tool_result_turn": False,
+            "tool_turns_used": 0,
+        })
+
+    # route_context should NOT have been called on Turn 2
+    mock_rc.assert_not_called()
+    # tool_selector should have been called (and returned empty due to is_tool_result_turn)
+    mock_ts.assert_called_once()
