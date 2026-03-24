@@ -418,3 +418,58 @@ def test_agent_state_new_fields():
     assert "pending_tool_calls" in hints
     assert "is_tool_result_turn" in hints
     assert "tool_turns_used" in hints
+
+
+import pytest
+
+@pytest.mark.asyncio
+async def test_count_by_file_returns_zero_when_empty():
+    """count_by_file returns 0 when no chunks exist for a path."""
+    from unittest.mock import AsyncMock, MagicMock
+    from server.rag.qdrant_client import QdrantService
+
+    svc = QdrantService.__new__(QdrantService)
+    mock_client = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.count = 0
+    mock_client.count = AsyncMock(return_value=mock_result)
+    svc._client = mock_client
+    svc._collection = "codebase"
+
+    result = await svc.count_by_file("src/UserService.java")
+    assert result == 0
+    mock_client.count.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_count_by_file_returns_count_when_exists():
+    """count_by_file returns > 0 when chunks exist."""
+    from unittest.mock import AsyncMock, MagicMock
+    from server.rag.qdrant_client import QdrantService
+
+    svc = QdrantService.__new__(QdrantService)
+    mock_client = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.count = 5
+    mock_client.count = AsyncMock(return_value=mock_result)
+    svc._client = mock_client
+    svc._collection = "codebase"
+
+    result = await svc.count_by_file("src/UserService.java")
+    assert result == 5
+
+
+@pytest.mark.asyncio
+async def test_count_by_file_returns_zero_on_exception():
+    """count_by_file returns 0 (miss) on any Qdrant exception."""
+    from unittest.mock import AsyncMock
+    from server.rag.qdrant_client import QdrantService
+
+    svc = QdrantService.__new__(QdrantService)
+    mock_client = AsyncMock()
+    mock_client.count = AsyncMock(side_effect=Exception("connection refused"))
+    svc._client = mock_client
+    svc._collection = "codebase"
+
+    result = await svc.count_by_file("src/UserService.java")
+    assert result == 0
