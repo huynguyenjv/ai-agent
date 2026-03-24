@@ -530,3 +530,127 @@ def test_classify_intent_not_tool_result_turn_on_normal_message():
 
     assert result.get("is_tool_result_turn", False) is False
     assert result["intent"] == "unit_test"
+
+
+import pytest
+
+@pytest.mark.asyncio
+async def test_tool_selector_structural_analysis():
+    """structural_analysis intent always emits get_project_skeleton."""
+    from unittest.mock import AsyncMock
+    from server.agent.tool_selector import tool_selector
+
+    mock_qdrant = AsyncMock()
+    mock_qdrant.count_by_file = AsyncMock(return_value=0)
+
+    state = {
+        "intent": "structural_analysis",
+        "mentioned_files": [],
+        "active_file": None,
+        "freshness_signal": False,
+        "is_tool_result_turn": False,
+        "tool_turns_used": 0,
+        "messages": [],
+    }
+    result = await tool_selector(state, qdrant=mock_qdrant)
+
+    assert len(result["pending_tool_calls"]) == 1
+    assert result["pending_tool_calls"][0]["function"]["name"] == "get_project_skeleton"
+    assert result["tool_turns_used"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_selector_search():
+    """search intent always emits search_symbol regardless of Qdrant state."""
+    from unittest.mock import AsyncMock
+    from server.agent.tool_selector import tool_selector
+
+    mock_qdrant = AsyncMock()
+    state = {
+        "intent": "search",
+        "mentioned_files": [],
+        "active_file": None,
+        "freshness_signal": False,
+        "is_tool_result_turn": False,
+        "tool_turns_used": 0,
+        "messages": [type("M", (), {"content": "find UserService class"})()],
+    }
+    result = await tool_selector(state, qdrant=mock_qdrant)
+
+    assert len(result["pending_tool_calls"]) == 1
+    assert result["pending_tool_calls"][0]["function"]["name"] == "search_symbol"
+    args = result["pending_tool_calls"][0]["function"]["arguments"]
+    import json
+    assert "UserService" in json.loads(args)["name"]
+
+
+@pytest.mark.asyncio
+async def test_tool_selector_code_gen_miss():
+    """code_gen + Qdrant miss + file mentioned -> [index_with_deps, read_file]."""
+    from unittest.mock import AsyncMock
+    from server.agent.tool_selector import tool_selector
+
+    mock_qdrant = AsyncMock()
+    mock_qdrant.count_by_file = AsyncMock(return_value=0)  # miss
+
+    state = {
+        "intent": "code_gen",
+        "mentioned_files": ["src/UserService.java"],
+        "active_file": None,
+        "freshness_signal": False,
+        "is_tool_result_turn": False,
+        "tool_turns_used": 0,
+        "messages": [],
+    }
+    result = await tool_selector(state, qdrant=mock_qdrant)
+
+    names = [c["function"]["name"] for c in result["pending_tool_calls"]]
+    assert "index_with_deps" in names
+    assert "read_file" in names
+    assert result["tool_turns_used"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_selector_code_gen_hit_no_freshness():
+    """code_gen + hit + file mentioned, no freshness -> [read_file] only."""
+    from unittest.mock import AsyncMock
+    from server.agent.tool_selector import tool_selector
+
+    mock_qdrant = AsyncMock()
+    mock_qdrant.count_by_file = AsyncMock(return_value=10)  # hit
+
+    state = {
+        "intent": "code_gen",
+        "mentioned_files": ["src/UserService.java"],
+        "active_file": None,
+        "freshness_signal": False,
+        "is_tool_result_turn": False,
+        "tool_turns_used": 0,
+        "messages": [],
+    }
+    result = await tool_selector(state, qdrant=mock_qdrant)
+
+    names = [c["function"]["name"] for c in result["pending_tool_calls"]]
+    assert names == ["read_file"]
+
+
+@pytest.mark.asyncio
+async def test_tool_selector_cap():
+    """tool_turns_used >= 1 always returns empty pending_tool_calls."""
+    from unittest.mock import AsyncMock
+    from server.agent.tool_selector import tool_selector
+
+    mock_qdrant = AsyncMock()
+    state = {
+        "intent": "structural_analysis",  # would normally emit tool
+        "mentioned_files": [],
+        "active_file": None,
+        "freshness_signal": False,
+        "is_tool_result_turn": False,
+        "tool_turns_used": 1,  # already used
+        "messages": [],
+    }
+    result = await tool_selector(state, qdrant=mock_qdrant)
+
+    assert result["pending_tool_calls"] == []
+    assert result["tool_turns_used"] == 1  # not incremented again
