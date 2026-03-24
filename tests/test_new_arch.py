@@ -499,3 +499,34 @@ def test_tool_calls_event_format():
     chunk2 = json.loads(data_lines[1][6:])
     assert chunk2["choices"][0]["delta"] == {}
     assert chunk2["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_result_turn_detection():
+    """classify_intent sets is_tool_result_turn=True when ToolMessage present."""
+    from langchain_core.messages import ToolMessage, HumanMessage
+    from server.agent.classify_intent import classify_intent
+
+    # Turn 2: messages contain a ToolMessage
+    messages = [
+        HumanMessage(content="generate tests for UserService.java"),
+        ToolMessage(content='{"files": ["UserService.java"]}', tool_call_id="call_1"),
+    ]
+    state = {"messages": messages, "intent": "unit_test"}
+    result = classify_intent(state)
+
+    assert result["is_tool_result_turn"] is True
+    # Must preserve prior intent, not re-classify from ToolMessage JSON content
+    assert result["intent"] == "unit_test"
+
+
+def test_classify_intent_not_tool_result_turn_on_normal_message():
+    """classify_intent sets is_tool_result_turn=False for normal user messages."""
+    from langchain_core.messages import HumanMessage
+    from server.agent.classify_intent import classify_intent
+
+    messages = [HumanMessage(content="viết test cho UserService")]
+    state = {"messages": messages, "intent": ""}
+    result = classify_intent(state)
+
+    assert result.get("is_tool_result_turn", False) is False
+    assert result["intent"] == "unit_test"
