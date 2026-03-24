@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/huynmb/AppData/Local/Programs/Python/Python312/python -c \"from mcp.server import Server; from mcp.types import Tool, TextContent; print\\('MCP imports OK'\\)\" 2>&1)",
+      "Bash(python3 -c \"from qdrant_client.models import NamedSparseVector, SparseVector\")",
+      "Bash(/c/Users/huynmb/AppData/Local/Programs/Python/Python312/python << 'EOF'\nimport sys\npackages = [\n    \\('tree_sitter', 'tree_sitter'\\),\n    \\('tree_sitter_java', 'tree_sitter_java'\\),\n    \\('tree_sitter_python', 'tree_sitter_python'\\),\n    \\('tree_sitter_go', 'tree_sitter_go'\\),\n    \\('tree_sitter_javascript', 'tree_sitter_javascript'\\),\n    \\('tree_sitter_c_sharp', 'tree_sitter_c_sharp'\\),\n    \\('tree_sitter_hcl', 'tree_sitter_hcl'\\),\n    \\('httpx', 'httpx'\\),\n]\n\nmissing = []\nfor import_name, display_name in packages:\n    try:\n        __import__\\(import_name\\)\n        print\\(f\"OK: {display_name}\"\\)\n    except ImportError as e:\n        missing.append\\(f\"MISSING: {display_name}\"\\)\n\nif missing:\n    print\\(\"\\\\n\".join\\(missing\\)\\)\n    sys.exit\\(1\\)\nEOF)",
+      "Bash(grep -n 'make_chunk_id.*\"\"\"\"\"\"\"\"' /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/mcp_server/plugins/*.py)",
+      "Bash(/c/Users/huynmb/AppData/Local/Programs/Python/Python312/python << 'EOF'\nfrom mcp.server import Server\nimport inspect\n\n# Check Server.__init__ signature\nsig = inspect.signature\\(Server.__init__\\)\nprint\\(\"Server.__init__ signature:\", sig\\)\n\n# Check available methods\nmethods = [m for m in dir\\(Server\\) if not m.startswith\\('_'\\)]\nprint\\(\"\\\\nServer methods:\", methods\\)\nEOF)",
+      "Bash(/c/Users/huynmb/AppData/Local/Programs/Python/Python312/python << 'EOF'\nfrom mcp.server import Server\n\n# Create a server with just a name\nserver = Server\\(\"test-server\"\\)\n\n# Check if it has create_initialization_options method\nprint\\(\"Has create_initialization_options:\", hasattr\\(server, \"create_initialization_options\"\\)\\)\n\n# Check the method signature\nif hasattr\\(server, \"create_initialization_options\"\\):\n    import inspect\n    sig = inspect.signature\\(server.create_initialization_options\\)\n    print\\(\"Signature:\", sig\\)\nEOF)",
+      "Bash(/c/Users/huynmb/AppData/Local/Programs/Python/Python312/python << 'EOF'\nfrom mcp.server import Server\nimport inspect\n\nserver = Server\\(\"test\"\\)\nsig = inspect.signature\\(server.run\\)\nprint\\(\"Server.run signature:\", sig\\)\nEOF)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(ls server/*.py)",
+      "Bash(ls *.py)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 17688)",
+      "Bash(taskkill //F //PID 32444)",
+      "Bash(taskkill //F //PID 9708)",
+      "Bash(python -c \"from qdrant_client import AsyncQdrantClient; print\\([m for m in dir\\(AsyncQdrantClient\\) if ''''search'''' in m.lower\\(\\) or ''''query'''' in m.lower\\(\\)]\\)\")",
+      "Bash(wsl hostname:*)",
+      "Bash(curl -s --connect-timeout 5 http://192.168.176.159:8000/v1/models)",
+      "Bash(wsl -e bash -c \"curl -s --connect-timeout 5 http://127.0.0.1:8000/v1/models 2>&1\")",
+      "Bash(wsl:*)",
+      "Bash(findstr :8000)",
+      "Bash(curl -s --connect-timeout 5 http://127.0.0.1:8000/v1/models)",
+      "Bash(curl -s --connect-timeout 5 http://localhost:8000/v1/models)",
+      "Bash(curl -s --connect-timeout 3 http://localhost:8000/v1/models)",
+      "Bash(curl -s --connect-timeout 3 http://192.168.176.159:8000/v1/models)",
+      "Bash(ls /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/*.toml /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/*.cfg /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/*.ini)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"feat: add tool call flow fields to AgentState:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
