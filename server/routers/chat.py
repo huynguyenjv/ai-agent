@@ -1,292 +1,217 @@
-"""
-Chat completions endpoints (OpenAI-compatible).
+"""POST /v1/chat/completions — Section 7 + Section 10.
 
-Includes: /v1/chat/completions, /v1/completions, /v1/rag-context
+SSE streaming endpoint. Always streams regardless of stream field.
+Authentication via X-Api-Key header.
+
+Continue IDE compatibility:
+- active_file extracted from code fences in message content
+- thinking/tool events wrapped in OpenAI delta format (SSE comments invisible to Continue)
+- All events are valid OpenAI streaming chunks
 """
 
-import re
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
 import time
-import uuid
-import re as _re
-from typing import Optional
+from typing import AsyncGenerator
 
-import structlog
-from fastapi import APIRouter, HTTPException
+_SENTINEL = object()  # Completion signal for SSE queue
+
+from fastapi import APIRouter, Header, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
-from agent.models import GenerationRequest
-from ..dependencies import (
-    graph_orchestrator, tool_orchestrator, _executor,
-    _get_orchestrator, run_in_executor,
+from server.auth import verify_api_key
+from server.continue_compat import extract_active_file
+from server.streaming.sse import (
+    thinking_event,
+    tool_start_event,
+    tool_done_event,
+    tool_error_event,
+    content_delta_event,
+    done_event,
+    heartbeat_comment,
+    tool_calls_event,
 )
-from ..schemas import (
-    ChatMessage, ChatCompletionRequest, ChatCompletionResponse,
-)
-from ..services.stream import (
-    _sse_chunk, _stream_from_vllm, _stream_test_generation,
-)
-from ..services.rag_resolver import _resolve_collection, _resolve_repo_path, _enrich_with_rag
 
-logger = structlog.get_logger()
+logger = logging.getLogger("server.chat")
 
 router = APIRouter()
 
 
-def _extract_java_file_path_from_message(content: str) -> Optional[str]:
-    """Extract Java file path from inline code blocks sent by Continue IDE.
+class ChatMessage(BaseModel):
+    role: str
+    content: str | None = None        # null in assistant tool_calls messages
+    tool_calls: list[dict] | None = None  # present in assistant messages for Turn 2
+    tool_call_id: str | None = None   # present in role:"tool" result messages
 
-    Continue IDE format when user uses @ClassName:
-        ```src/main/java/com/example/ClassName.java
-        package com.example;
-        ...
-        ```
 
-    Returns the file path if found, None otherwise.
+class ChatRequest(BaseModel):
+    """OpenAI-compatible chat completions request + custom fields.
+
+    Continue sends standard OpenAI format. active_file is extracted
+    from message content code fences if not explicitly provided.
     """
-    # Pattern 1: code block with file path as info string
-    # ```src/main/java/.../ClassName.java  or  ```java src/.../ClassName.java
-    code_block_pattern = r'```(?:java\s+)?([^\n]*?\.java)\s*\n'
-    match = re.search(code_block_pattern, content)
-    if match:
-        return match.group(1).strip()
-
-    # Pattern 2: look for class declaration to infer class name as fallback
-    class_pattern = r'(?:public\s+)?class\s+(\w+)'
-    class_match = re.search(class_pattern, content)
-    if class_match:
-        class_name = class_match.group(1)
-        # Try to find package declaration for a better path
-        pkg_match = re.search(r'package\s+([\w.]+)\s*;', content)
-        if pkg_match:
-            package_path = pkg_match.group(1).replace('.', '/')
-            return f"src/main/java/{package_path}/{class_name}.java"
-        return f"{class_name}.java"
-
-    return None
+    messages: list[ChatMessage]
+    model: str = ""
+    stream: bool = True  # Always streams per Section 7
+    active_file: str | None = None
+    repo_path: str | None = None
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    """OpenAI-compatible chat completions endpoint."""
-    # ── DEBUGGING: Log incoming request from Continue ────────────────
-    logger.debug("Incoming ChatCompletionRequest",
-                 model=request.model,
-                 stream=request.stream,
-                 msg_count=len(request.messages),
-                 has_tools=bool(request.tools))
-    if request.tools:
-        logger.debug("Tools provided by IDE", count=len(request.tools), tools=[t.function.name for t in request.tools])
+async def chat_completions(
+    request: ChatRequest,
+    req: Request,
+    x_api_key: str = Header(None),
+    authorization: str = Header(None),
+) -> StreamingResponse:
+    """Stream SSE response through the LangGraph agent."""
+    verify_api_key(req, x_api_key, authorization)
 
-    active = _get_orchestrator()
-    if not active:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    # ── Parse messages ───────────────────────────────────────────────
-    user_messages = [m for m in request.messages if m.role == "user"]
-    if not user_messages:
-        raise HTTPException(status_code=400, detail="No user message provided")
-
-    user_content = user_messages[-1].content or ""
-    system_messages = [m for m in request.messages if m.role == "system"]
-    system_content = system_messages[0].content if system_messages else ""
-
-    # Filter overly-long IDE agent system prompts
-    if system_content and any(marker in system_content for marker in [
-        "<important_rules>", "You are in agent mode",
-        "TOOL_NAME:", "read_file tool", "create_new_file tool",
-    ]):
-        logger.debug("Filtering overly-long IDE system prompt", original_len=len(system_content))
-        system_content = ""
-
-    # ── Handle tool calls from Continue ──────────────────────────────
-    # If Continue sent tool results, include them in the message history
-    # and forward to vLLM for the next response.
-    tool_messages = [m for m in request.messages if m.role == "tool"]
-
-    # ── Detect request intent ────────────────────────────────────────
-    is_test_request = any(
-        kw in user_content.lower()
-        for kw in ["test", "junit", "unit test", "mockito", "generate test"]
+    return StreamingResponse(
+        _stream_response(request, req),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
-    file_path = request.file_path
-    if not file_path:
-        file_path = _extract_java_file_path_from_message(user_content)
 
-    # ── Resolve Repository and Collection (3-tier) ───────────────────
-    resolved_collection = _resolve_collection(
-        explicit=request.collection,
-        file_path=file_path,
-        workspace_path=request.workspace_path,
-    )
-    resolved_repo_path = _resolve_repo_path(
-        workspace_path=request.workspace_path,
-        collection=resolved_collection,
-        file_path=file_path,
-    )
-    logger.info(
-        "Resolved context",
-        collection=resolved_collection,
-        repo_path=resolved_repo_path,
-    )
+async def _stream_response(
+    request: ChatRequest,
+    req: Request,
+) -> AsyncGenerator[str, None]:
+    """Generate SSE events through the agent pipeline.
 
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-    created_time = int(time.time())
+    Section 10 timing constraints:
+    - First thinking event: within 50ms
+    - First tool_start: within 100ms of tool decision
+    - First content token: within 200ms of LLM start
+    - Max blank screen: 500ms
+    - Heartbeat: every 15 seconds
+    """
+    # Emit first thinking event immediately (within 50ms)
+    # Wrapped in OpenAI delta format so Continue renders it as content
+    yield thinking_event("Phân tích intent...")
 
-    # ═════════════════════════════════════════════════════════════════
-    # PATH 1: Test generation pipeline (supports Two-Phase Strategy)
-    # ═════════════════════════════════════════════════════════════════
-    if is_test_request and file_path:
-        logger.info(
-            "Using test generation pipeline",
-            file_path=file_path,
-            collection=resolved_collection,
-            force_two_phase=request.force_two_phase,
-        )
-        
-        # Extract source code from user message if present
-        source_code = None
-        code_match = _re.search(r'```(?:[^\n]*\.java)?\s*\n(.*?)```', user_content, _re.DOTALL)
-        if code_match:
-            source_code = code_match.group(1).strip()
-        
-        gen_request = GenerationRequest(
-            file_path=file_path,
-            task_description=user_content,
-            collection_name=resolved_collection,
-            source_code=source_code,
-            repo_path=resolved_repo_path,
-            # Two-Phase Strategy: always on
-            force_two_phase=True,
-            force_single_pass=False,
-            complexity_threshold=request.complexity_threshold or 10,
-        )
+    # Build event queue for SSE callback
+    event_queue: asyncio.Queue = asyncio.Queue()
+    content_streamed = False
 
-        # ── REAL STREAMING: progress phases + token-by-token code ────
-        # Chat completions always stream; ignore request.stream here.
-        return _stream_test_generation(
-            response_id, created_time, request.model, gen_request,
-        )
+    async def sse_callback(event_type: str, content: str) -> None:
+        """Callback for agent nodes to emit SSE events."""
+        nonlocal content_streamed
+        if event_type == "content":
+            content_streamed = True
+            await event_queue.put(content_delta_event(content))
+        elif event_type == "error":
+            await event_queue.put(tool_error_event("generate", content))
+        elif event_type == "tool_calls":
+            # content is JSON-serialized list of tool call dicts
+            await event_queue.put(tool_calls_event(json.loads(content)))
 
-    # ═════════════════════════════════════════════════════════════════
-    # PATH 2: General chat — supports real streaming from vLLM
-    # ═════════════════════════════════════════════════════════════════
-
-    # Build the enhanced prompt (with optional RAG context)
-    enhanced_prompt = user_content
-    if file_path:
-        enhanced_prompt = await _enrich_with_rag(user_content, file_path, resolved_collection)
-
-    # ── Resolve System Prompt ────────────────────────────────────────
-    # If system_content was filtered (empty), use a concise default.
-    if not system_content:
-        effective_system = (
-            "You are a Senior Java Backend Developer (Java 21, Spring Boot 3.x).\n"
-            "Provide concise, high-quality code and answers. "
-            "Use available tools when necessary to fulfill user requests."
-        )
-    else:
-        effective_system = system_content
-
-    logger.info("Effective system prompt resolved", length=len(effective_system))
-    logger.debug("Effective system prompt content", content=effective_system[:200] + "...")
-
-    # ── ADVANCED: Inject tool-calling instructions ──────────────────
-    if request.tools:
-        tool_rules = tool_orchestrator.build_tool_system_prompt(request.tools)
-        effective_system += f"\n\n{tool_rules}"
-        logger.info("Injected tool calling instructions", tool_count=len(request.tools))
-        logger.debug("Effective System Prompt", content=effective_system[:500] + "...")
-
-    # ── Build multi-turn messages ───────────────────────────────────
-    # We maintain full history so vLLM sees previous user/assistant 
-    # messages and tool results.
-    multi_turn_messages = [{"role": "system", "content": effective_system}]
+    # Convert messages to LangChain format
+    messages = []
     for msg in request.messages:
-        if msg.role == "system":
-            continue
-        m: dict = {"role": msg.role, "content": msg.content or ""}
-        if msg.tool_call_id:
-            m["tool_call_id"] = msg.tool_call_id
-        
-        # Convert assistant's tool_calls back to XML for model context
-        if msg.role == "assistant" and msg.tool_calls:
-            tc_text = "\n".join(
-                f'<tool_call>\n{{"name": "{tc.function.name}", "arguments": {tc.function.arguments}}}\n</tool_call>'
-                for tc in msg.tool_calls
-            )
-            m["content"] = (m["content"] or "") + "\n" + tc_text
-        multi_turn_messages.append(m)
+        if msg.role == "user":
+            messages.append(HumanMessage(content=msg.content or ""))
+        elif msg.role == "tool":
+            messages.append(ToolMessage(
+                content=msg.content or "",
+                tool_call_id=msg.tool_call_id or "",
+            ))
+        else:
+            messages.append(AIMessage(content=msg.content or ""))
 
-    # ── REAL STREAMING ───────────────────────────────────────────────
-    return _stream_from_vllm(
-        response_id, created_time, request.model,
-        effective_system, enhanced_prompt,
-        request.temperature, request.max_tokens,
-        messages=multi_turn_messages,
-    )
+    # Extract active_file from Continue's message content if not explicitly provided
+    active_file = extract_active_file(messages, request.active_file)
+    if active_file:
+        logger.info("Detected active_file from message content: %s", active_file)
 
-
-@router.post("/v1/completions")
-async def completions(request: dict):
-    """OpenAI-compatible completions endpoint (legacy). Redirects to chat."""
-    prompt = request.get("prompt", "")
-    messages = [ChatMessage(role="user", content=prompt)]
-
-    chat_request = ChatCompletionRequest(
-        model=request.get("model", "ai-agent"),
-        messages=messages,
-        temperature=request.get("temperature", 0.2),
-        max_tokens=request.get("max_tokens", 4096),
-    )
-
-    response = await chat_completions(chat_request)
-
-    # If it's a streaming response, return as-is
-    if isinstance(response, StreamingResponse):
-        return response
-
-    return {
-        "id": response.id,
-        "object": "text_completion",
-        "created": response.created,
-        "model": response.model,
-        "choices": [
-            {
-                "text": response.choices[0].message.content if response.choices[0].message else "",
-                "index": 0,
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": response.usage.model_dump() if response.usage else {},
+    # Initial agent state
+    initial_state = {
+        "messages": messages,
+        "intent": "",
+        "active_file": active_file,
+        "mentioned_files": [],
+        "freshness_signal": False,
+        "force_reindex": False,
+        "rag_chunks": [],
+        "rag_hit": False,
+        "hash_verified": False,
+        "tool_results": [],
+        "context_assembled": "",
+        "draft": "",
+        "emitted_steps": [],
+        "volatile_rejected": False,
+        "pending_tool_calls": [],
+        "is_tool_result_turn": False,
+        "tool_turns_used": 0,
     }
 
+    # Build and run agent graph
+    from server.agent.graph import build_agent_graph
 
-# ============================================================================
-# RAG Context Inspection
-# ============================================================================
+    vllm_client = req.app.state.vllm_client
+    model = req.app.state.vllm_model
+    qdrant = req.app.state.qdrant
+    embedder = req.app.state.embedder
 
-@router.get("/v1/rag-context")
-async def get_rag_context(
-    class_name: str,
-    file_path: str = "",
-    session_id: str = "",
-):
-    """Return RAG chunks used to build the prompt for a given class.
-
-    Useful for debugging and transparency — lets callers see
-    exactly what context the agent retrieves from the vector DB.
-    """
-    if not graph_orchestrator:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    session = None
-    if session_id:
-        session = await run_in_executor(
-            graph_orchestrator.memory_manager.get_session, session_id
-        )
-
-    chunks = await run_in_executor(
-        graph_orchestrator._get_rag_context, class_name, file_path, session
+    agent = build_agent_graph(
+        vllm_client=vllm_client,
+        model=model,
+        qdrant=qdrant,
+        embedder=embedder,
+        sse_callback=sse_callback,
     )
-    return chunks
+
+    # Run agent in background task, signal completion via queue
+    async def _run_agent():
+        try:
+            result = await agent.ainvoke(initial_state)
+            await event_queue.put((_SENTINEL, result))
+        except Exception as exc:
+            await event_queue.put((_SENTINEL, exc))
+
+    asyncio.create_task(_run_agent())
+
+    yield thinking_event("Đang xử lý...")
+
+    # Stream events from queue + heartbeat
+    last_event_time = time.monotonic()
+    agent_result = None
+
+    while True:
+        try:
+            event = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            if time.monotonic() - last_event_time > 15:
+                yield heartbeat_comment()
+                last_event_time = time.monotonic()
+            continue
+
+        # Completion signal
+        if isinstance(event, tuple) and len(event) == 2 and event[0] is _SENTINEL:
+            agent_result = event[1]
+            break
+
+        yield event
+        last_event_time = time.monotonic()
+
+    # If agent failed, emit error
+    if isinstance(agent_result, Exception):
+        logger.error("Agent execution failed: %s", agent_result)
+        yield tool_error_event("agent", str(agent_result))
+    elif agent_result and not content_streamed:
+        # If no content was streamed via callback, stream the draft directly
+        draft = agent_result.get("draft", "")
+        if draft:
+            yield content_delta_event(draft)
+
+    # Terminal event
+    yield done_event()
