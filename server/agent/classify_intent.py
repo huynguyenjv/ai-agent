@@ -15,6 +15,11 @@ from server.agent.state import AgentState
 # Section 8: Intent priority order (must be preserved)
 # Pre-compiled for performance — patterns are checked on every request.
 INTENT_PATTERNS: list[tuple[str, list[re.Pattern]]] = [
+    ("code_review", [
+        re.compile(r"code\s*review"), re.compile(r"review\s*(?:file|pr|mr|code|diff)"),
+        re.compile(r"review\s*lại"), re.compile(r"review\s*giúp"), re.compile(r"audit"),
+        re.compile(r"gitlab\.[\w.-]+/.+/-/merge_requests/\d+"),
+    ]),
     ("unit_test", [
         re.compile(r"viết\s*test"), re.compile(r"write\s*test"), re.compile(r"unit\s*test"),
         re.compile(r"generate\s*test"), re.compile(r"tạo\s*test"),

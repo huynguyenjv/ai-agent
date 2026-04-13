@@ -26,6 +26,9 @@ from server.agent.rag_search import rag_search
 from server.agent.plan_steps import plan_steps
 from server.agent.generate import generate
 from server.agent.post_process import post_process
+from server.agent.review_analyze import review_analyze
+from server.agent.review_format import review_format
+from server.agent.upsert_mr_comment import upsert_mr_comment
 import server.agent.tool_selector as _tool_selector_mod
 import server.agent.emit_tool_calls as _emit_tool_calls_mod
 
@@ -66,9 +69,15 @@ def _route_after_tool_selector(state: AgentState) -> str:
     """Route based on whether tools need to be emitted."""
     if state.get("pending_tool_calls"):
         return "emit_tool_calls"
+    if state.get("intent") == "code_review":
+        return "review_analyze"
     if state.get("intent") == "structural_analysis":
         return "generate"
     return "rag_search"
+
+
+def _route_after_review_format(state: AgentState) -> str:
+    return "upsert_mr_comment" if state.get("auto_post") else "post_process"
 
 
 def _route_after_rag(state: AgentState) -> str:
@@ -115,6 +124,14 @@ def build_agent_graph(vllm_client, model: str, qdrant, embedder, sse_callback=No
     )
     graph.add_node("post_process", post_process)
 
+    # Code review nodes
+    graph.add_node(
+        "review_analyze",
+        partial(review_analyze, vllm_client=vllm_client, model=model),
+    )
+    graph.add_node("review_format", review_format)
+    graph.add_node("upsert_mr_comment", upsert_mr_comment)
+
     # Set entry point
     graph.set_entry_point("classify_intent")
 
@@ -149,8 +166,21 @@ def build_agent_graph(vllm_client, model: str, qdrant, embedder, sse_callback=No
             "emit_tool_calls": "emit_tool_calls",
             "rag_search": "rag_search",
             "generate": "generate",
+            "review_analyze": "review_analyze",
         },
     )
+
+    # Code review flow
+    graph.add_edge("review_analyze", "review_format")
+    graph.add_conditional_edges(
+        "review_format",
+        _route_after_review_format,
+        {
+            "upsert_mr_comment": "upsert_mr_comment",
+            "post_process": "post_process",
+        },
+    )
+    graph.add_edge("upsert_mr_comment", END)
 
     # emit_tool_calls -> END (Turn 1 ends here, Continue takes over)
     graph.add_edge("emit_tool_calls", END)

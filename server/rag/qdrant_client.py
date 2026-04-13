@@ -32,7 +32,7 @@ DENSE_DIM = 384
 class QdrantService:
     """Manages Qdrant operations for the codebase collection."""
 
-    def __init__(self, url: str = "http://127.0.0.1:6333") -> None:
+    def __init__(self, url: str = "https://research-rd.internal.prd.vtrip.cloudhms.io:6333") -> None:
         self._client = AsyncQdrantClient(url=url)
         self._collection = COLLECTION_NAME
 

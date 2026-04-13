@@ -12,6 +12,12 @@ import json
 import os
 import sys
 import logging
+from pathlib import Path
+
+# Ensure project root is on sys.path when run directly (e.g. by Continue IDE)
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -30,6 +36,11 @@ from mcp_server.dep_classifier import DepClassifier
 from mcp_server.uploader import Uploader
 from mcp_server.tools import read_file, search_symbol
 from mcp_server.tools_indexer import get_project_skeleton, index_with_deps
+from mcp_server.tools_review import (
+    get_pr_diff as review_get_pr_diff,
+    get_mr_note as review_get_mr_note,
+    upsert_mr_comment as review_upsert_mr_comment,
+)
 
 logger = logging.getLogger("mcp_server")
 
@@ -153,6 +164,48 @@ def create_server() -> Server:
                     "required": ["file_path"],
                 },
             ),
+            Tool(
+                name="get_pr_diff",
+                description="Fetch GitLab MR unified diff and metadata by project path and MR IID.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {"type": "string", "enum": ["gitlab"], "default": "gitlab"},
+                        "repo": {"type": "string", "description": "Project path, e.g. group/project"},
+                        "pr_id": {"type": "integer", "description": "MR IID"},
+                    },
+                    "required": ["repo", "pr_id"],
+                },
+            ),
+            Tool(
+                name="get_mr_note",
+                description="Find existing AI review note on an MR by marker substring.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {"type": "string", "enum": ["gitlab"], "default": "gitlab"},
+                        "repo": {"type": "string"},
+                        "pr_id": {"type": "integer"},
+                        "marker": {"type": "string"},
+                    },
+                    "required": ["repo", "pr_id", "marker"],
+                },
+            ),
+            Tool(
+                name="upsert_mr_comment",
+                description="Create or update a comment on an MR. Pass note_id to update, omit to create.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "provider": {"type": "string", "enum": ["gitlab"], "default": "gitlab"},
+                        "repo": {"type": "string"},
+                        "pr_id": {"type": "integer"},
+                        "body": {"type": "string"},
+                        "note_id": {"type": "integer"},
+                    },
+                    "required": ["repo", "pr_id", "body"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -188,6 +241,27 @@ def create_server() -> Server:
                 file_path=arguments["file_path"],
                 depth=arguments.get("depth", DEPTH_DEFAULT),
                 token_budget=TOKEN_BUDGET,
+            )
+        elif name == "get_pr_diff":
+            result = await review_get_pr_diff(
+                provider=arguments.get("provider", "gitlab"),
+                repo=arguments["repo"],
+                pr_id=arguments["pr_id"],
+            )
+        elif name == "get_mr_note":
+            result = await review_get_mr_note(
+                provider=arguments.get("provider", "gitlab"),
+                repo=arguments["repo"],
+                pr_id=arguments["pr_id"],
+                marker=arguments["marker"],
+            )
+        elif name == "upsert_mr_comment":
+            result = await review_upsert_mr_comment(
+                provider=arguments.get("provider", "gitlab"),
+                repo=arguments["repo"],
+                pr_id=arguments["pr_id"],
+                body=arguments["body"],
+                note_id=arguments.get("note_id"),
             )
         else:
             result = {"error": f"Unknown tool: {name}"}

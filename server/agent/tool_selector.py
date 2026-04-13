@@ -7,10 +7,13 @@ Agent logic decides tools — not the LLM.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 
 from server.agent.state import AgentState
+
+logger = logging.getLogger("server.tool_selector")
 
 # Regex to extract a symbol name from the user's message for search intent
 _SYMBOL_PATTERN = re.compile(r"\b([A-Z][a-zA-Z0-9]+|`([^`]+)`|\"([^\"]+)\")\b")
@@ -63,7 +66,23 @@ async def tool_selector(state: AgentState, qdrant=None) -> dict:
 
     tool_calls: list[dict] = []
 
-    if intent == "structural_analysis":
+    logger.info(
+        "tool_selector: intent=%s, mentioned_files=%s, active_file=%s, freshness=%s, turns=%s",
+        intent, mentioned_files, active_file, freshness_signal, state.get("tool_turns_used", 0),
+    )
+
+    if intent == "code_review":
+        review_mode = state.get("review_mode") or "file"
+        pr_ctx = state.get("pr_context") or {}
+        if review_mode == "pr" and pr_ctx.get("pr_id"):
+            tool_calls = [_make_tool_call("get_pr_diff", {
+                "provider": pr_ctx.get("provider", "gitlab"),
+                "repo": pr_ctx.get("repo", ""),
+                "pr_id": pr_ctx.get("pr_id"),
+            })]
+        # file mode: Continue đã paste full file trong code fence → không cần tool
+
+    elif intent == "structural_analysis":
         tool_calls = [_make_tool_call("get_project_skeleton", {"include_methods": True})]
 
     elif intent == "search":

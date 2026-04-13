@@ -31,7 +31,14 @@
       "Bash(ls /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/*.toml /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/*.cfg /c/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/*.ini)",
       "Bash(git add:*)",
       "Bash(git commit -m \"feat: add tool call flow fields to AgentState:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(ls \"c:\\\\Users\\\\huynmb\\\\IdeaProjects\\\\source\\\\services\\\\vtrip.core.iam\\\\.continue\"\" 2>/dev/null || echo \"dir not found \")",
+      "Bash(taskkill //F //IM mcp-server.exe)",
+      "Bash(\"c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/venv/Scripts/python.exe\" -m mcp_server.server)",
+      "Bash(\"c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/venv/Scripts/pip.exe\" show:*)",
+      "Bash(time \"c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/venv/Scripts/python.exe\" -c \"from mcp_server.server import create_server; print\\(''OK''\\)\")",
+      "Bash(c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/venv/Scripts/python.exe c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/mcp_server/server.py)",
+      "Bash(curl -s -X POST http://localhost:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"X-Api-Key: dev-secret-key\" -d '{\"\"\"\"messages\"\"\"\":[{\"\"\"\"role\"\"\"\":\"\"\"\"user\"\"\"\",\"\"\"\"content\"\"\"\":\"\"\"\"hello\"\"\"\"}],\"\"\"\"model\"\"\"\":\"\"\"\"test\"\"\"\",\"\"\"\"stream\"\"\"\":true}')"
     ]
   }
 }

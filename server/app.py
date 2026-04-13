@@ -26,24 +26,24 @@ from server.rag.embedder import Embedder
 from server.rag.qdrant_client import QdrantService
 from server.routers.chat import router as chat_router
 from server.routers.index import router as index_router
+from server.routers.review import router as review_router
 
 logger = logging.getLogger("server")
-
-# Config from environment — Section 17
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8080/v1")
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — initialize and cleanup resources."""
     logger.info("Starting AI Coding Agent server...")
 
+    # Read env vars here (after dotenv loaded in main.py)
+    qdrant_url = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
+    vllm_base_url = os.environ.get("VLLM_BASE_URL", "http://localhost:8080/v1")
+
     # Initialize Qdrant (non-blocking — will retry on first request if unavailable)
-    qdrant = QdrantService(url=QDRANT_URL)
+    qdrant = QdrantService(url=qdrant_url)
     try:
         await qdrant.ensure_collection()
-        logger.info("Qdrant connected: %s", QDRANT_URL)
+        logger.info("Qdrant connected: %s", qdrant_url)
     except Exception as e:
         logger.warning("Qdrant not available at startup (%s). Will retry on first request.", e)
     app.state.qdrant = qdrant
@@ -59,12 +59,12 @@ async def lifespan(app: FastAPI):
 
     # Initialize vLLM client
     app.state.vllm_client = AsyncOpenAI(
-        base_url=VLLM_BASE_URL,
+        base_url=vllm_base_url,
         api_key="not-needed",  # vLLM local, no auth required
     )
     app.state.vllm_model = os.environ.get("VLLM_MODEL", "qwen2.5-coder")
 
-    logger.info("Server ready. vLLM: %s", VLLM_BASE_URL)
+    logger.info("Server ready. vLLM: %s", vllm_base_url)
 
     yield
 
@@ -120,6 +120,7 @@ def create_app() -> FastAPI:
     # Include routers
     app.include_router(chat_router)
     app.include_router(index_router)
+    app.include_router(review_router)
 
     # Health check
     @app.get("/health")

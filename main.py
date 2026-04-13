@@ -16,7 +16,7 @@ from server.logging_config import configure_logging
 
 
 def main() -> None:
-    load_dotenv()
+    load_dotenv()  # Must run before any os.environ.get
 
     # Configure logging — use JSON in production (LOG_FORMAT=json)
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -30,8 +30,11 @@ def main() -> None:
         logging.getLogger("main").error("Invalid PORT value, defaulting to 8000")
         port = 8000
 
+    # Import app AFTER load_dotenv so lifespan reads correct env vars
+    from server.app import app  # noqa: E402
+
     uvicorn.run(
-        "server.app:app",
+        app,
         host=host,
         port=port,
         log_level=log_level.lower(),

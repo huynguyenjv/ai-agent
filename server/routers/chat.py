@@ -50,14 +50,16 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """OpenAI-compatible chat completions request + custom fields.
+    """OpenAI-compatible chat completions request.
 
-    Continue sends standard OpenAI format. active_file is extracted
-    from message content code fences if not explicitly provided.
+    Continue sends standard OpenAI format with extra fields like
+    temperature, max_tokens, etc. We accept and ignore them.
     """
+    model_config = {"extra": "allow"}
+
     messages: list[ChatMessage]
     model: str = ""
-    stream: bool = True  # Always streams per Section 7
+    stream: bool = True
     active_file: str | None = None
     repo_path: str | None = None
 

@@ -43,31 +43,31 @@ services:
   # ---------------------------------------------------------------------------
   # vLLM Server (GPU required) — Qwen2.5-Coder-7B-Instruct
   # ---------------------------------------------------------------------------
-  vllm:
-    image: vllm/vllm-openai:latest
-    container_name: ai-agent-vllm
-    restart: always
-    runtime: nvidia
-    ports:
-      - "8000:8000"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    shm_size: '16gb'
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    command: >
-      --model ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}
-      --port 8000
-      --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
-      --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
-      --max-num-seqs ${VLLM_MAX_NUM_SEQS:-16}
-      --enable-prefix-caching
-      --trust-remote-code
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: ai-agent-vllm
+  #   restart: always
+  #   runtime: nvidia
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ~/.cache/huggingface:/root/.cache/huggingface
+  #   shm_size: '16gb'
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   command: >
+  #     --model ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct-AWQ}
+  #     --port 8000
+  #     --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
+  #     --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
+  #     --max-num-seqs ${VLLM_MAX_NUM_SEQS:-16}
+  #     --enable-prefix-caching
+  #     --trust-remote-code
 
   # ---------------------------------------------------------------------------
   # Qdrant Vector Database — bound to 127.0.0.1 in production

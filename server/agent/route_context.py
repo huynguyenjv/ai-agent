@@ -10,6 +10,12 @@ import re
 
 from server.agent.state import AgentState
 
+# GitLab MR URL: https://gitlab.xxx/group/project/-/merge_requests/123
+_GITLAB_MR_URL = re.compile(
+    r"https?://([\w.-]+)/([\w./-]+?)/-/merge_requests/(\d+)",
+    re.IGNORECASE,
+)
+
 # Gate 1: File mention patterns
 _FILE_PATTERNS = [
     # Direct filename: XxxService.java, handler.go, main.tf, etc.
@@ -63,6 +69,28 @@ def route_context(state: AgentState) -> dict:
         text = last_msg.get("content", "")
     else:
         text = str(last_msg)
+
+    # --- Code review: detect PR URL or file mode ---
+    if state.get("intent") == "code_review":
+        mr_match = _GITLAB_MR_URL.search(text)
+        if mr_match:
+            host, repo, pr_id = mr_match.group(1), mr_match.group(2), int(mr_match.group(3))
+            pr_ctx = dict(state.get("pr_context") or {})
+            pr_ctx.update({"provider": "gitlab", "host": host, "repo": repo, "pr_id": pr_id})
+            return {
+                "mentioned_files": [],
+                "force_reindex": False,
+                "freshness_signal": False,
+                "review_mode": "pr",
+                "pr_context": pr_ctx,
+            }
+        # No PR URL → file mode (Continue sent full file in code fence)
+        return {
+            "mentioned_files": [],
+            "force_reindex": False,
+            "freshness_signal": False,
+            "review_mode": state.get("review_mode") or "file",
+        }
 
     # --- Gate 1: Explicit File Mention ---
     mentioned_files: list[str] = []
