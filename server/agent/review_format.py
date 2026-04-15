@@ -17,7 +17,7 @@ KEEP_HISTORY = int(os.environ.get("AI_REVIEWER_KEEP_HISTORY", "3"))
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _SEVERITY_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
-_SEVERITY_TITLE = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low"}
+_SEVERITY_TITLE = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
 
 
 def _count(findings: list[dict]) -> dict[str, int]:
@@ -54,23 +54,37 @@ def _summary_stats(counts: dict[str, int]) -> str:
 
 
 def _render_finding(f: dict) -> str:
-    fw = f.get("framework", "") or "—"
+    """Collapsible <details> block per finding."""
+    sev = f.get("severity", "low")
+    emoji = _SEVERITY_EMOJI.get(sev, "🔵")
+    sev_label = _SEVERITY_TITLE.get(sev, sev.upper())
+    fw = (f.get("framework") or "—").strip()
     file = f.get("file", "?")
     line = f.get("line", 0)
-    title = (f.get("title") or "").strip()
+    title = (f.get("title") or "").strip() or "Issue"
     msg = (f.get("message") or "").strip()
     sugg = (f.get("suggestion") or "").strip()
 
-    # Pick the shorter non-empty one as the headline, skip duplication
-    headline = title or msg[:120]
-    body = "" if not msg or msg == title or msg.startswith(title) else msg
+    summary = (
+        f"{emoji} <b>{sev_label}</b> &nbsp;<code>{fw}</code>&nbsp; {title}"
+    )
 
-    out = [f"- **[{fw}]** `{file}:{line}` — {headline}"]
-    if body:
-        out.append(f"  {body}")
+    body_lines = [f"**File:** `{file}` · line {line}", ""]
+    if msg and msg != title:
+        body_lines.append(msg)
+        body_lines.append("")
     if sugg and sugg.lower() not in {"null", "none", ""}:
-        out.append(f"  💡 {sugg}")
-    return "\n".join(out)
+        body_lines.append("**💡 Suggestion:**")
+        body_lines.append("")
+        body_lines.append(sugg)
+        body_lines.append("")
+
+    body = "\n".join(body_lines).rstrip()
+    return (
+        f"<details open>\n<summary>{summary}</summary>\n\n"
+        f"{body}\n\n"
+        f"</details>"
+    )
 
 
 def _render_findings_block(findings: list[dict]) -> str:
@@ -80,23 +94,39 @@ def _render_findings_block(findings: list[dict]) -> str:
     for f in findings:
         by_sev.setdefault(f.get("severity", "low"), []).append(f)
 
-    parts = []
+    parts: list[str] = []
     for sev in ("critical", "high", "medium", "low"):
         items = by_sev.get(sev, [])
         if not items:
             continue
-        parts.append(f"\n### {_SEVERITY_EMOJI[sev]} {_SEVERITY_TITLE[sev]}\n")
+        parts.append(f"\n#### {_SEVERITY_EMOJI[sev]} {_SEVERITY_TITLE[sev]} ({len(items)})\n")
         parts.extend(_render_finding(f) for f in items)
     return "\n".join(parts)
 
 
+_STATUS_ICON = {"fixed": "✅ fixed", "open": "🔴 open", "new": "🟠 new"}
+
+
 def _render_previous_reviews_block(prev: list[dict]) -> str:
+    """Render Previous reviews as a collapsible markdown table."""
     if not prev:
         return ""
-    lines = [f"<details><summary>Previous reviews ({len(prev)})</summary>\n"]
-    for r in prev[:KEEP_HISTORY]:
-        lines.append(f"- `{r['sha']}` ({r['ts']}) — {r['summary']}")
-    lines.append("\n</details>\n")
+    rows = prev[:KEEP_HISTORY]
+    lines = [
+        f"<details open>",
+        f"<summary>📋 Previous reviews ({len(rows)})</summary>",
+        "",
+        "| Commit | When | Summary |",
+        "|--------|------|---------|",
+    ]
+    for r in rows:
+        sha = r.get("sha", "")
+        ts = r.get("ts", "")
+        summary = (r.get("summary", "") or "").replace("|", "\\|")
+        lines.append(f"| `{sha}` | {ts} | {summary} |")
+    lines.append("")
+    lines.append("</details>")
+    lines.append("")
     return "\n".join(lines)
 
 

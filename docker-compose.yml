@@ -1,91 +1,76 @@
-version: '3.8'
-
 # =============================================================================
-# AI Coding Agent — New Architecture
+# AI Coding Agent — production docker-compose
 # =============================================================================
-# Development:
-#   docker-compose up -d qdrant         # Start Qdrant only
-#   python main.py                       # Run server locally
+# vLLM chạy ở container/image riêng (không trong compose này).
+# Trong `.env`, set VLLM_BASE_URL:
+#   - vLLM trên cùng host (bare-metal):   http://host.docker.internal:8000/v1
+#   - vLLM ở docker network khác:         http://<vllm-container>:8000/v1
+#     (cần join network: thêm `networks: [vllm_net]` + external block bên dưới)
 #
-# Production:
-#   docker-compose up -d                 # Full stack
+# First run (HF cache chưa có):
+#   HF_HUB_OFFLINE=0 docker compose up -d
+#   # chờ embedder tải all-MiniLM-L6-v2 xong (1 lần), rồi set HF_HUB_OFFLINE=1
 # =============================================================================
 
 services:
 
-  # ---------------------------------------------------------------------------
-  # AI Agent Application (Cloud VM)
-  # ---------------------------------------------------------------------------
   ai-agent:
     build: .
     container_name: ai-agent
+    restart: unless-stopped
+    env_file: .env
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
-    environment:
-      - API_KEY=${API_KEY:-}
-      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
-      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://vllm:8000/v1}
-      - VLLM_MODEL=${VLLM_MODEL:-qwen2.5-coder}
-      - HOST=${HOST:-0.0.0.0}
-      - PORT=${PORT:-8080}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    extra_hosts:
+      # Cho phép container gọi vLLM chạy trên host (Linux docker 20.10+)
+      - "host.docker.internal:host-gateway"
     depends_on:
       qdrant:
         condition: service_healthy
-    command: ["python", "main.py"]
-    restart: unless-stopped
+    volumes:
+      - hf_cache:/home/agent/.cache/huggingface
+      # Mount CA bundle cho GitLab self-signed (nếu có). Set GITLAB_CA_BUNDLE=/certs/ca.crt trong .env
+      - ./deploy/certs:/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8080}/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT:-8080}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s
 
-  # ---------------------------------------------------------------------------
-  # vLLM Server (GPU required) — Qwen2.5-Coder-7B-Instruct
-  # ---------------------------------------------------------------------------
-  # vllm:
-  #   image: vllm/vllm-openai:latest
-  #   container_name: ai-agent-vllm
-  #   restart: always
-  #   runtime: nvidia
-  #   ports:
-  #     - "8000:8000"
-  #   volumes:
-  #     - ~/.cache/huggingface:/root/.cache/huggingface
-  #   shm_size: '16gb'
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: 1
-  #             capabilities: [gpu]
-  #   command: >
-  #     --model ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct-AWQ}
-  #     --port 8000
-  #     --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
-  #     --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
-  #     --max-num-seqs ${VLLM_MAX_NUM_SEQS:-16}
-  #     --enable-prefix-caching
-  #     --trust-remote-code
-
-  # ---------------------------------------------------------------------------
-  # Qdrant Vector Database — bound to 127.0.0.1 in production
-  # ---------------------------------------------------------------------------
   qdrant:
     image: qdrant/qdrant:latest
     container_name: ai-agent-qdrant
+    restart: unless-stopped
     ports:
-      - "6333:6333"
+      # Bind localhost only — ai-agent truy cập qua docker network service name
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      # Qdrant image không có curl — dùng bash /dev/tcp để TCP probe
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   qdrant_data:
+    driver: local
+  hf_cache:
     driver: local

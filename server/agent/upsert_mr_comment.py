@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import os
 
+import httpx
+
 from server.agent.state import AgentState
 from server.agent.review_format import MARKER, review_format
 
@@ -37,15 +39,16 @@ def _render_inline_body(f: dict) -> str:
     return "\n".join(parts)
 
 
-async def _resolve_old_inline(provider: str, repo: str, pr_id: int) -> int:
+async def _resolve_old_inline(provider: str, repo: str, pr_id: int) -> tuple[int, int]:
+    """Return (resolved_count, failed_count)."""
     from mcp_server.tools_review import list_mr_discussions, resolve_mr_discussion
     try:
         discussions = await list_mr_discussions(provider=provider, repo=repo, pr_id=pr_id)
     except Exception as exc:
         logger.warning("list_mr_discussions failed: %s", exc)
-        return 0
+        return 0, 0
 
-    resolved = 0
+    candidates = []
     for d in discussions:
         notes = d.get("notes") or []
         if not notes:
@@ -57,14 +60,27 @@ async def _resolve_old_inline(provider: str, repo: str, pr_id: int) -> int:
         if INLINE_MARKER not in body:
             continue
         did = d.get("id")
-        if not did:
-            continue
+        if did:
+            candidates.append(did)
+
+    logger.info("inline resolve: %d AI threads need resolving", len(candidates))
+
+    resolved = 0
+    failed = 0
+    for did in candidates:
         try:
             await resolve_mr_discussion(provider=provider, repo=repo, pr_id=pr_id, discussion_id=did)
             resolved += 1
+        except httpx.HTTPStatusError as exc:
+            failed += 1
+            logger.warning(
+                "resolve FAIL discussion=%s HTTP %d body=%s",
+                did, exc.response.status_code, exc.response.text[:300],
+            )
         except Exception as exc:
-            logger.warning("resolve_mr_discussion %s failed: %s", did, exc)
-    return resolved
+            failed += 1
+            logger.warning("resolve FAIL discussion=%s %s", did, exc)
+    return resolved, failed
 
 
 async def _post_inline_findings(
@@ -81,21 +97,50 @@ async def _post_inline_findings(
         return 0, 0
 
     added_lines_map: dict[str, list[int]] = pr_ctx.get("added_lines") or {}
+    # Normalise map keys for fuzzy match (leading slash, trimming)
+    norm_map = {k.strip().lstrip("/"): set(v or []) for k, v in added_lines_map.items()}
+
     posted = 0
     skipped = 0
     for f in findings:
         sev = f.get("severity", "low")
         if sev not in INLINE_SEVERITIES:
             continue
-        path = (f.get("file") or "").strip()
+        path_raw = (f.get("file") or "").strip()
+        path = path_raw.lstrip("/")
         try:
             line = int(f.get("line", 0) or 0)
         except (TypeError, ValueError):
             line = 0
-        allowed = set(added_lines_map.get(path) or [])
-        if line <= 0 or (allowed and line not in allowed):
+
+        if line <= 0 or not path:
+            logger.info("inline SKIP [%s] %s:%s — invalid line/path", sev, path_raw, line)
             skipped += 1
             continue
+
+        allowed = norm_map.get(path)
+        if allowed is None:
+            # Try basename match as last resort (LLM sometimes strips dirs)
+            matches = [k for k in norm_map if k.endswith("/" + path) or k == path]
+            if len(matches) == 1:
+                path = matches[0]
+                allowed = norm_map[path]
+            else:
+                logger.info(
+                    "inline SKIP [%s] %s:%d — path not in diff (known: %s)",
+                    sev, path_raw, line, list(norm_map.keys())[:5],
+                )
+                skipped += 1
+                continue
+
+        if line not in allowed:
+            logger.info(
+                "inline SKIP [%s] %s:%d — line not a '+' line (allowed sample: %s)",
+                sev, path, line, sorted(allowed)[:10],
+            )
+            skipped += 1
+            continue
+
         body = _render_inline_body(f)
         try:
             await create_mr_discussion(
@@ -104,8 +149,14 @@ async def _post_inline_findings(
                 new_path=path, new_line=line,
             )
             posted += 1
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "inline FAIL [%s] %s:%d — HTTP %d body=%s",
+                sev, path, line, exc.response.status_code, exc.response.text[:400],
+            )
+            skipped += 1
         except Exception as exc:
-            logger.warning("create_mr_discussion %s:%d failed: %s", path, line, exc)
+            logger.warning("inline FAIL [%s] %s:%d — %s", sev, path, line, exc)
             skipped += 1
     return posted, skipped
 
@@ -164,18 +215,21 @@ async def upsert_mr_comment(state: AgentState) -> dict:
             )
             # Inline discussions: resolve old AI threads, then post new for critical/high/medium.
             try:
-                resolved = await _resolve_old_inline(provider="gitlab", repo=repo, pr_id=pr_id)
+                resolved, resolve_failed = await _resolve_old_inline(
+                    provider="gitlab", repo=repo, pr_id=pr_id,
+                )
                 findings = list(state.get("review_findings") or [])
                 posted, skipped = await _post_inline_findings(
                     provider="gitlab", repo=repo, pr_id=pr_id,
                     findings=findings, pr_ctx=pr_ctx,
                 )
                 logger.info(
-                    "inline discussions: resolved=%d posted=%d skipped=%d",
-                    resolved, posted, skipped,
+                    "inline discussions: resolved=%d resolve_failed=%d posted=%d skipped=%d",
+                    resolved, resolve_failed, posted, skipped,
                 )
                 pr_ctx["inline_posted"] = posted
                 pr_ctx["inline_resolved"] = resolved
+                pr_ctx["inline_resolve_failed"] = resolve_failed
                 pr_ctx["inline_skipped"] = skipped
             except Exception as exc:
                 logger.warning("inline discussion flow failed: %s", exc)

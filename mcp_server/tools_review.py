@@ -233,8 +233,15 @@ async def upsert_mr_comment(
     async with _client() as client:
         if note_id:
             resp = await client.put(f"{base}/{note_id}", headers=_headers(), json={"body": body})
-            resp.raise_for_status()
-            return {"note_id": note_id, "action": "updated"}
+            if resp.status_code == 403:
+                # Note do user khác tạo → GitLab chặn PUT. Fallback tạo note mới.
+                logger.warning(
+                    "upsert_mr_comment: PUT note %s forbidden (not the author) — creating new note instead",
+                    note_id,
+                )
+            else:
+                resp.raise_for_status()
+                return {"note_id": note_id, "action": "updated"}
         resp = await client.post(base, headers=_headers(), json={"body": body})
         resp.raise_for_status()
         data = resp.json()
