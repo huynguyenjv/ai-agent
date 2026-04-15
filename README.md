@@ -138,6 +138,7 @@ Each node wraps a battle-tested existing module:
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat (IDE integration) |
 | `GET`  | `/v1/models` | List available models |
+| `POST` | `/review/pr` | **Code review MR** (GitLab V1) — fetch diff, review OWASP/CWE, auto-post/update MR comment. See [curl examples](docs/code-review-curl-examples.md) |
 | `POST` | `/review/{run_id}` | Submit human review (LangGraph only) |
 | `GET`  | `/runs/{run_id}` | Poll run status (LangGraph only) |
 | `POST` | `/generate-test` | Native test generation |
@@ -145,6 +146,15 @@ Each node wraps a battle-tested existing module:
 | `POST` | `/reindex` | Index/re-index a Java repo |
 | `GET`  | `/health` | Health check |
 | `GET`  | `/metrics` | Prometheus-style metrics |
+
+## Code Review Pipeline (GitLab)
+
+- `.gitlab-ci.yml` triggers `POST /review/pr` on MR events.
+- Frameworks: **OWASP Top 10 (2021)** + **CWE Top 25 (2024)** + language lint rules.
+- Output: markdown comment on MR with marker `<!-- AI_REVIEW_MARKER:v1 -->`, update in-place on new commits, keeps last 3 review summaries in collapsible `<details>`.
+- Prompts in [server/agent/prompts/](server/agent/prompts/) (system + user + output template) — edit markdown files, no code change needed.
+- Config env: see [.env.example](.env.example) (`GITLAB_URL`, `GITLAB_TOKEN`, `GITLAB_CA_BUNDLE`, `REVIEW_TIMEOUT_SECS`, ...).
+- Full docs: [docs/code-review-curl-examples.md](docs/code-review-curl-examples.md).
 
 ## API Examples
 

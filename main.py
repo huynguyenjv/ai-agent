@@ -16,7 +16,7 @@ from server.logging_config import configure_logging
 
 
 def main() -> None:
-    load_dotenv()  # Must run before any os.environ.get
+    load_dotenv(override=True)  # Must run before any os.environ.get
 
     # Configure logging — use JSON in production (LOG_FORMAT=json)
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()

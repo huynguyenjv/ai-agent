@@ -68,6 +68,13 @@ Thumbs.db
 
 # Environment
 .env
+.env.prod
+.env.*
+!.env.example
+
+# Deploy secrets
+deploy/certs/
+logs/
 
 # Model files
 models/

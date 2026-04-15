@@ -8,8 +8,10 @@ V1: GitLab only. Agent posts/updates a single MR note identified by marker.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from typing import Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -19,6 +21,8 @@ from pydantic import BaseModel, Field
 from server.auth import verify_api_key
 
 logger = logging.getLogger("server.review")
+
+REVIEW_TIMEOUT_SECS = int(os.environ.get("REVIEW_TIMEOUT_SECS", "180"))
 
 router = APIRouter()
 
@@ -31,9 +35,9 @@ class ReviewPRRequest(BaseModel):
 
 
 def _count_findings(findings: list[dict]) -> dict:
-    counts = {"blocker": 0, "major": 0, "minor": 0, "info": 0}
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for f in findings or []:
-        sev = f.get("severity", "info")
+        sev = f.get("severity", "low")
         if sev in counts:
             counts[sev] += 1
     return counts
@@ -81,6 +85,14 @@ async def review_pr(
 ) -> dict[str, Any]:
     verify_api_key(req, x_api_key, authorization)
 
+    try:
+        return await asyncio.wait_for(_run_review(request, req), timeout=REVIEW_TIMEOUT_SECS)
+    except asyncio.TimeoutError:
+        logger.warning("review_pr timeout after %ds for %s!%d", REVIEW_TIMEOUT_SECS, request.repo, request.pr_id)
+        raise HTTPException(status_code=504, detail=f"Review timeout after {REVIEW_TIMEOUT_SECS}s")
+
+
+async def _run_review(request: ReviewPRRequest, req: Request) -> dict[str, Any]:
     from server.agent.graph import build_agent_graph
 
     vllm_client = req.app.state.vllm_client
