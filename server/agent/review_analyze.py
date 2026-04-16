@@ -158,7 +158,7 @@ async def _call_llm(client: AsyncOpenAI, model: str, system: str, user: str) -> 
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             max_tokens=LLM_MAX_TOKENS,
             temperature=0.1,
-            stream=False,
+            stream=False,  # batch response — V1 per spec (non-streaming review)
         ),
         timeout=LLM_TIMEOUT_SECS,
     )
