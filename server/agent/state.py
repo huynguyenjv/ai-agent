@@ -37,3 +37,7 @@ class AgentState(TypedDict, total=False):
     review_findings: list[dict]      # [{file, line, severity, category, title, description, suggestion}]
     output_format: str               # "" | "markdown" | "sse_stream"
     auto_post: bool                  # True khi gọi từ /review/pr
+
+    # --- Native tool-call (client-forwarded) ---
+    client_tools: list[dict]             # raw tool schemas from ChatRequest.tools
+    tool_choice: str | dict | None       # forwarded tool_choice
