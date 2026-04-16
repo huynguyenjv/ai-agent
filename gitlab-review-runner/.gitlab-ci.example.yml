@@ -1,0 +1,23 @@
+# Copy this into the target repo's .gitlab-ci.yml (or include via `include:`).
+# Requires these CI/CD variables to be set on the project (Settings → CI/CD → Variables):
+#   GITLAB_TOKEN        — PAT with `api` scope, member of this project
+#   AI_SERVER_API_KEY   — matches API_KEY env on the AI server
+#   AI_SERVER_URL       — (optional, can be set as job variable below instead)
+#
+# Mark both tokens as Masked + Protected.
+
+stages:
+  - review
+
+ai-review:
+  stage: review
+  image: registry.vinit.tech/ai/gitlab-review-runner:latest
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    AI_SERVER_URL: "https://ai-server.internal"
+    # GITLAB_URL defaults to $CI_SERVER_URL — override only if different.
+    # GITLAB_CA_BUNDLE: "/certs/ca.crt"   # if GitLab uses self-signed cert
+  script:
+    - python /app/main.py
+  allow_failure: true
