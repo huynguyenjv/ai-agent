@@ -1,6 +1,8 @@
-"""Node: generate — Section 8.
+"""Node: generate — native tool-call streaming.
 
-Assembles system prompt with RAG context, streams tokens via vLLM.
+Forwards merged tools (server registry + client) to vLLM, streams content
+tokens, and captures tool_call deltas to accumulate a final pending_tool_calls
+list for Turn 2.
 """
 
 from __future__ import annotations
@@ -10,12 +12,62 @@ import logging
 from openai import AsyncOpenAI
 
 from server.agent.state import AgentState
+from server.tools.registry import merge_tools
 
 logger = logging.getLogger("server.agent.generate")
 
-BASE_SYSTEM_PROMPT = """You are an expert coding assistant. You provide accurate, well-structured code responses grounded in the actual codebase context provided below. Always reference the codebase context when generating code. If the context is insufficient, say so clearly.
+BASE_SYSTEM_PROMPT = (
+    "You are an expert coding assistant. Provide accurate, well-structured answers. "
+    "If you need to inspect files or search the codebase, call the provided tools. "
+    "Respond in the same language as the user's query (Vietnamese or English)."
+)
 
-Respond in the same language as the user's query (Vietnamese or English)."""
+
+def _to_openai_messages(state: AgentState) -> list[dict]:
+    out: list[dict] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
+    for msg in state.get("messages", []):
+        mtype = getattr(msg, "type", None)
+        if mtype == "human":
+            out.append({"role": "user", "content": msg.content or ""})
+        elif mtype == "ai":
+            item: dict = {"role": "assistant", "content": msg.content or ""}
+            tc = (getattr(msg, "additional_kwargs", {}) or {}).get("tool_calls")
+            if tc:
+                item["tool_calls"] = tc
+                item["content"] = None
+            out.append(item)
+        elif mtype == "tool":
+            out.append({
+                "role": "tool",
+                "content": msg.content or "",
+                "tool_call_id": getattr(msg, "tool_call_id", "") or "",
+            })
+        elif mtype == "system":
+            out.append({"role": "system", "content": msg.content or ""})
+        else:
+            out.append({"role": "user", "content": str(getattr(msg, "content", msg))})
+    return out
+
+
+def _merge_tool_call_delta(acc: list[dict], delta_list: list) -> None:
+    for d in delta_list:
+        if hasattr(d, "model_dump"):
+            d = d.model_dump()
+        idx = d.get("index", 0)
+        while len(acc) <= idx:
+            acc.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        slot = acc[idx]
+        if d.get("id"):
+            slot["id"] = d["id"]
+        if d.get("type"):
+            slot["type"] = d["type"]
+        fn = d.get("function") or {}
+        name = fn.get("name")
+        if name:
+            slot["function"]["name"] += name
+        args = fn.get("arguments")
+        if args:
+            slot["function"]["arguments"] += args
 
 
 async def generate(
@@ -24,86 +76,44 @@ async def generate(
     model: str,
     sse_callback=None,
 ) -> dict:
-    """Assemble prompt and stream LLM response.
+    merged_tools = merge_tools(state.get("client_tools"))
+    messages = _to_openai_messages(state)
 
-    Section 8:
-    1. System prompt + RAG context + plan (for code_gen)
-    2. Conversation history
-    3. Stream via vLLM with stream=True
-    4. Emit content SSE delta events
-    """
-    intent = state.get("intent", "code_gen")
-    rag_chunks = state.get("rag_chunks", [])
-    tool_results = state.get("tool_results", [])
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        "tools": merged_tools,
+        "stream": True,
+        "max_tokens": 4096,
+        "temperature": 0.3,
+    }
+    tc = state.get("tool_choice")
+    if tc is not None:
+        kwargs["tool_choice"] = tc
 
-    # Build system prompt
-    parts = [BASE_SYSTEM_PROMPT]
+    content_buf: list[str] = []
+    tool_calls_acc: list[dict] = []
 
-    # Add RAG context as labeled code blocks
-    if rag_chunks:
-        parts.append("\n## Codebase Context\n")
-        for chunk in rag_chunks:
-            symbol = chunk.get("symbol_name", "unknown")
-            lang = chunk.get("lang", "")
-            file_path = chunk.get("file_path", "")
-            body = chunk.get("body", "")
-            embed = chunk.get("embed_text", "")
-
-            text = body if body else embed
-            if text:
-                parts.append(f"### {symbol} ({file_path})")
-                parts.append(f"```{lang}\n{text}\n```\n")
-
-    # Add plan for code_gen
-    if intent == "code_gen" and tool_results:
-        for result in tool_results:
-            if "plan" in result:
-                parts.append(f"\n## Execution Plan\n{result['plan']}\n")
-
-    system_prompt = "\n".join(parts)
-
-    # Build messages
-    llm_messages = [{"role": "system", "content": system_prompt}]
-
-    for msg in state.get("messages", []):
-        if hasattr(msg, "type"):
-            role = "assistant" if msg.type == "ai" else "user"
-            content = msg.content
-        elif isinstance(msg, dict):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-        else:
-            role = "user"
-            content = str(msg)
-        llm_messages.append({"role": role, "content": content})
-
-    # Stream from vLLM
-    full_response = []
     try:
-        stream = await vllm_client.chat.completions.create(
-            model=model,
-            messages=llm_messages,
-            max_tokens=4096,
-            temperature=0.3,
-            stream=True,
-        )
-
+        stream = await vllm_client.chat.completions.create(**kwargs)
         async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                full_response.append(token)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                token = delta.content
+                content_buf.append(token)
                 if sse_callback:
                     await sse_callback("content", token)
-
+            if getattr(delta, "tool_calls", None):
+                _merge_tool_call_delta(tool_calls_acc, delta.tool_calls)
     except Exception as e:
         logger.error("vLLM generation failed: %s", e)
-        error_msg = f"Generation error: {str(e)}"
-        full_response.append(error_msg)
         if sse_callback:
-            await sse_callback("error", error_msg)
+            await sse_callback("error", str(e))
+        return {"draft": f"Generation error: {e}", "pending_tool_calls": []}
 
-    draft = "".join(full_response)
     return {
-        "draft": draft,
-        "context_assembled": system_prompt,
+        "draft": "".join(content_buf),
+        "pending_tool_calls": tool_calls_acc,
     }
