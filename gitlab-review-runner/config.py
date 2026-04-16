@@ -46,17 +46,19 @@ def load_config() -> Config:
     gitlab_url = (
         os.environ.get("GITLAB_URL")
         or os.environ.get("CI_SERVER_URL")
-        or "https://gitlab.com"
+        or "https://gitlab.vinit.com"
     ).rstrip("/")
 
     return Config(
         repo=repo,
         pr_id=pr_id,
         gitlab_url=gitlab_url,
-        gitlab_token=_require("GITLAB_TOKEN"),
+        # gitlab_token=_require("GITLAB_TOKEN"),
+        gitlab_token = '',
         gitlab_verify=_resolve_verify(os.environ.get("GITLAB_CA_BUNDLE", "")),
         ai_server_url=_require("AI_SERVER_URL").rstrip("/"),
-        ai_api_key=_require("AI_SERVER_API_KEY"),
+        # ai_api_key=_require("AI_SERVER_API_KEY"),
+        ai_api_key= '',
         http_timeout=float(os.environ.get("HTTP_TIMEOUT", "60")),
         summary_marker=os.environ.get("AI_REVIEWER_MARKER", "AI_REVIEW_MARKER:v1"),
         inline_marker=os.environ.get("AI_REVIEWER_INLINE_MARKER", "AI_REVIEW_INLINE:v1"),

@@ -135,6 +135,15 @@ def run() -> int:
         posted, failed = _post_inline_comments(gl, cfg, diff_payload, inline_comments)
         log.info("inline discussions: posted=%d failed=%d", posted, failed)
 
+    counts = result.get("findings_count") or {}
+    blocking = int(counts.get("critical", 0)) + int(counts.get("high", 0))
+    if blocking > 0:
+        log.error(
+            "review BLOCKING: %d critical + %d high findings — failing pipeline",
+            counts.get("critical", 0), counts.get("high", 0),
+        )
+        return 2
+
     log.info("runner done")
     return 0
 
