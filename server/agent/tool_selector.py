@@ -1,4 +1,11 @@
-"""Node: tool_selector — Agent Tool Call Flow.
+"""DEPRECATED — superseded by native tool-call flow in generate.py.
+
+Kept for historical reference; not imported by the agent graph under the
+native tool-call architecture (see docs/superpowers/specs/
+2026-04-15-chat-completions-native-toolcall-design.md). Do not add new
+call sites.
+
+Node: tool_selector — Agent Tool Call Flow.
 
 Deterministically selects MCP tools based on intent, gate outputs, and Qdrant cache state.
 Agent logic decides tools — not the LLM.

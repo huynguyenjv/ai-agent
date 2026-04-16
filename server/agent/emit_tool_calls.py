@@ -1,4 +1,11 @@
-"""Node: emit_tool_calls — Agent Tool Call Flow.
+"""DEPRECATED — superseded by native tool-call flow in generate.py.
+
+Kept for historical reference; not imported by the agent graph under the
+native tool-call architecture (see docs/superpowers/specs/
+2026-04-15-chat-completions-native-toolcall-design.md). Do not add new
+call sites.
+
+Node: emit_tool_calls — Agent Tool Call Flow.
 
 Pure SSE side-effect node. Emits thinking comments and OpenAI tool_calls chunks.
 Connected to END — handles exceptions internally (no graph fallback exists).
