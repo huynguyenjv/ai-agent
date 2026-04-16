@@ -5,6 +5,14 @@ import os
 import shutil
 import tempfile
 
+import pytest
+
+# Tests for tool_selector / emit_tool_calls / old graph routing are obsolete
+# under the native tool-call architecture (see docs/superpowers/specs/
+# 2026-04-15-chat-completions-native-toolcall-design.md). Skipped en masse
+# via test name patterns in the relevant test functions below.
+_DEPRECATED_REASON = "obsolete after native tool-call refactor; see 2026-04-15 spec"
+
 # ============ Phase 1: Models, HashStore, Tools ============
 
 
@@ -535,6 +543,7 @@ def test_classify_intent_not_tool_result_turn_on_normal_message():
 import pytest
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_tool_selector_structural_analysis():
     """structural_analysis intent always emits get_project_skeleton."""
     from unittest.mock import AsyncMock
@@ -560,6 +569,7 @@ async def test_tool_selector_structural_analysis():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_tool_selector_search():
     """search intent always emits search_symbol regardless of Qdrant state."""
     from unittest.mock import AsyncMock
@@ -585,6 +595,7 @@ async def test_tool_selector_search():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_tool_selector_code_gen_miss():
     """code_gen + Qdrant miss + file mentioned -> [index_with_deps, read_file]."""
     from unittest.mock import AsyncMock
@@ -611,6 +622,7 @@ async def test_tool_selector_code_gen_miss():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_tool_selector_code_gen_hit_no_freshness():
     """code_gen + hit + file mentioned, no freshness -> [read_file] only."""
     from unittest.mock import AsyncMock
@@ -635,6 +647,7 @@ async def test_tool_selector_code_gen_hit_no_freshness():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_tool_selector_cap():
     """tool_turns_used >= 1 always returns empty pending_tool_calls."""
     from unittest.mock import AsyncMock
@@ -657,6 +670,7 @@ async def test_tool_selector_cap():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_emit_tool_calls_sse_format():
     """emit_tool_calls streams thinking comment + two-chunk tool_calls + DONE."""
     import json
@@ -706,6 +720,7 @@ def test_chat_message_accepts_null_content():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_graph_routes_to_emit_tool_calls():
     """Graph routes to emit_tool_calls when pending_tool_calls is non-empty."""
     from unittest.mock import AsyncMock, patch
@@ -750,6 +765,7 @@ async def test_graph_routes_to_emit_tool_calls():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_graph_skips_to_rag_search():
     """Graph completes without emitting tool_calls when pending_tool_calls is empty."""
     from unittest.mock import AsyncMock, patch
@@ -791,6 +807,7 @@ async def test_graph_skips_to_rag_search():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=_DEPRECATED_REASON)
 async def test_graph_turn2_skips_route_context():
     """Turn 2 (is_tool_result_turn=True) skips route_context, goes classify_intent -> tool_selector -> rag_search."""
     from unittest.mock import AsyncMock, patch

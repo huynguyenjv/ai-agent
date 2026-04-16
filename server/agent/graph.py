@@ -1,16 +1,17 @@
-"""LangGraph Agent — Section 8, Graph Structure + Tool Call Flow.
+"""LangGraph agent graph — native tool-call edition.
 
-Directed graph with conditional edges.
+Flow:
+  classify_intent
+    ├─ is_tool_result_turn=True → generate → post_process → END
+    └─ else → route_context
+         ├─ volatile_rejected → reject_volatile → END
+         └─ else → <intent router>
+              ├─ code_review → review_analyze → review_format
+              │                 ├─ auto_post → upsert_mr_comment → END
+              │                 └─ else → post_process → END
+              └─ else → generate → post_process → END
 
-Turn 1 (normal):
-  classify_intent -> route_context -> tool_selector
-    -> [pending_tool_calls]: emit_tool_calls -> END
-    -> [no tools, structural_analysis]: generate -> post_process -> END
-    -> [no tools, other]: rag_search -> plan_steps/generate -> post_process -> END
-    -> [volatile_rejected]: reject_volatile -> END
-
-Turn 2 (tool results):
-  classify_intent -> tool_selector (skip route_context) -> rag_search -> generate -> END
+rag_search / plan_steps only wired when enable_rag=True (pending RAG redesign).
 """
 
 from __future__ import annotations
@@ -22,17 +23,12 @@ from langgraph.graph import END, StateGraph
 from server.agent.state import AgentState
 from server.agent.classify_intent import classify_intent
 from server.agent.route_context import route_context
-from server.agent.rag_search import rag_search
-from server.agent.plan_steps import plan_steps
 from server.agent.generate import generate
 from server.agent.post_process import post_process
 from server.agent.review_analyze import review_analyze
 from server.agent.review_format import review_format
 from server.agent.upsert_mr_comment import upsert_mr_comment
-import server.agent.tool_selector as _tool_selector_mod
-import server.agent.emit_tool_calls as _emit_tool_calls_mod
 
-# Gate 3 canned response (Section 11)
 _VOLATILE_RESPONSE = (
     "Xin lỗi, tính năng này chưa được hỗ trợ trong phiên bản hiện tại (V1). "
     "Hệ thống chưa thể truy cập dữ liệu real-time như git diff, runtime logs, "
@@ -42,89 +38,51 @@ _VOLATILE_RESPONSE = (
 
 
 def _reject_volatile(state: AgentState) -> dict:
-    """Return a canned 'not supported' message for Gate 3 volatile queries."""
     return {"draft": _VOLATILE_RESPONSE}
 
 
 def _route_after_classify(state: AgentState) -> str:
-    """Turn 2 bypass: skip route_context when tool results are present.
-
-    On Turn 2, route_context would re-parse ToolMessage JSON content and
-    set force_reindex/mentioned_files from the tool result text — causing
-    unwanted side effects. Skip directly to tool_selector.
-    """
     if state.get("is_tool_result_turn"):
-        return "tool_selector"
+        return "generate"
     return "route_context"
 
 
-def _route_after_intent(state: AgentState) -> str:
-    """Conditional edge after route_context — volatile gate fires first."""
+def _route_after_context(state: AgentState) -> str:
     if state.get("volatile_rejected"):
         return "reject_volatile"
-    return "tool_selector"
-
-
-def _route_after_tool_selector(state: AgentState) -> str:
-    """Route based on whether tools need to be emitted."""
-    if state.get("pending_tool_calls"):
-        return "emit_tool_calls"
     if state.get("intent") == "code_review":
         return "review_analyze"
-    if state.get("intent") == "structural_analysis":
-        return "generate"
-    return "rag_search"
+    return "generate"
 
 
 def _route_after_review_format(state: AgentState) -> str:
     return "upsert_mr_comment" if state.get("auto_post") else "post_process"
 
 
-def _route_after_rag(state: AgentState) -> str:
-    """Conditional edge after rag_search."""
-    if state.get("intent") == "code_gen":
-        return "plan_steps"
-    return "generate"
+def build_agent_graph(
+    vllm_client,
+    model: str,
+    qdrant,
+    embedder,
+    sse_callback=None,
+    *,
+    enable_rag: bool = False,
+):
+    # Re-read current module bindings each call so monkeypatch-based tests
+    # see the intended fakes (partial binds at call time, not import time).
+    import server.agent.graph as _this
 
-
-def build_agent_graph(vllm_client, model: str, qdrant, embedder, sse_callback=None):
-    """Build and compile the LangGraph agent graph.
-
-    All async nodes that need external services receive them via partial.
-    """
     graph = StateGraph(AgentState)
 
-    # Add nodes
-    graph.add_node("classify_intent", classify_intent)
-    graph.add_node("route_context", route_context)
+    graph.add_node("classify_intent", _this.classify_intent)
+    graph.add_node("route_context", _this.route_context)
     graph.add_node("reject_volatile", _reject_volatile)
-    _qdrant = qdrant
-
-    async def _tool_selector_node(state):
-        return await _tool_selector_mod.tool_selector(state, qdrant=_qdrant)
-
-    _sse = sse_callback
-
-    async def _emit_tool_calls_node(state):
-        return await _emit_tool_calls_mod.emit_tool_calls(state, sse_callback=_sse)
-
-    graph.add_node("tool_selector", _tool_selector_node)
-    graph.add_node("emit_tool_calls", _emit_tool_calls_node)
-    graph.add_node(
-        "rag_search",
-        partial(rag_search, qdrant=qdrant, embedder=embedder),
-    )
-    graph.add_node(
-        "plan_steps",
-        partial(plan_steps, vllm_client=vllm_client, model=model),
-    )
     graph.add_node(
         "generate",
-        partial(generate, vllm_client=vllm_client, model=model, sse_callback=sse_callback),
+        partial(_this.generate, vllm_client=vllm_client, model=model, sse_callback=sse_callback),
     )
-    graph.add_node("post_process", post_process)
+    graph.add_node("post_process", _this.post_process)
 
-    # Code review nodes
     graph.add_node(
         "review_analyze",
         partial(review_analyze, vllm_client=vllm_client, model=model),
@@ -132,71 +90,43 @@ def build_agent_graph(vllm_client, model: str, qdrant, embedder, sse_callback=No
     graph.add_node("review_format", review_format)
     graph.add_node("upsert_mr_comment", upsert_mr_comment)
 
-    # Set entry point
     graph.set_entry_point("classify_intent")
 
-    # classify_intent -> conditional: Turn 2 bypass
     graph.add_conditional_edges(
         "classify_intent",
         _route_after_classify,
-        {
-            "route_context": "route_context",
-            "tool_selector": "tool_selector",
-        },
+        {"route_context": "route_context", "generate": "generate"},
     )
 
-    # route_context -> conditional: volatile gate or tool_selector
     graph.add_conditional_edges(
         "route_context",
-        _route_after_intent,
+        _route_after_context,
         {
             "reject_volatile": "reject_volatile",
-            "tool_selector": "tool_selector",
+            "review_analyze": "review_analyze",
+            "generate": "generate",
         },
     )
 
-    # reject_volatile goes straight to END
     graph.add_edge("reject_volatile", END)
 
-    # tool_selector -> conditional: emit tools, skip to generate, or rag_search
-    graph.add_conditional_edges(
-        "tool_selector",
-        _route_after_tool_selector,
-        {
-            "emit_tool_calls": "emit_tool_calls",
-            "rag_search": "rag_search",
-            "generate": "generate",
-            "review_analyze": "review_analyze",
-        },
-    )
-
-    # Code review flow
     graph.add_edge("review_analyze", "review_format")
     graph.add_conditional_edges(
         "review_format",
         _route_after_review_format,
-        {
-            "upsert_mr_comment": "upsert_mr_comment",
-            "post_process": "post_process",
-        },
+        {"upsert_mr_comment": "upsert_mr_comment", "post_process": "post_process"},
     )
     graph.add_edge("upsert_mr_comment", END)
 
-    # emit_tool_calls -> END (Turn 1 ends here, Continue takes over)
-    graph.add_edge("emit_tool_calls", END)
-
-    # rag_search -> conditional
-    graph.add_conditional_edges(
-        "rag_search",
-        _route_after_rag,
-        {
-            "plan_steps": "plan_steps",
-            "generate": "generate",
-        },
-    )
-
-    graph.add_edge("plan_steps", "generate")
     graph.add_edge("generate", "post_process")
     graph.add_edge("post_process", END)
+
+    if enable_rag:
+        # Nodes kept resident for future wiring; edges intentionally not added.
+        from server.agent.rag_search import rag_search
+        from server.agent.plan_steps import plan_steps
+
+        graph.add_node("rag_search", partial(rag_search, qdrant=qdrant, embedder=embedder))
+        graph.add_node("plan_steps", partial(plan_steps, vllm_client=vllm_client, model=model))
 
     return graph.compile()
