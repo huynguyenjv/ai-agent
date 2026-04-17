@@ -14,10 +14,6 @@ import sys
 import logging
 from pathlib import Path
 
-# Ensure project root is on sys.path when run directly (e.g. by Continue IDE)
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
