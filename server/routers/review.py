@@ -65,7 +65,7 @@ def _count_findings(findings: list[dict]) -> dict:
 
 async def _execute_tool_calls(tool_calls: list[dict]) -> list[ToolMessage]:
     """Execute pending MCP tool calls in-process. V1 supports review tools only here."""
-    from mcp_server import tools_review
+    from server import gitlab
 
     results: list[ToolMessage] = []
     for tc in tool_calls:
@@ -78,11 +78,11 @@ async def _execute_tool_calls(tool_calls: list[dict]) -> list[ToolMessage]:
 
         try:
             if name == "get_pr_diff":
-                payload = await tools_review.get_pr_diff(**args)
+                payload = await gitlab.get_pr_diff(**args)
             elif name == "get_mr_note":
-                payload = await tools_review.get_mr_note(**args)
+                payload = await gitlab.get_mr_note(**args)
             elif name == "upsert_mr_comment":
-                payload = await tools_review.upsert_mr_comment(**args)
+                payload = await gitlab.upsert_mr_comment(**args)
             else:
                 payload = {"error": f"Tool {name} not supported in /review/pr"}
         except Exception as exc:

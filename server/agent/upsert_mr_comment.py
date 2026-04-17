@@ -41,7 +41,7 @@ def _render_inline_body(f: dict) -> str:
 
 async def _resolve_old_inline(provider: str, repo: str, pr_id: int) -> tuple[int, int]:
     """Return (resolved_count, failed_count)."""
-    from mcp_server.tools_review import list_mr_discussions, resolve_mr_discussion
+    from server.gitlab import list_mr_discussions, resolve_mr_discussion
     try:
         discussions = await list_mr_discussions(provider=provider, repo=repo, pr_id=pr_id)
     except Exception as exc:
@@ -87,7 +87,7 @@ async def _post_inline_findings(
     provider: str, repo: str, pr_id: int,
     findings: list[dict], pr_ctx: dict,
 ) -> tuple[int, int]:
-    from mcp_server.tools_review import create_mr_discussion
+    from server.gitlab import create_mr_discussion
 
     base_sha = pr_ctx.get("base_sha", "")
     head_sha = pr_ctx.get("head_sha", "")
@@ -178,7 +178,7 @@ async def upsert_mr_comment(state: AgentState) -> dict:
         return {}
 
     # Import review tools directly (decision §16.1)
-    from mcp_server.tools_review import get_mr_note, upsert_mr_comment as api_upsert
+    from server.gitlab import get_mr_note, upsert_mr_comment as api_upsert
 
     # Step 1: fetch existing note
     existing = None
