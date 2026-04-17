@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tabby-mcp-server"
+name = "vtrip-mcp-server"
 version = "0.1.0"
-description = "MCP Server for Tabby AI Coding Agent"
+description = "MCP Server for VTrip AI Coding Agent"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ classifiers = [
 ]
 
 [project.scripts]
-tabby-mcp-server = "mcp_server.server:main"
+vtrip-mcp-server = "mcp_server.server:main"
 
 [tool.setuptools]
 packages = ["mcp_server", "mcp_server.plugins"]
