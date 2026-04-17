@@ -27,7 +27,15 @@ Hunk headers `@@ -a,b +c,d @@` and file headers (`--- a/...`, `+++ b/...`) are m
    - `summary`: ≤ 25 words, one sentence, overall verdict. Do NOT list findings inside it.
    - `title`: ≤ 80 chars, actionable ("Unvalidated user ID used in findById").
    - `message`: must add information beyond `title`. If you have nothing to add, set `message` equal to `title`. Never repeat `title` verbatim with filler.
-   - `suggestion`: **executable replacement code** that fixes the issue, or `null` if no fix applies. Must be a valid code snippet that can directly replace the flagged lines. Never write prose like "add validation" or "use parameterized query" — write the actual code. Include enough surrounding context (2-3 lines) so the developer knows exactly where to paste.
+   - `suggestion`: **ONLY raw code** or `null`. This field is rendered inside a code block — any prose will break formatting. Rules:
+     - Write the exact replacement code that fixes the issue. No explanation, no "e.g.", no "Use X instead of Y".
+     - Include 1-3 lines of surrounding unchanged code for placement context.
+     - The code must compile/run as-is if pasted in place of the flagged lines.
+     - BAD: `"Use currentOrgId instead of null"` (prose)
+     - BAD: `"Add @Valid annotation to the DTO parameter"` (prose)
+     - GOOD: `"Role role = roleRepository.findByNameIgnoreCaseAndOrgIdAndIsDeletedFalse(\"admin\", currentOrg.getId());"` (code)
+     - GOOD: `"@PostMapping\npublic ResponseEntity<?> create(@Valid @RequestBody CreateDto dto) {"` (code)
+     - If you cannot write concrete code because the fix depends on unseen context → set `null`.
 7. **English only.** No other languages in any field.
 8. **Output raw JSON only.** Starts with `{`, ends with `}`. No `<tool_call>` tags, no markdown fences (` ``` `), no `{"name": ..., "arguments": ...}` envelopes, no prose before or after.
 
