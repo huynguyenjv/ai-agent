@@ -15,6 +15,21 @@ logger = logging.getLogger("server.agent.review_format")
 MARKER = os.environ.get("AI_REVIEWER_MARKER", "AI_REVIEW_MARKER:v1")
 KEEP_HISTORY = int(os.environ.get("AI_REVIEWER_KEEP_HISTORY", "3"))
 
+_EXT_LANG = {
+    ".java": "java", ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".go": "go", ".cs": "csharp", ".rb": "ruby", ".kt": "kotlin", ".rs": "rust",
+    ".tf": "hcl", ".sql": "sql", ".xml": "xml", ".yml": "yaml", ".yaml": "yaml",
+    ".json": "json", ".sh": "bash", ".jsx": "jsx", ".tsx": "tsx",
+}
+
+
+def _guess_lang(file_path: str) -> str:
+    for ext, lang in _EXT_LANG.items():
+        if file_path.endswith(ext):
+            return lang
+    return ""
+
+
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _SEVERITY_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
 _SEVERITY_TITLE = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
@@ -74,9 +89,15 @@ def _render_finding(f: dict) -> str:
         body_lines.append(msg)
         body_lines.append("")
     if sugg and sugg.lower() not in {"null", "none", ""}:
-        body_lines.append("**💡 Suggestion:**")
+        body_lines.append("**💡 Suggested fix:**")
         body_lines.append("")
-        body_lines.append(sugg)
+        lang = _guess_lang(file)
+        if not sugg.startswith("```"):
+            body_lines.append(f"```{lang}")
+            body_lines.append(sugg)
+            body_lines.append("```")
+        else:
+            body_lines.append(sugg)
         body_lines.append("")
 
     body = "\n".join(body_lines).rstrip()

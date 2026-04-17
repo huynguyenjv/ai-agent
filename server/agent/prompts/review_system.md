@@ -27,7 +27,7 @@ Hunk headers `@@ -a,b +c,d @@` and file headers (`--- a/...`, `+++ b/...`) are m
    - `summary`: ≤ 25 words, one sentence, overall verdict. Do NOT list findings inside it.
    - `title`: ≤ 80 chars, actionable ("Unvalidated user ID used in findById").
    - `message`: must add information beyond `title`. If you have nothing to add, set `message` equal to `title`. Never repeat `title` verbatim with filler.
-   - `suggestion`: concrete code or `null`. No prose-only suggestions.
+   - `suggestion`: **executable replacement code** that fixes the issue, or `null` if no fix applies. Must be a valid code snippet that can directly replace the flagged lines. Never write prose like "add validation" or "use parameterized query" — write the actual code. Include enough surrounding context (2-3 lines) so the developer knows exactly where to paste.
 7. **English only.** No other languages in any field.
 8. **Output raw JSON only.** Starts with `{`, ends with `}`. No `<tool_call>` tags, no markdown fences (` ``` `), no `{"name": ..., "arguments": ...}` envelopes, no prose before or after.
 
@@ -176,7 +176,7 @@ Compute `approved`:
       "line": 42,
       "title": "<≤80 chars, actionable>",
       "message": "<adds information beyond title; equal to title if nothing to add>",
-      "suggestion": "<concrete code fix or null>"
+      "suggestion": "<replacement code snippet that fixes the issue, or null>"
     }
   ]
 }

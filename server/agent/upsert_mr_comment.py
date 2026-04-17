@@ -19,6 +19,18 @@ logger = logging.getLogger("server.agent.upsert_mr_comment")
 
 INLINE_MARKER = os.environ.get("AI_REVIEWER_INLINE_MARKER", "AI_REVIEW_INLINE:v1")
 INLINE_SEVERITIES = {"critical", "high", "medium"}
+
+_INLINE_EXT_LANG = {
+    ".java": "java", ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".go": "go", ".cs": "csharp", ".kt": "kotlin", ".rs": "rust",
+}
+
+
+def _guess_inline_lang(file_path: str) -> str:
+    for ext, lang in _INLINE_EXT_LANG.items():
+        if file_path.endswith(ext):
+            return lang
+    return ""
 _SEV_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡"}
 
 
@@ -34,8 +46,13 @@ def _render_inline_body(f: dict) -> str:
         parts.append("")
         parts.append(msg)
     if sugg and sugg.lower() not in {"null", "none", ""}:
+        file_path = f.get("file", "")
+        lang = _guess_inline_lang(file_path)
         parts.append("")
-        parts.append(f"💡 **Suggestion:**\n\n{sugg}")
+        if sugg.startswith("```"):
+            parts.append(f"💡 **Suggested fix:**\n\n{sugg}")
+        else:
+            parts.append(f"💡 **Suggested fix:**\n\n```{lang}\n{sugg}\n```")
     return "\n".join(parts)
 
 
