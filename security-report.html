@@ -1,0 +1,1563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Scan Report - vtrip.core.iam</title>
+    <style>
+        :root {
+            --critical: #dc2626;
+            --high: #ea580c;
+            --medium: #ca8a04;
+            --low: #16a34a;
+            --info: #2563eb;
+            --bg-dark: #1e293b;
+            --bg-card: #ffffff;
+            --text-primary: #1e293b;
+            --text-secondary: #64748b;
+            --border: #e2e8f0;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #f1f5f9;
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--bg-dark) 0%, #334155 100%);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .header-meta {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            flex-wrap: wrap;
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+
+        .verdict-badge {
+            display: inline-block;
+            background: var(--critical);
+            color: white;
+            padding: 0.5rem 1.5rem;
+            border-radius: 2rem;
+            font-weight: bold;
+            margin-top: 1rem;
+            font-size: 1.1rem;
+        }
+
+        .container {
+            display: flex;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .sidebar {
+            width: 280px;
+            background: var(--bg-card);
+            padding: 1.5rem;
+            position: sticky;
+            top: 140px;
+            height: calc(100vh - 140px);
+            overflow-y: auto;
+            border-right: 1px solid var(--border);
+        }
+
+        .sidebar h3 {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+        }
+
+        .sidebar a {
+            display: block;
+            padding: 0.75rem 1rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            border-radius: 0.5rem;
+            margin-bottom: 0.25rem;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        .sidebar a:hover {
+            background: #f1f5f9;
+        }
+
+        .sidebar a.active {
+            background: #e0e7ff;
+            color: #4f46e5;
+            font-weight: 500;
+        }
+
+        .main {
+            flex: 1;
+            padding: 2rem;
+            min-width: 0;
+        }
+
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .summary-card {
+            background: var(--bg-card);
+            padding: 1.5rem;
+            border-radius: 1rem;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .summary-card .count {
+            font-size: 2.5rem;
+            font-weight: bold;
+        }
+
+        .summary-card .label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .summary-card.critical .count { color: var(--critical); }
+        .summary-card.high .count { color: var(--high); }
+        .summary-card.medium .count { color: var(--medium); }
+        .summary-card.low .count { color: var(--low); }
+
+        .section {
+            background: var(--bg-card);
+            border-radius: 1rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .section-header {
+            background: #f8fafc;
+            padding: 1.5rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .section-header h2 {
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .section-header .toggle {
+            font-size: 1.5rem;
+            color: var(--text-secondary);
+            transition: transform 0.3s;
+        }
+
+        .section-header.collapsed .toggle {
+            transform: rotate(-90deg);
+        }
+
+        .section-content {
+            padding: 1.5rem;
+        }
+
+        .section-content.collapsed {
+            display: none;
+        }
+
+        .finding {
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            margin-bottom: 1rem;
+            overflow: hidden;
+        }
+
+        .finding-header {
+            padding: 1rem 1.5rem;
+            display: flex;
+            align-items: flex-start;
+            gap: 1rem;
+            cursor: pointer;
+            background: #fafafa;
+        }
+
+        .finding-header:hover {
+            background: #f5f5f5;
+        }
+
+        .severity-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 1rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+
+        .severity-badge.critical { background: #fef2f2; color: var(--critical); border: 1px solid #fecaca; }
+        .severity-badge.high { background: #fff7ed; color: var(--high); border: 1px solid #fed7aa; }
+        .severity-badge.medium { background: #fefce8; color: var(--medium); border: 1px solid #fef08a; }
+        .severity-badge.low { background: #f0fdf4; color: var(--low); border: 1px solid #bbf7d0; }
+        .severity-badge.info { background: #eff6ff; color: var(--info); border: 1px solid #bfdbfe; }
+
+        .finding-title {
+            flex: 1;
+            font-weight: 500;
+        }
+
+        .finding-body {
+            padding: 1.5rem;
+            border-top: 1px solid var(--border);
+            display: none;
+            background: white;
+        }
+
+        .finding-body.expanded {
+            display: block;
+        }
+
+        .finding-body h4 {
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-top: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .finding-body h4:first-child {
+            margin-top: 0;
+        }
+
+        .finding-body p, .finding-body ul {
+            margin-bottom: 0.75rem;
+        }
+
+        .finding-body ul {
+            padding-left: 1.5rem;
+        }
+
+        .finding-body code {
+            background: #f1f5f9;
+            padding: 0.125rem 0.375rem;
+            border-radius: 0.25rem;
+            font-size: 0.85em;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        }
+
+        .finding-body pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            margin: 0.75rem 0;
+        }
+
+        .finding-body pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+
+        .table-wrapper {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: #f8fafc;
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        tr:hover {
+            background: #fafafa;
+        }
+
+        .roadmap-item {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .roadmap-item .number {
+            width: 2rem;
+            height: 2rem;
+            background: var(--bg-dark);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            flex-shrink: 0;
+        }
+
+        .roadmap-item .content {
+            flex: 1;
+        }
+
+        .roadmap-item .title {
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+
+        .sprint-label {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            background: #e0e7ff;
+            color: #4f46e5;
+            border-radius: 1rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .theme-card {
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .theme-card h4 {
+            font-size: 1rem;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .theme-card .theme-number {
+            background: var(--critical);
+            color: white;
+            width: 1.5rem;
+            height: 1.5rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+
+        .endpoint-verdict {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .endpoint-verdict.fail { background: #fef2f2; color: var(--critical); }
+        .endpoint-verdict.conditional { background: #fff7ed; color: var(--high); }
+        .endpoint-verdict.ok { background: #f0fdf4; color: var(--low); }
+
+        @media (max-width: 1024px) {
+            .container {
+                flex-direction: column;
+            }
+            .sidebar {
+                width: 100%;
+                position: static;
+                height: auto;
+                border-right: none;
+                border-bottom: 1px solid var(--border);
+            }
+            .sidebar a {
+                display: inline-block;
+                margin-right: 0.5rem;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .header h1 {
+                font-size: 1.5rem;
+            }
+            .header-meta {
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+            .summary-cards {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .print-only {
+            display: none;
+        }
+
+        @media print {
+            .sidebar, .header {
+                display: none;
+            }
+            .main {
+                padding: 0;
+            }
+            .section-content.collapsed {
+                display: block;
+            }
+            .finding-body {
+                display: block;
+            }
+            .print-only {
+                display: block;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>Security Scan Report</h1>
+        <div class="header-meta">
+            <span><strong>Service:</strong> vtrip.core.iam</span>
+            <span><strong>Stack:</strong> Spring Boot 3.5 / Java 21 / Kotlin</span>
+            <span><strong>Host:</strong> vtrip-api.beta.cloudhms.io/core-iam</span>
+            <span><strong>Date:</strong> 2026-04-17</span>
+        </div>
+        <div class="verdict-badge">FAIL - DO NOT PROMOTE TO PRODUCTION</div>
+    </header>
+
+    <div class="container">
+        <nav class="sidebar">
+            <h3>Navigation</h3>
+            <a href="#summary" class="active">Executive Summary</a>
+            <a href="#findings-rollup">Findings Roll-up</a>
+            <a href="#root-causes">Systemic Root Causes</a>
+            <a href="#dangerous-findings">Most Dangerous Findings</a>
+            <a href="#roadmap">Remediation Roadmap</a>
+            <a href="#endpoints">Endpoint Verdicts</a>
+            <h3 style="margin-top: 1.5rem;">Detailed Reports</h3>
+            <a href="#report-01">01 - Organization Endpoints</a>
+            <a href="#report-02">02 - Organization Users</a>
+            <a href="#report-03">03 - Permissions</a>
+            <a href="#report-04">04 - Organization Roles</a>
+            <a href="#report-05">05 - Modules</a>
+            <a href="#report-06">06 - Full App Posture</a>
+        </nav>
+
+        <main class="main">
+            <!-- Summary Section -->
+            <section id="summary">
+                <div class="summary-cards">
+                    <div class="summary-card critical">
+                        <div class="count">14</div>
+                        <div class="label">Critical</div>
+                    </div>
+                    <div class="summary-card high">
+                        <div class="count">22</div>
+                        <div class="label">High</div>
+                    </div>
+                    <div class="summary-card medium">
+                        <div class="count">27</div>
+                        <div class="label">Medium</div>
+                    </div>
+                    <div class="summary-card low">
+                        <div class="count">26+</div>
+                        <div class="label">Low/Info</div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header" onclick="toggleSection(this)">
+                        <h2>Overall Verdict</h2>
+                        <span class="toggle">&#9660;</span>
+                    </div>
+                    <div class="section-content">
+                        <p>The 32 endpoints in scope plus the cross-cutting posture scan together produced <strong>11 CRITICAL</strong> and <strong>22 HIGH</strong> findings. The repository exhibits a systemic pattern: the authorization framework (<code>@RbacRequired</code> + <code>OrgCodeValidationAspect</code>) is designed around a single path variable name (<code>orgCode</code>) and the contract breaks silently on every controller that uses any other name (<code>orgId</code>, <code>roleId</code>, <code>userId</code>), on V2 controllers that omit the annotation entirely, and on routes the <code>permit-all</code> yaml lists unauthenticated.</p>
+
+                        <h4>Combined Blast Radius</h4>
+                        <p style="background: #fef2f2; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid var(--critical);">
+                            <strong>Any authenticated tenant member can read, modify, or delete data in any other tenant, and can grant themselves super-admin within their own tenant</strong> - without tripping any alarm (audit logging is absent on every mutation path reviewed).
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Findings Roll-up -->
+            <section id="findings-rollup" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>Findings Roll-up by Area</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content">
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Area (Report)</th>
+                                    <th>Critical</th>
+                                    <th>High</th>
+                                    <th>Medium</th>
+                                    <th>Low/Info</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>01 - Organization + Profile</td>
+                                    <td><span class="severity-badge critical">3</span></td>
+                                    <td><span class="severity-badge high">4</span></td>
+                                    <td><span class="severity-badge medium">4</span></td>
+                                    <td><span class="severity-badge low">5</span></td>
+                                </tr>
+                                <tr>
+                                    <td>02 - Organization Users</td>
+                                    <td><span class="severity-badge critical">3</span></td>
+                                    <td><span class="severity-badge high">3</span></td>
+                                    <td><span class="severity-badge medium">5</span></td>
+                                    <td><span class="severity-badge low">4</span></td>
+                                </tr>
+                                <tr>
+                                    <td>03 - Permissions + /sync + Role-Perm</td>
+                                    <td><span class="severity-badge critical">3</span></td>
+                                    <td><span class="severity-badge high">3</span></td>
+                                    <td><span class="severity-badge medium">3</span></td>
+                                    <td><span class="severity-badge low">3</span></td>
+                                </tr>
+                                <tr>
+                                    <td>04 - Organization Roles</td>
+                                    <td><span class="severity-badge critical">2</span></td>
+                                    <td><span class="severity-badge high">2</span></td>
+                                    <td><span class="severity-badge medium">3</span></td>
+                                    <td><span class="severity-badge low">2</span></td>
+                                </tr>
+                                <tr>
+                                    <td>05 - Modules + ModuleConfigs</td>
+                                    <td><span class="severity-badge critical">1</span></td>
+                                    <td><span class="severity-badge high">3</span></td>
+                                    <td><span class="severity-badge medium">4</span></td>
+                                    <td><span class="severity-badge low">4</span></td>
+                                </tr>
+                                <tr>
+                                    <td>06 - Full-app Posture</td>
+                                    <td><span class="severity-badge critical">2</span></td>
+                                    <td><span class="severity-badge high">7</span></td>
+                                    <td><span class="severity-badge medium">8</span></td>
+                                    <td><span class="severity-badge low">8+</span></td>
+                                </tr>
+                                <tr style="font-weight: bold; background: #f8fafc;">
+                                    <td>Totals</td>
+                                    <td><span class="severity-badge critical">14</span></td>
+                                    <td><span class="severity-badge high">22</span></td>
+                                    <td><span class="severity-badge medium">27</span></td>
+                                    <td><span class="severity-badge low">26+</span></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Root Causes -->
+            <section id="root-causes" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>Systemic Root Causes</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content">
+                    <div class="theme-card">
+                        <h4><span class="theme-number">1</span> OrgCodeValidationAspect is path-variable-name-dependent</h4>
+                        <p><strong>Evidence:</strong> <code>OrgCodeValidationAspect.java:42</code> - <code>if (pathVars == null || !pathVars.containsKey("orgCode")) return;</code></p>
+                        <p><strong>Impact:</strong> The aspect short-circuits for every endpoint that uses <code>{orgId}</code>, <code>{userId}</code>, <code>{roleId}</code>, <code>{staffId}</code>, <code>{code}</code>, or that accepts the org from a header/body. Instead of failing closed, it <strong>allows the request</strong>.</p>
+                        <p><strong>Fix:</strong> Rewrite the aspect to fail-closed. Introduce a <code>@TenantScoped(pathVar = "...")</code> annotation. Add ArchUnit/Checkstyle rule.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">2</span> V2 controllers omit @RbacRequired / @HasPermission</h4>
+                        <p><strong>Evidence:</strong> <code>PermissionV2Controller.java</code>, <code>RolePermissionV2Controller.java</code>, <code>ModuleV1Controller.java</code>, <code>ModuleConfigsV1Controller.java</code></p>
+                        <p><strong>Impact:</strong> Any authenticated principal can hit permission CRUD, run <code>/permissions/sync</code> to rewrite the service catalog, grant any permission to any role in any org.</p>
+                        <p><strong>Fix:</strong> Class-level <code>@HasPermission</code> by default on every <code>@RestController</code>. CI check that rejects unannotated controllers.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">3</span> Mass-assignment on every update DTO</h4>
+                        <p><strong>Evidence:</strong> <code>OrganizationUpdateRequest</code> exposes <code>status</code> + <code>parentOrganizationId</code>; <code>OrganizationUserUpdateRequest</code> exposes <code>organizationRole</code> (incl. <code>SUPER_ADMIN</code>)</p>
+                        <p><strong>Impact:</strong> Self-promotion to super-admin, org-reparenting, lockout of privileged accounts.</p>
+                        <p><strong>Fix:</strong> Split DTOs per role-scope. Privileged fields on dedicated endpoints gated by dedicated permissions.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">4</span> "Cannot grant more than you have" is nowhere enforced</h4>
+                        <p><strong>Evidence:</strong> <code>RoleUseCaseService.java:148-174</code>, <code>RolePermissionUseCaseServiceV2.java:51-95</code></p>
+                        <p><strong>Impact:</strong> An org-admin can grant any permission that exists in the catalogue to a role they hold, then reload their token and be a super-admin.</p>
+                        <p><strong>Fix:</strong> Every permission-grant path must intersect the requested set with the caller's effective permission set. Add scope metadata on <code>PermissionEntity</code>.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">5</span> Audit logging is missing on every privileged mutation</h4>
+                        <p><strong>Evidence:</strong> <code>AuditLogFactory</code> exposes only a <code>login(...)</code> factory. Zero matches in role, permission, organization services.</p>
+                        <p><strong>Impact:</strong> Forensic blind spot after any privilege-escalation or tenant-breach. PCI 10.2, SOC 2 CC7.3, ISO 27001 A.12.4 compliance gap.</p>
+                        <p><strong>Fix:</strong> Spring <code>@AfterReturning</code> aspect on every <code>*CommandService</code> mutation method.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">6</span> permit-all YAML entries expose the wrong surface</h4>
+                        <p><strong>Evidence:</strong> <code>application-prd.yml:4</code> permits <code>/private/**</code> and <code>/internal/**</code> unauthenticated</p>
+                        <p><strong>Impact:</strong> <code>GET /private/api/v1/profile/{userId}</code> returns full PII unauthenticated on prd. DoS via OpenSearch re-indexing triggers.</p>
+                        <p><strong>Fix:</strong> Enumerate routes; require mTLS or client_credentials JWT on <code>/private</code>. Never permit <code>/api/v1/**</code>.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">7</span> Tenant identity taken from client-controlled header/body</h4>
+                        <p><strong>Evidence:</strong> <code>ModuleV1Controller.java:45-62</code> uses <code>X-Organization-Id</code> header</p>
+                        <p><strong>Fix:</strong> Tenant identity must come from <code>IdUtils.getRequiredOrgId()</code>. Header/body org identifiers allowed only as filters.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">8</span> Starter-delegated security with zero visibility</h4>
+                        <p><strong>Evidence:</strong> No <code>SecurityFilterChain</code>, <code>CorsConfigurationSource</code>, <code>HttpSecurity</code> in this repo. All in <code>microservice-spring-boot-starter:2.0.12-RELEASE</code>.</p>
+                        <p><strong>Fix:</strong> Audit the starter separately. Add a local <code>SecurityConfig</code> that denies <code>/api/**</code> by default as defense-in-depth.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">9</span> gt-app issuer is a universal bypass</h4>
+                        <p><strong>Evidence:</strong> <code>OrgCodeValidationAspect.java:35-36</code> - <code>if ("gt-app".equals(issuer)) return;</code></p>
+                        <p><strong>Impact:</strong> Any JWT bearing <code>iss=gt-app</code> bypasses every tenant check.</p>
+                        <p><strong>Fix:</strong> Replace with scope/audience claim check. Log every invocation of the bypass path.</p>
+                    </div>
+
+                    <div class="theme-card">
+                        <h4><span class="theme-number">10</span> Authentication bypass via /api/v1/app/login-anonymous</h4>
+                        <p><strong>Evidence:</strong> <code>AppV1Controller.java:96</code> + <code>AuthUseCaseService.java:212-238</code> - issues 1-year JWT to any caller supplying a valid email, no credential.</p>
+                        <p><strong>Impact:</strong> Account takeover for any user whose email is known.</p>
+                        <p><strong>Fix:</strong> Delete the endpoint. If business-justified, gate behind OTP / magic-link.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Most Dangerous Findings -->
+            <section id="dangerous-findings" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>Most Dangerous Individual Findings</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content">
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Title</th>
+                                    <th>Severity</th>
+                                    <th>Evidence</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>A</td>
+                                    <td><code>/private/**</code> permit-all exposes PII + triggers OpenSearch DoS unauthenticated on prd</td>
+                                    <td><span class="severity-badge critical">Critical</span></td>
+                                    <td><code>PrivateServiceV1Controller.java:41,53,64,74</code></td>
+                                </tr>
+                                <tr>
+                                    <td>B</td>
+                                    <td>Hardcoded fallback OAuth <code>clientId c3a7b1e4-...</code> (committed)</td>
+                                    <td><span class="severity-badge high">High</span></td>
+                                    <td><code>OAuthV1Controller.java:95</code></td>
+                                </tr>
+                                <tr>
+                                    <td>C</td>
+                                    <td>Base64-decoded caller-controlled <code>redirectUri</code> - open-redirect / SSRF</td>
+                                    <td><span class="severity-badge high">High</span></td>
+                                    <td><code>PortalV1Controller.java:39-47</code></td>
+                                </tr>
+                                <tr>
+                                    <td>D</td>
+                                    <td><code>app.mock.enabled: true</code> in baseline, not overridden on prd</td>
+                                    <td><span class="severity-badge high">High</span></td>
+                                    <td><code>application.yml:9-14</code></td>
+                                </tr>
+                                <tr>
+                                    <td>E</td>
+                                    <td><code>AuthenCacheService.java:165</code> - <code>Duration.ofHours(3600)</code> = 150 days TTL bug</td>
+                                    <td><span class="severity-badge medium">Medium</span></td>
+                                    <td><code>AuthenCacheService.java:165</code></td>
+                                </tr>
+                                <tr>
+                                    <td>F</td>
+                                    <td>6-char password minimum; no lockout; no MFA</td>
+                                    <td><span class="severity-badge high">High</span></td>
+                                    <td><code>ValidateInfoLogin.java:11</code></td>
+                                </tr>
+                                <tr>
+                                    <td>G</td>
+                                    <td>Hard-delete of <code>OrganizationProfile</code> with PII, no soft-delete, no audit</td>
+                                    <td><span class="severity-badge high">High</span></td>
+                                    <td><code>OrganizationProfileCommandService.java:24-27</code></td>
+                                </tr>
+                                <tr>
+                                    <td>H</td>
+                                    <td><code>/permissions/sync</code> ignores checksum, idempotencyKey, dryrun</td>
+                                    <td><span class="severity-badge high">High</span></td>
+                                    <td><code>PermissionUseCaseService.java:141-383</code></td>
+                                </tr>
+                                <tr>
+                                    <td>I</td>
+                                    <td>File upload trusts client <code>Content-Type</code>; <code>image/*</code> admits SVG - stored XSS</td>
+                                    <td><span class="severity-badge medium">Medium</span></td>
+                                    <td><code>UploadController.java:55-60</code></td>
+                                </tr>
+                                <tr>
+                                    <td>J</td>
+                                    <td>Global uniqueness on <code>roles.name</code>/<code>roles.code</code> - cross-tenant enumeration</td>
+                                    <td><span class="severity-badge medium">Medium</span></td>
+                                    <td><code>RoleEntity.java:23,26</code></td>
+                                </tr>
+                                <tr>
+                                    <td>K</td>
+                                    <td>Error messages echo identifiers - enumeration risk</td>
+                                    <td><span class="severity-badge medium">Medium</span></td>
+                                    <td><code>OrganizationUseCaseService.java:43</code></td>
+                                </tr>
+                                <tr>
+                                    <td>L</td>
+                                    <td>OAuth request/response bodies logged with <code>client_secret</code>, <code>code</code></td>
+                                    <td><span class="severity-badge medium">Medium</span></td>
+                                    <td><code>VIDRepository.java:51-53</code></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Remediation Roadmap -->
+            <section id="roadmap" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>Prioritized Remediation Roadmap</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content">
+                    <div class="sprint-label">Sprint 1 - STOP-SHIP Fixes (Block Prod Promotion)</div>
+
+                    <div class="roadmap-item">
+                        <div class="number">1</div>
+                        <div class="content">
+                            <div class="title">Delete or gate /api/v1/app/login-anonymous</div>
+                            <div class="desc">Auth bypass - this is the most critical fix.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">2</div>
+                        <div class="content">
+                            <div class="title">Narrow /private/** on prd</div>
+                            <div class="desc">Require mTLS / client_credentials JWT. Remove /private/api/v1/profile/{userId} from permit-all.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">3</div>
+                        <div class="content">
+                            <div class="title">Rewrite OrgCodeValidationAspect to fail-closed</div>
+                            <div class="desc">Introduce explicit tenant-source annotations; update every {orgId}/{roleId}/{userId}/{staffId} endpoint.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">4</div>
+                        <div class="content">
+                            <div class="title">Add @HasPermission class-level on V2 controllers</div>
+                            <div class="desc">PermissionV2Controller, RolePermissionV2Controller, ModuleV1Controller, ModuleConfigsV1Controller.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">5</div>
+                        <div class="content">
+                            <div class="title">Gate POST /organizations/initial + POST /permissions/sync</div>
+                            <div class="desc">Behind an explicit platform-admin permission.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">6</div>
+                        <div class="content">
+                            <div class="title">Remove hardcoded fallback clientId</div>
+                            <div class="desc">Remove c3a7b1e4-...; rotate that client's secret.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">7</div>
+                        <div class="content">
+                            <div class="title">Allowlist redirectUri</div>
+                            <div class="desc">Against per-client registered URIs.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">8</div>
+                        <div class="content">
+                            <div class="title">Set app.mock.enabled: false</div>
+                            <div class="desc">In every non-local profile; exclude mock/** from prd JAR.</div>
+                        </div>
+                    </div>
+
+                    <div class="sprint-label" style="margin-top: 2rem;">Sprint 2 - Privilege-Escalation Closure</div>
+
+                    <div class="roadmap-item">
+                        <div class="number">9</div>
+                        <div class="content">
+                            <div class="title">Split update DTOs everywhere</div>
+                            <div class="desc">Profile fields vs privileged fields vs role-admin fields.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">10</div>
+                        <div class="content">
+                            <div class="title">Enforce "cannot grant more than you have"</div>
+                            <div class="desc">On every permission-grant path.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">11</div>
+                        <div class="content">
+                            <div class="title">Add scope metadata on PermissionEntity</div>
+                            <div class="desc">SYSTEM/ORG/RESOURCE. Block SYSTEM-scope grants from non-platform callers.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">12</div>
+                        <div class="content">
+                            <div class="title">Remove gt-app issuer bypass</div>
+                            <div class="desc">In OrgCodeValidationAspect; replace with scope claim.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">13</div>
+                        <div class="content">
+                            <div class="title">Audit logging aspect</div>
+                            <div class="desc">Over every *CommandService mutation and every role-permission change.</div>
+                        </div>
+                    </div>
+
+                    <div class="sprint-label" style="margin-top: 2rem;">Sprint 3 - Hardening</div>
+
+                    <div class="roadmap-item">
+                        <div class="number">14</div>
+                        <div class="content">
+                            <div class="title">Raise password minimum to 12</div>
+                            <div class="desc">+ HIBP breach check; add account lockout; audit failed logins.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">15</div>
+                        <div class="content">
+                            <div class="title">Narrow beta/stg permit-all</div>
+                            <div class="desc">Mirror prd (drop /api/v1/**, /open/**).</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">16</div>
+                        <div class="content">
+                            <div class="title">Soft-delete + audit</div>
+                            <div class="desc">For organization profile and organization user.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">17</div>
+                        <div class="content">
+                            <div class="title">Rate-limit + pagination cap + DTO size-cap</div>
+                            <div class="desc">Across all list/bulk endpoints.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">18</div>
+                        <div class="content">
+                            <div class="title">Fix AuthenCacheService.java:165</div>
+                            <div class="desc">Duration.ofHours(3600) -> Duration.ofSeconds(3600).</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">19</div>
+                        <div class="content">
+                            <div class="title">File-upload magic-byte validation</div>
+                            <div class="desc">Tika; block SVG; set Content-Type server-side.</div>
+                        </div>
+                    </div>
+
+                    <div class="roadmap-item">
+                        <div class="number">20</div>
+                        <div class="content">
+                            <div class="title">Redact secrets from Feign error logs</div>
+                            <div class="desc">VIDRepository, VClubRepository; mask phone in MemberUseCaseService.</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Endpoint Verdicts -->
+            <section id="endpoints" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>Endpoint Verdict Summary</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content">
+                    <p style="margin-bottom: 1rem;"><strong>Counts:</strong> 17 FAIL, 9 CONDITIONAL, 6 OK</p>
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Endpoint</th>
+                                    <th>Verdict</th>
+                                    <th>Issue</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>12</td>
+                                    <td>POST /organizations/initial</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>C-03 - no admin gate</td>
+                                </tr>
+                                <tr>
+                                    <td>13</td>
+                                    <td>GET /organizations/{orgId}</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>BOLA C-01</td>
+                                </tr>
+                                <tr>
+                                    <td>14</td>
+                                    <td>PATCH /organizations/{orgId}</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>BOLA + mass-assignment C-01, C-02</td>
+                                </tr>
+                                <tr>
+                                    <td>15</td>
+                                    <td>GET /organizations</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>pagination cap unverified</td>
+                                </tr>
+                                <tr>
+                                    <td>16</td>
+                                    <td>POST /organizations/{orgCode}/users</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>F-04 enumeration, rate-limit</td>
+                                </tr>
+                                <tr>
+                                    <td>17</td>
+                                    <td>GET /organizations/{orgCode}/users</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>pagination cap</td>
+                                </tr>
+                                <tr>
+                                    <td>18</td>
+                                    <td>GET /organizations/{orgCode}/users/{userId}</td>
+                                    <td><span class="endpoint-verdict ok">OK</span></td>
+                                    <td>verified org-scoped</td>
+                                </tr>
+                                <tr>
+                                    <td>19</td>
+                                    <td>PATCH /organizations/{orgCode}/users/{userId}</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>priv-esc via role, F-02/F-03</td>
+                                </tr>
+                                <tr>
+                                    <td>20</td>
+                                    <td>DELETE /organizations/{orgCode}/users/{userId}</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>hard-delete, no audit</td>
+                                </tr>
+                                <tr>
+                                    <td>21</td>
+                                    <td>GET /organizations/users</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant leak F-01</td>
+                                </tr>
+                                <tr>
+                                    <td>22</td>
+                                    <td>GET /organizations/users/not-belong</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant leak F-01</td>
+                                </tr>
+                                <tr>
+                                    <td>23</td>
+                                    <td>GET /permissions (V2)</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>no authZ</td>
+                                </tr>
+                                <tr>
+                                    <td>24</td>
+                                    <td>POST /permissions (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>no authZ</td>
+                                </tr>
+                                <tr>
+                                    <td>25</td>
+                                    <td>GET /permissions/{code} (V2)</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>-</td>
+                                </tr>
+                                <tr>
+                                    <td>26</td>
+                                    <td>PATCH /permissions/{code} (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>no authZ + mass-assignment status</td>
+                                </tr>
+                                <tr>
+                                    <td>27</td>
+                                    <td>DELETE /permissions/{code} (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>no authZ</td>
+                                </tr>
+                                <tr>
+                                    <td>28</td>
+                                    <td>GET /permissions/me (V2)</td>
+                                    <td><span class="endpoint-verdict ok">OK</span></td>
+                                    <td>-</td>
+                                </tr>
+                                <tr>
+                                    <td>29</td>
+                                    <td>GET /permissions/matrix/{roleId} (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant read F-03</td>
+                                </tr>
+                                <tr>
+                                    <td>30</td>
+                                    <td>POST /permissions/sync (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>no authZ + no integrity + no idempotency</td>
+                                </tr>
+                                <tr>
+                                    <td>31</td>
+                                    <td>GET /roles/{roleId}/permissions (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant read F-03</td>
+                                </tr>
+                                <tr>
+                                    <td>32</td>
+                                    <td>PUT /roles/{roleId}/permissions (V2)</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant write F-02</td>
+                                </tr>
+                                <tr>
+                                    <td>33</td>
+                                    <td>POST /organizations/{orgId}/profile</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>BOLA C-01 + parentOrgId mass-assignment H-01</td>
+                                </tr>
+                                <tr>
+                                    <td>34</td>
+                                    <td>GET /organizations/{orgId}/profile</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant PII H-04</td>
+                                </tr>
+                                <tr>
+                                    <td>35</td>
+                                    <td>PATCH /organizations/{orgId}/profile</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>BOLA + no @Valid</td>
+                                </tr>
+                                <tr>
+                                    <td>36</td>
+                                    <td>DELETE /organizations/{orgId}/profile</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>BOLA + hard-delete H-03</td>
+                                </tr>
+                                <tr>
+                                    <td>37</td>
+                                    <td>GET /organizations/{orgCode}/roles</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>no method-level authZ</td>
+                                </tr>
+                                <tr>
+                                    <td>38</td>
+                                    <td>POST /organizations/{orgCode}/roles</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>code weak validation + global unique</td>
+                                </tr>
+                                <tr>
+                                    <td>39</td>
+                                    <td>GET /organizations/{orgCode}/roles/{roleId}</td>
+                                    <td><span class="endpoint-verdict ok">OK</span></td>
+                                    <td>verified org-scoped</td>
+                                </tr>
+                                <tr>
+                                    <td>40</td>
+                                    <td>PUT /organizations/{orgCode}/roles/{roleId}</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>no method-level authZ</td>
+                                </tr>
+                                <tr>
+                                    <td>41</td>
+                                    <td>DELETE /organizations/{orgCode}/roles/{roleId}</td>
+                                    <td><span class="endpoint-verdict conditional">CONDITIONAL</span></td>
+                                    <td>no audit</td>
+                                </tr>
+                                <tr>
+                                    <td>42</td>
+                                    <td>PATCH /organizations/{orgCode}/roles/{roleId}/permissions</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>cross-tenant grant FIND-01 + priv-esc FIND-02</td>
+                                </tr>
+                                <tr>
+                                    <td>43</td>
+                                    <td>GET /api/v1/modules/mapping</td>
+                                    <td><span class="endpoint-verdict fail">FAIL</span></td>
+                                    <td>header-driven IDOR F-1 + no authZ F-2</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Detailed Reports -->
+            <section id="report-01" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>01 - Organization & Profile Endpoints</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <p><strong>Scope:</strong> <code>/api/v1/organizations/**</code> and <code>/api/v1/organizations/{orgId}/profile</code></p>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">C-01: BOLA / IDOR - cross-tenant read & modification</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Affected Endpoints</h4>
+                            <ul>
+                                <li>GET /api/v1/organizations/{orgId}</li>
+                                <li>PATCH /api/v1/organizations/{orgId}</li>
+                                <li>POST/GET/PATCH/DELETE /api/v1/organizations/{orgId}/profile</li>
+                            </ul>
+                            <h4>Evidence</h4>
+                            <p>Controller accepts any path <code>orgId</code>, only validates UUID shape. Service does a blind <code>findById</code> with no comparison to caller's JWT <code>orgId</code>.</p>
+                            <p>The existing tenant-check aspect applies <strong>only when the path variable is named <code>orgCode</code></strong>:</p>
+                            <pre><code>// OrgCodeValidationAspect.java:42
+if (pathVars == null || !pathVars.containsKey("orgCode")) return;</code></pre>
+                            <h4>Impact</h4>
+                            <p>Tenant data exfiltration via GET. Arbitrary modification via PATCH (deactivate, re-parent). Arbitrary deletion of any tenant's profile.</p>
+                            <h4>Fix</h4>
+                            <pre><code>UUID callerOrgId = IdUtils.getRequiredOrgId();
+if (!callerOrgId.equals(orgId) && !isParentOf(callerOrgId, orgId)) {
+    throw new ForbiddenException("Cross-tenant access denied");
+}</code></pre>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">C-02: Mass-assignment - client can set status & parent org</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code>// OrganizationUpdateRequest.java:8-14
+public record OrganizationUpdateRequest(
+    String name,
+    OrganizationType organizationType,
+    OrganizationStatus organizationStatus,
+    UUID parentOrganizationId
+) {}</code></pre>
+                            <h4>Impact</h4>
+                            <p>Attacker re-parents tenant B under tenant A. Self-DoS by flipping own status to INACTIVE/DELETED.</p>
+                            <h4>Fix</h4>
+                            <p>Split DTOs: self-service DTO (name only) and platform-admin DTO (status, parentOrganizationId).</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">C-03: POST /organizations/initial has no admin gating</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Impact</h4>
+                            <p>Unauthorized tenant provisioning. Data pollution and quota abuse. Combined with C-02 and C-01, attacker can create a tenant then re-parent existing tenants under it.</p>
+                            <h4>Fix</h4>
+                            <p>Move to platform-admin-only controller guarded by specific permission (e.g. <code>@RequirePermission("platform.org.create")</code>).</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="report-02" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>02 - Organization Users Endpoints</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <p><strong>Scope:</strong> <code>/api/v1/organizations/{orgCode}/users</code> endpoints (16-22)</p>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">F-01: Cross-tenant data leak - endpoints 21 & 22 bypass tenant scoping</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>OrgCodeValidationAspect.java:42</code> - aspect short-circuits when no <code>{orgCode}</code> path variable. Endpoints 21/22 have no path variable.</p>
+                            <h4>Impact</h4>
+                            <p>Any authenticated user can call <code>GET /organizations/users</code> and retrieve userId, fullName, email, phoneNumber of staff across <strong>every tenant</strong>. Multi-tenant breach; large-scale PII exposure.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">F-02: Privilege escalation via PATCH - caller can promote to SUPER_ADMIN</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p>Update DTO binds <code>organizationRole</code> (unrestricted OrgRole enum including SUPER_ADMIN), <code>status</code>, and <code>roleIds</code>.</p>
+                            <h4>Impact</h4>
+                            <p>Self-promotion to SUPER_ADMIN. Via <code>roleIds</code>, silently stack high-privilege roles.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge high">High</span>
+                            <span class="finding-title">F-05: gt-app issuer blanket bypass of tenant check</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code>// OrgCodeValidationAspect.java:35-36
+if ("gt-app".equals(issuer)) return;</code></pre>
+                            <h4>Impact</h4>
+                            <p>Any JWT issued by <code>gt-app</code> skips the entire orgCode to token.orgId comparison.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="report-03" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>03 - Permissions + Role-Permission Bindings</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <p><strong>Scope:</strong> V2 permissions CRUD, /me, matrix, sync, role-permission bindings (endpoints 23-32)</p>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">F-01: V2 permission CRUD + sync gated by NO role/permission check</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>PermissionV2Controller</code> carries <strong>no</strong> <code>@HasPermission</code>, <code>@PreAuthorize</code>, <code>@Secured</code>, or any authZ annotation on any handler.</p>
+                            <p>Endpoint 30 (<code>/permissions/sync</code>) is the worst: bulk-inserts/updates/soft-deletes modules and permissions by serviceCode AND invalidates every affected role's JWT claims.</p>
+                            <h4>Impact</h4>
+                            <p>Any authenticated caller can create/modify/delete system-wide permission definitions. Combined with F-02, grants arbitrary permissions to any role = full privilege escalation.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">F-02: PUT /roles/{roleId}/permissions - cross-tenant privilege grant</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p>Handler has no <code>@HasPermission</code>. <code>updatePermissionByRoleId</code> loads the role by id and rewrites its permission set without consulting the caller's organization.</p>
+                            <h4>Impact</h4>
+                            <p>A user in org A who discovers a role UUID in org B can call PUT and become a full admin of org B. Full cross-tenant privilege escalation.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge high">High</span>
+                            <span class="finding-title">F-04: Missing audit logging on all permission mutations</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>AuditLogUseCase.log(...)</code> is called only from auth flows. Grep confirms zero call sites in any permission / role-permission service.</p>
+                            <h4>Impact</h4>
+                            <p>Forensic blind spot after a privilege-escalation incident. PCI 10.2, SOC 2 CC7.3, ISO 27001 A.12.4 compliance gap.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="report-04" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>04 - Organization Roles Endpoints</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <p><strong>Scope:</strong> <code>/api/v1/organizations/{orgCode}/roles</code> (endpoints 37-42)</p>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">FIND-01: BOLA / Cross-tenant permission write on endpoint 42</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>updatePermissionsByOrgCode(orgCode, roleId, assign, permissionCodes)</code> only validates org exists but never verifies that the <code>roleId</code> belongs to the organization identified by <code>orgCode</code>.</p>
+                            <h4>Attack</h4>
+                            <ol>
+                                <li>Attacker is org admin of ORG_A (JWT orgId = ORG_A)</li>
+                                <li>They enumerate/guess a roleId belonging to ORG_B</li>
+                                <li>They call PATCH /api/v1/organizations/ORG_A/roles/&lt;ORG_B_roleId&gt;/permissions</li>
+                                <li>The aspect passes (URL ORG_A matches JWT). The service writes into rolepermissions against ORG_B's role.</li>
+                            </ol>
+                            <h4>Impact</h4>
+                            <p>Full cross-tenant compromise of authorization - any org admin can rewrite permissions of any role in any other org.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">FIND-02: Privilege escalation - no "cannot grant more than you have" check</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>assignPermissions</code> accepts any set of permission codes and writes them unconditionally. No subset check vs the caller's own effective permissions.</p>
+                            <h4>Impact</h4>
+                            <p>An org admin can grant a role (including one they hold) any permission that exists in the catalogue. If the catalogue contains any super-admin permission, they can silently self-escalate.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="report-05" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>05 - Modules Endpoint</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <p><strong>Scope:</strong> <code>GET /api/v1/modules/mapping</code> + adjacent ModuleConfigs</p>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">F-1: Cross-tenant IDOR - target org from client-controlled header</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>getModulesByOrgId(HttpServletRequest)</code> pulls the org id directly off <code>X-Organization-Id</code> header and passes it to the repository. No comparison between the header and the <code>orgId</code> claim on the caller's JWT.</p>
+                            <h4>Impact</h4>
+                            <p>An authenticated caller from org A enumerates the modules catalogue of any org B by sending <code>X-Organization-Id: &lt;B-uuid&gt;</code>.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge high">High</span>
+                            <span class="finding-title">A-2: Cross-tenant config pollution on ModuleConfigs</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <p><code>ModuleConfigs</code> has no <code>orgId</code> field. The upsert keys a single global record per <code>moduleId</code>.</p>
+                            <h4>Impact</h4>
+                            <p>Any authenticated caller can overwrite global module settings, affecting every tenant consuming that module. Super-user capability at regular auth tier.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="report-06" class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <h2>06 - Full Application Posture</h2>
+                    <span class="toggle">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <p><strong>Scope:</strong> Cross-cutting: secrets, auth/JWT/session, Spring Security, dependencies, injection, SSRF/upload, logging, infra</p>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">/api/v1/app/login-anonymous mints JWT for any user by email alone</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code>public JwtToken loginAtAnonymousUser(String email) {
+    User anony = userQueryService.findByEmail(email);
+    ...
+    long oneYear = 31536000L;
+    long exp = (System.currentTimeMillis() / 1000) + oneYear;
+    claims.put("exp", exp);
+    return jwtUseCase.createToken(ActorType.USER_ACTOR, anony.id().toString(), claims);
+}</code></pre>
+                            <h4>Impact</h4>
+                            <p>Accepts just <code>{ "email": "..." }</code>, does no credential check, no OTP, no CAPTCHA, no rate-limit. Full account takeover for any user whose email an attacker knows.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge critical">Critical</span>
+                            <span class="finding-title">permit-all list extremely broad in prd</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code># application-prd.yml
+permit-all: >
+  /api/v1/app/exchange, /api/v1/app/refresh, /api/v1/portal/exchange,
+  /private/**, /internal/**, /api/v1/oauth/exchange-authcode</code></pre>
+                            <h4>Impact</h4>
+                            <ul>
+                                <li><code>/private/**</code> - unauthenticated access to GET /private/api/v1/profile/{userId} (full PII by ID)</li>
+                                <li>POST /private/api/v1/profile/os-sync/* - trigger full OpenSearch re-index (DoS)</li>
+                                <li><code>/internal/**</code> - any future internal route is unauthenticated by default</li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge high">High</span>
+                            <span class="finding-title">app.mock.enabled: true in baseline, not overridden on prd</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code># application.yml:9-14
+app:
+  mock:
+    enabled: true
+    endpoints:
+      - "/open/identity/v1/profile"
+      - "/oauth2/token/exchange"
+      - "/oauth2/token/refresh"</code></pre>
+                            <h4>Impact</h4>
+                            <p>Mock fixtures ship with fake tokens and user IDs. May serve mock responses in production if no override exists.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge high">High</span>
+                            <span class="finding-title">Open-redirect / SSRF via caller-supplied redirectUri</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code>String redirectUri = request.redirectUri();
+if (redirectUri != null && !redirectUri.isBlank()) {
+    redirectUri = new String(Base64.getDecoder().decode(redirectUri));
+}</code></pre>
+                            <h4>Impact</h4>
+                            <p>Open-redirect if IdP echoes URI; SSRF if IdP fetches/logs URI server-side (incl. 169.254.169.254 metadata); auth-code theft via attacker-hosted redirect.</p>
+                        </div>
+                    </div>
+
+                    <div class="finding">
+                        <div class="finding-header" onclick="toggleFinding(this)">
+                            <span class="severity-badge high">High</span>
+                            <span class="finding-title">Weak password policy: 6-char minimum; no lockout; no MFA</span>
+                        </div>
+                        <div class="finding-body">
+                            <h4>Evidence</h4>
+                            <pre><code>// ValidateInfoLogin.java:11
+private static final int MIN_PASSWORD_LENGTH = 6;</code></pre>
+                            <h4>Fix</h4>
+                            <p>Raise to 12; add breach-list check against HIBP top 100k. Add account lockout. Roadmap MFA for SUPER_ADMIN.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <footer style="text-align: center; padding: 2rem; color: var(--text-secondary); font-size: 0.85rem;">
+                <p>Security Scan Report generated 2026-04-17</p>
+                <p>Method: 6 parallel security-scanner agents, evidence-based code review</p>
+            </footer>
+        </main>
+    </div>
+
+    <script>
+        function toggleSection(header) {
+            const content = header.nextElementSibling;
+            header.classList.toggle('collapsed');
+            content.classList.toggle('collapsed');
+        }
+
+        function toggleFinding(header) {
+            const body = header.nextElementSibling;
+            body.classList.toggle('expanded');
+        }
+
+        // Active link tracking
+        document.querySelectorAll('.sidebar a').forEach(link => {
+            link.addEventListener('click', function() {
+                document.querySelectorAll('.sidebar a').forEach(l => l.classList.remove('active'));
+                this.classList.add('active');
+            });
+        });
+
+        // Scroll spy
+        window.addEventListener('scroll', function() {
+            const sections = document.querySelectorAll('section[id]');
+            let current = '';
+
+            sections.forEach(section => {
+                const sectionTop = section.offsetTop;
+                if (scrollY >= sectionTop - 200) {
+                    current = section.getAttribute('id');
+                }
+            });
+
+            document.querySelectorAll('.sidebar a').forEach(link => {
+                link.classList.remove('active');
+                if (link.getAttribute('href') === '#' + current) {
+                    link.classList.add('active');
+                }
+            });
+        });
+    </script>
+</body>
+</html>
