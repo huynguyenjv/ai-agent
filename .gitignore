@@ -68,6 +68,16 @@ Thumbs.db
 
 # Environment
 .env
+<<<<<<< HEAD
+=======
+.env.prod
+.env.*
+!.env.example
+
+# Deploy secrets
+deploy/certs/
+logs/
+>>>>>>> feature/new-architecture
 
 # Model files
 models/
@@ -79,3 +89,7 @@ benchmark/results/
 qdrant_data/
 
 .agent/
+<<<<<<< HEAD
+=======
+.env
+>>>>>>> feature/new-architecture

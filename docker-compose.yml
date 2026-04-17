@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 version: '3.8'
 
 # =============================================================================
@@ -13,10 +14,25 @@ version: '3.8'
 #
 #   Chỉ Qdrant (không cần Redis):
 #     docker-compose up -d qdrant
+=======
+# =============================================================================
+# AI Coding Agent — production docker-compose
+# =============================================================================
+# vLLM chạy ở container/image riêng (không trong compose này).
+# Trong `.env`, set VLLM_BASE_URL:
+#   - vLLM trên cùng host (bare-metal):   http://host.docker.internal:8000/v1
+#   - vLLM ở docker network khác:         http://<vllm-container>:8000/v1
+#     (cần join network: thêm `networks: [vllm_net]` + external block bên dưới)
+#
+# First run (HF cache chưa có):
+#   HF_HUB_OFFLINE=0 docker compose up -d
+#   # chờ embedder tải all-MiniLM-L6-v2 xong (1 lần), rồi set HF_HUB_OFFLINE=1
+>>>>>>> feature/new-architecture
 # =============================================================================
 
 services:
 
+<<<<<<< HEAD
   # ---------------------------------------------------------------------------
   # AI Agent Application
   # ---------------------------------------------------------------------------
@@ -163,10 +179,71 @@ services:
       - redis
     profiles:
       - tools  # Only start with: docker-compose --profile tools up -d
+=======
+  ai-agent:
+    build: .
+    container_name: ai-agent
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    extra_hosts:
+      # Cho phép container gọi vLLM chạy trên host (Linux docker 20.10+)
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - hf_cache:/home/agent/.cache/huggingface
+      # Mount CA bundle cho GitLab self-signed (nếu có). Set GITLAB_CA_BUNDLE=/certs/ca.crt trong .env
+      - ./deploy/certs:/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT:-8080}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-agent-qdrant
+    restart: unless-stopped
+    ports:
+      # Bind localhost only — ai-agent truy cập qua docker network service name
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # Qdrant image không có curl — dùng bash /dev/tcp để TCP probe
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+>>>>>>> feature/new-architecture
 
 volumes:
   qdrant_data:
     driver: local
+<<<<<<< HEAD
   redis_data:
     driver: local
 
+=======
+  hf_cache:
+    driver: local
+>>>>>>> feature/new-architecture
