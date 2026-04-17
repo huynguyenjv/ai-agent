@@ -71,19 +71,36 @@ async def test_generate_captures_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_generate_forwards_merged_tools_to_vllm():
+async def test_generate_forwards_client_tools_to_vllm():
     d1 = MagicMock(content="ok", tool_calls=None)
     stream = FakeStream([FakeChunk(d1, finish_reason="stop")])
     vllm = MagicMock()
     vllm.chat.completions.create = AsyncMock(return_value=stream)
 
+    client_tools = [
+        {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "search_symbol", "parameters": {"type": "object", "properties": {}}}},
+    ]
     state = {
         "messages": [HumanMessage(content="hi")],
-        "client_tools": [{"type": "function", "function": {"name": "foo", "parameters": {"type": "object", "properties": {}}}}],
+        "client_tools": client_tools,
     }
     await generate(state, vllm_client=vllm, model="m", sse_callback=None)
 
     call_kwargs = vllm.chat.completions.create.call_args.kwargs
-    tool_names = {t["function"]["name"] for t in call_kwargs["tools"]}
-    assert tool_names == {"read_file", "grep_code", "foo"}
+    assert call_kwargs["tools"] == client_tools
     assert call_kwargs["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_generate_no_tools_omits_tools_key():
+    d1 = MagicMock(content="ok", tool_calls=None)
+    stream = FakeStream([FakeChunk(d1, finish_reason="stop")])
+    vllm = MagicMock()
+    vllm.chat.completions.create = AsyncMock(return_value=stream)
+
+    state = {"messages": [HumanMessage(content="hi")], "client_tools": []}
+    await generate(state, vllm_client=vllm, model="m", sse_callback=None)
+
+    call_kwargs = vllm.chat.completions.create.call_args.kwargs
+    assert "tools" not in call_kwargs

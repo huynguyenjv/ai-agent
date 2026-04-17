@@ -12,7 +12,6 @@ import logging
 from openai import AsyncOpenAI
 
 from server.agent.state import AgentState
-from server.tools.registry import merge_tools
 
 logger = logging.getLogger("server.agent.generate")
 
@@ -76,14 +75,14 @@ async def generate(
     model: str,
     sse_callback=None,
 ) -> dict:
-    merged_tools = merge_tools(state.get("client_tools"))
+    client_tools = state.get("client_tools") or []
     messages = _to_openai_messages(state)
 
     kwargs: dict = {
         "model": model,
         "messages": messages,
-        "tools": merged_tools,
         "stream": True,
+        **({"tools": client_tools} if client_tools else {}),
         "max_tokens": 4096,
         "temperature": 0.3,
     }
