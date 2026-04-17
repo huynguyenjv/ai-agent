@@ -97,7 +97,7 @@ def search_symbol(
             try:
                 chunks = plugin.extract_chunks(rel_path, source, ExtractionMode.names_only)
             except Exception as e:
-                logger.debug("Failed to parse %s: %s", rel_path, e)
+                logger.warning("Failed to parse %s: %s", rel_path, e)
                 continue
 
             for chunk in chunks:

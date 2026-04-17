@@ -7,6 +7,7 @@ Timeout: 30 seconds per request.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -81,7 +82,6 @@ class Uploader:
                     logger.warning("Upload attempt %d error: %s", attempt + 1, e)
 
                 if attempt < self._max_retries - 1:
-                    import asyncio
                     await asyncio.sleep(backoff)
                     backoff *= 2
 
