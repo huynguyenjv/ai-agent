@@ -37,6 +37,10 @@ from server.streaming.sse import (
     tool_calls_event,
 )
 
+def _native_tool_calls() -> bool:
+    """True → OpenAI native tool_calls; False → <tool_call> text tags (Continue)."""
+    return os.environ.get("TOOL_CALL_FORMAT", "text").lower() == "native"
+
 logger = logging.getLogger("server.chat")
 
 router = APIRouter()
@@ -212,7 +216,7 @@ async def _stream_response(
     elif isinstance(agent_result, dict):
         tc = agent_result.get("pending_tool_calls") or []
         if tc and not content_streamed:
-            yield tool_calls_event(tc)
+            yield tool_calls_event(tc, native=_native_tool_calls())
         elif not content_streamed:
             draft = agent_result.get("draft", "")
             if draft:

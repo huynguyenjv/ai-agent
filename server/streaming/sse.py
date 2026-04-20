@@ -88,34 +88,45 @@ def done_event() -> str:
     return "data: [DONE]\n\n"
 
 
-def tool_calls_event(tool_calls: list[dict], chunk_id: str = "chatcmpl-agent") -> str:
-    """OpenAI tool_calls delta format for Continue.
+def tool_calls_event(
+    tool_calls: list[dict],
+    chunk_id: str = "chatcmpl-agent",
+    *,
+    native: bool = False,
+) -> str:
+    """Emit tool calls in native OpenAI format or <tool_call> text tags.
 
-    Emits two chunks per OpenAI streaming spec:
-      Chunk 1: delta with tool_calls list, finish_reason null
-      Chunk 2: empty delta, finish_reason "tool_calls"
-
-    Continue accumulates arguments from Chunk 1 before processing Chunk 2.
+    Args:
+        native: True  → OpenAI tool_calls object (for /review/pr, API clients)
+                False → <tool_call> text in content (for Continue IDE)
     """
-    chunk1 = sse_event({
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "choices": [{
-            "index": 0,
-            "delta": {"tool_calls": tool_calls},
-            "finish_reason": None,
-        }],
-    })
-    chunk2 = sse_event({
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "tool_calls",
-        }],
-    })
-    return chunk1 + chunk2
+    if native:
+        chunk1 = sse_event({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": tool_calls},
+                "finish_reason": None,
+            }],
+        })
+        chunk2 = sse_event({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls",
+            }],
+        })
+        return chunk1 + chunk2
+
+    lines: list[str] = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        payload = {"name": fn.get("name", ""), "arguments": json.loads(fn.get("arguments", "{}"))}
+        lines.append(f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>")
+    return _content_chunk("\n".join(lines), chunk_id)
 
 
 def heartbeat_comment() -> str:
