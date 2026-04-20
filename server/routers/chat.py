@@ -37,20 +37,19 @@ from server.streaming.sse import (
     tool_calls_event,
 )
 
-def _native_tool_calls() -> bool:
-    """True → OpenAI native tool_calls; False → <tool_call> text tags (Continue)."""
-    return os.environ.get("TOOL_CALL_FORMAT", "text").lower() == "native"
-
 logger = logging.getLogger("server.chat")
 
 router = APIRouter()
 
 
 class ChatMessage(BaseModel):
+    model_config = {"extra": "allow"}
+
     role: str
-    content: str | None = None
+    content: str | list | None = None
     tool_calls: list[dict] | None = None
     tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -74,6 +73,13 @@ async def chat_completions(
 ) -> StreamingResponse:
     verify_api_key(req, x_api_key, authorization)
 
+    logger.info(
+        "chat request: model=%s tools=%d tool_names=%s",
+        request.model,
+        len(request.tools or []),
+        [t.get("function", {}).get("name") for t in (request.tools or [])],
+    )
+
     return StreamingResponse(
         _stream_response(request, req),
         media_type="text/event-stream",
@@ -84,18 +90,29 @@ async def chat_completions(
     )
 
 
+def _flatten_content(content) -> str:
+    """Normalize content: list[{"type":"text","text":"..."}] → str."""
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return content or ""
+
+
 def _convert_messages(request_messages: list[ChatMessage]):
     out = []
     for msg in request_messages:
+        text = _flatten_content(msg.content)
         if msg.role == "user":
-            out.append(HumanMessage(content=msg.content or ""))
+            out.append(HumanMessage(content=text))
         elif msg.role == "tool":
             out.append(ToolMessage(
-                content=msg.content or "",
+                content=text,
                 tool_call_id=msg.tool_call_id or "",
             ))
         elif msg.role == "assistant":
-            ai = AIMessage(content=msg.content or "")
+            ai = AIMessage(content=text)
             if msg.tool_calls:
                 ai.additional_kwargs["tool_calls"] = msg.tool_calls
             out.append(ai)
@@ -216,7 +233,7 @@ async def _stream_response(
     elif isinstance(agent_result, dict):
         tc = agent_result.get("pending_tool_calls") or []
         if tc and not content_streamed:
-            yield tool_calls_event(tc, native=_native_tool_calls())
+            yield tool_calls_event(tc)
         elif not content_streamed:
             draft = agent_result.get("draft", "")
             if draft:

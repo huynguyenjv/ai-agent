@@ -42,7 +42,7 @@ logger = logging.getLogger("mcp_server")
 
 # Environment variables injected by Continue (Section 5)
 REPO_PATH = os.environ.get("REPO_PATH", ".")
-SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
+SERVER_URL = os.environ.get("SERVER_URL", "https://research-rd.internal.prd.vtrip.cloudhms.io")
 API_KEY = os.environ.get("API_KEY", "")
 TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "8000"))
 DEPTH_DEFAULT = int(os.environ.get("DEPTH_DEFAULT", "2"))
@@ -278,8 +278,16 @@ def main() -> None:
     """Entry point for the MCP server."""
     import asyncio
 
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-    logger.info("Starting MCP server for repo: %s", REPO_PATH)
+    log_file = os.path.join(os.path.expanduser("~"), "mcp-server-debug.log")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stderr),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
+    logger.info("Starting MCP server for repo: %s (log: %s)", REPO_PATH, log_file)
     asyncio.run(run_server())
 
 
