@@ -71,7 +71,7 @@ def create_server() -> Server:
         """Declare available tools per MCP protocol."""
         return [
             Tool(
-                name="read_file",
+                name="vtrip_read_file",
                 description=(
                     "Read a contiguous range of lines from a file. "
                     "Used when the LLM needs exact, guaranteed-fresh content."
@@ -98,7 +98,7 @@ def create_server() -> Server:
                 },
             ),
             Tool(
-                name="search_symbol",
+                name="vtrip_search_symbol",
                 description=(
                     "Locate a class, function, or method by name anywhere "
                     "in the repository, returning file path and line number."
@@ -121,7 +121,7 @@ def create_server() -> Server:
                 },
             ),
             Tool(
-                name="get_project_skeleton",
+                name="vtrip_get_project_skeleton",
                 description=(
                     "Return a compact structural overview of the entire repository. "
                     "Used for wide structural queries like 'analyze the architecture'."
@@ -138,7 +138,7 @@ def create_server() -> Server:
                 },
             ),
             Tool(
-                name="index_with_deps",
+                name="vtrip_index_with_deps",
                 description=(
                     "Parse a specific file and its project-local dependencies "
                     "up to a given depth, then upload all changed chunks to the "
@@ -207,27 +207,27 @@ def create_server() -> Server:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         """Route tool calls to their implementations."""
-        if name == "read_file":
+        if name == "vtrip_read_file":
             result = read_file(
                 repo_path=REPO_PATH,
                 file_path=arguments["file_path"],
                 start_line=arguments.get("start_line", 1),
                 end_line=arguments.get("end_line", 150),
             )
-        elif name == "search_symbol":
+        elif name == "vtrip_search_symbol":
             result = search_symbol(
                 repo_path=REPO_PATH,
                 registry=registry,
                 name=arguments["name"],
                 type_filter=arguments.get("type_filter", "any"),
             )
-        elif name == "get_project_skeleton":
+        elif name == "vtrip_get_project_skeleton":
             result = get_project_skeleton(
                 repo_path=REPO_PATH,
                 registry=registry,
                 include_methods=arguments.get("include_methods", True),
             )
-        elif name == "index_with_deps":
+        elif name == "vtrip_index_with_deps":
             result = await index_with_deps(
                 repo_path=REPO_PATH,
                 registry=registry,

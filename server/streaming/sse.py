@@ -100,13 +100,31 @@ def tool_calls_event(
         native: True  → OpenAI tool_calls object (for /review/pr, API clients)
                 False → <tool_call> text in content (for Continue IDE)
     """
+    if not tool_calls:
+        return ""
+
     if native:
+        # OpenAI format requires index in each tool_call
+        indexed_tool_calls = []
+        for i, tc in enumerate(tool_calls):
+            indexed_tc = {
+                "index": i,
+                "id": tc.get("id", f"call_{i}"),
+                "type": tc.get("type", "function"),
+                "function": tc.get("function", {}),
+            }
+            indexed_tool_calls.append(indexed_tc)
+
         chunk1 = sse_event({
             "id": chunk_id,
             "object": "chat.completion.chunk",
             "choices": [{
                 "index": 0,
-                "delta": {"tool_calls": tool_calls},
+                "delta": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": indexed_tool_calls,
+                },
                 "finish_reason": None,
             }],
         })
@@ -121,12 +139,24 @@ def tool_calls_event(
         })
         return chunk1 + chunk2
 
+    # Cline/Continue XML format: <tool_name><param>value</param></tool_name>
     lines: list[str] = []
     for tc in tool_calls:
         fn = tc.get("function") or {}
-        payload = {"name": fn.get("name", ""), "arguments": json.loads(fn.get("arguments", "{}"))}
-        lines.append(f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>")
-    return _content_chunk("\n".join(lines), chunk_id)
+        tool_name = fn.get("name", "")
+        if not tool_name:
+            continue
+
+        try:
+            args = json.loads(fn.get("arguments", "{}"))
+        except json.JSONDecodeError:
+            args = {}
+
+        # Build XML params
+        params_xml = "\n".join(f"<{k}>{v}</{k}>" for k, v in args.items())
+        lines.append(f"<{tool_name}>\n{params_xml}\n</{tool_name}>")
+
+    return _content_chunk("\n".join(lines), chunk_id) if lines else ""
 
 
 def heartbeat_comment() -> str:

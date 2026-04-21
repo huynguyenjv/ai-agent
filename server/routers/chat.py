@@ -150,6 +150,14 @@ async def _stream_response(
     if active_file:
         logger.info("Detected active_file from message content: %s", active_file)
 
+    # Count tool turns from conversation history
+    # Each pair of (assistant with tool_calls, tool result) = 1 turn
+    tool_turns_used = sum(
+        1 for msg in request.messages
+        if msg.role == "assistant" and msg.tool_calls
+    )
+    logger.info("Detected %d tool turns from conversation history", tool_turns_used)
+
     initial_state = {
         "messages": messages,
         "intent": "",
@@ -167,7 +175,7 @@ async def _stream_response(
         "volatile_rejected": False,
         "pending_tool_calls": [],
         "is_tool_result_turn": False,
-        "tool_turns_used": 0,
+        "tool_turns_used": tool_turns_used,
         "client_tools": request.tools or [],
         "tool_choice": request.tool_choice,
     }
@@ -232,8 +240,9 @@ async def _stream_response(
         yield tool_error_event("agent", str(agent_result))
     elif isinstance(agent_result, dict):
         tc = agent_result.get("pending_tool_calls") or []
-        if tc and not content_streamed:
-            yield tool_calls_event(tc)
+        if tc:
+            # Native OpenAI tool_calls format for Continue with tool-call enabled
+            yield tool_calls_event(tc, native=True)
         elif not content_streamed:
             draft = agent_result.get("draft", "")
             if draft:
