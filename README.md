@@ -138,7 +138,7 @@ Each node wraps a battle-tested existing module:
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat (IDE integration) |
 | `GET`  | `/v1/models` | List available models |
-| `POST` | `/review/pr` | **Code review MR** (GitLab V1) — fetch diff, review OWASP/CWE, auto-post/update MR comment. See [curl examples](docs/code-review-curl-examples.md) |
+| `POST` | `/review/analyze` | **Stateless code review** — accepts diff payload, returns markdown + findings + inline_comments. Caller (e.g. `gitlab-review-runner`) is responsible for fetching the diff and posting comments. See [curl examples](docs/code-review-curl-examples.md) |
 | `POST` | `/review/{run_id}` | Submit human review (LangGraph only) |
 | `GET`  | `/runs/{run_id}` | Poll run status (LangGraph only) |
 | `POST` | `/generate-test` | Native test generation |
@@ -149,11 +149,12 @@ Each node wraps a battle-tested existing module:
 
 ## Code Review Pipeline (GitLab)
 
-- `.gitlab-ci.yml` triggers `POST /review/pr` on MR events.
+- `gitlab-review-runner` (separate service) runs in CI on MR events, fetches the diff via the GitLab API, and POSTs to `/review/analyze`.
+- AI agent is **stateless**: it never talks to GitLab. The runner posts comments back using the markdown + inline_comments returned.
 - Frameworks: **OWASP Top 10 (2021)** + **CWE Top 25 (2024)** + language lint rules.
-- Output: markdown comment on MR with marker `<!-- AI_REVIEW_MARKER:v1 -->`, update in-place on new commits, keeps last 3 review summaries in collapsible `<details>`.
+- Output: markdown comment with marker `<!-- AI_REVIEW_MARKER:v1 -->` for in-place updates; inline discussions tagged `<!-- AI_REVIEW_INLINE:v1 -->`.
 - Prompts in [server/agent/prompts/](server/agent/prompts/) (system + user + output template) — edit markdown files, no code change needed.
-- Config env: see [.env.example](.env.example) (`GITLAB_URL`, `GITLAB_TOKEN`, `GITLAB_CA_BUNDLE`, `REVIEW_TIMEOUT_SECS`, ...).
+- Config env: see [.env.example](.env.example) (`REVIEW_TIMEOUT_SECS`, `REVIEW_LLM_TIMEOUT_SECS`, `AI_REVIEWER_MARKER`, ...).
 - Full docs: [docs/code-review-curl-examples.md](docs/code-review-curl-examples.md).
 
 ## API Examples

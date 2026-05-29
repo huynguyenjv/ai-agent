@@ -11,6 +11,7 @@ Continue IDE compatibility:
 from __future__ import annotations
 
 import json
+from html import escape as xml_escape
 
 
 def sse_event(data: dict) -> str:
@@ -97,8 +98,8 @@ def tool_calls_event(
     """Emit tool calls in native OpenAI format or <tool_call> text tags.
 
     Args:
-        native: True  → OpenAI tool_calls object (for /review/pr, API clients)
-                False → <tool_call> text in content (for Continue IDE)
+        native: True  → OpenAI tool_calls object (for API clients expecting OpenAI spec)
+                False → <tool_call> text in content (for Continue/Cline IDE)
     """
     if not tool_calls:
         return ""
@@ -152,8 +153,8 @@ def tool_calls_event(
         except json.JSONDecodeError:
             args = {}
 
-        # Build XML params
-        params_xml = "\n".join(f"<{k}>{v}</{k}>" for k, v in args.items())
+        # Build XML params with proper escaping
+        params_xml = "\n".join(f"<{k}>{xml_escape(str(v))}</{k}>" for k, v in args.items())
         lines.append(f"<{tool_name}>\n{params_xml}\n</{tool_name}>")
 
     return _content_chunk("\n".join(lines), chunk_id) if lines else ""

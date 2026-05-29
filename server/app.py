@@ -27,6 +27,8 @@ from server.rag.qdrant_client import QdrantService
 from server.routers.chat import router as chat_router
 from server.routers.index import router as index_router
 from server.routers.review import router as review_router
+from server.routers.metrics import router as metrics_router
+from server.routers.feedback import router as feedback_router
 
 logger = logging.getLogger("server")
 
@@ -37,7 +39,7 @@ async def lifespan(app: FastAPI):
 
     # Read env vars here (after dotenv loaded in main.py)
     qdrant_url = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-    vllm_base_url = os.environ.get("VLLM_BASE_URL", "http://localhost:8080/v1")
+    vllm_base_url = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 
     # Initialize Qdrant (non-blocking — will retry on first request if unavailable)
     qdrant = QdrantService(url=qdrant_url)
@@ -121,6 +123,8 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(index_router)
     app.include_router(review_router)
+    app.include_router(metrics_router)
+    app.include_router(feedback_router)
 
     # Health check
     @app.get("/health")

@@ -7,7 +7,9 @@ Gates are evaluated in strict order. First gate that fires determines strategy.
 from __future__ import annotations
 
 import re
+import threading
 
+from server.agent.rules_loader import get_rules_loader
 from server.agent.state import AgentState
 
 # GitLab MR URL: https://gitlab.xxx/group/project/-/merge_requests/123
@@ -16,15 +18,37 @@ _GITLAB_MR_URL = re.compile(
     re.IGNORECASE,
 )
 
-# Gate 1: File mention patterns
-_FILE_PATTERNS = [
-    # Direct filename: XxxService.java, handler.go, main.tf, etc.
-    re.compile(r"\b(\w+\.(?:java|go|py|ts|tsx|js|jsx|cs|tf|hcl))\b", re.IGNORECASE),
-    # @mention syntax: @UserService.java
-    re.compile(r"@(\w+\.(?:java|go|py|ts|tsx|js|jsx|cs|tf|hcl))\b", re.IGNORECASE),
-    # Class name patterns: UserService, OrderController
-    re.compile(r"\b([A-Z][a-zA-Z]+(?:Service|Controller|Repository|Handler|Manager|Factory|Provider|Adapter|Config|Entity|Model|Dto))\b"),
-]
+# Gate 1: file mention regexes are compiled lazily from rules.yaml so they
+# stay in sync with classify_intent's keyword list. Cache invalidates when
+# the underlying rules dict identity changes (RulesLoader replaces it on reload).
+_FILE_PATTERN_CACHE: dict = {"rules_id": None, "patterns": []}
+_FILE_PATTERN_LOCK = threading.Lock()
+
+
+def _get_file_patterns() -> list[re.Pattern]:
+    loader = get_rules_loader()
+    rules = loader.get_rules()
+    rules_id = id(rules)
+
+    with _FILE_PATTERN_LOCK:
+        if _FILE_PATTERN_CACHE["rules_id"] == rules_id and _FILE_PATTERN_CACHE["patterns"]:
+            return _FILE_PATTERN_CACHE["patterns"]
+
+        extensions = loader.get_file_extensions() or [".java", ".py", ".go", ".ts"]
+        suffixes = loader.get_file_suffixes() or ["Service", "Controller", "Repository"]
+
+        ext_alt = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
+        suffix_alt = "|".join(re.escape(s) for s in suffixes)
+
+        patterns = [
+            re.compile(rf"\b(\w+\.(?:{ext_alt}))\b", re.IGNORECASE),
+            re.compile(rf"@(\w+\.(?:{ext_alt}))\b", re.IGNORECASE),
+            re.compile(rf"\b([A-Z][a-zA-Z0-9]+(?:{suffix_alt}))\b"),
+        ]
+
+        _FILE_PATTERN_CACHE["rules_id"] = rules_id
+        _FILE_PATTERN_CACHE["patterns"] = patterns
+        return patterns
 
 # Gate 1: Deictic references
 _DEICTIC_PATTERNS = re.compile(
@@ -32,12 +56,31 @@ _DEICTIC_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Gate 2: Freshness/temporal keywords
-_FRESHNESS_PATTERNS = re.compile(
-    r"(?:vừa\s*thêm|vừa\s*sửa|vừa\s*commit|just\s*added|just\s*changed|"
-    r"hiện\s*tại\s*đang\s*có\s*bug|lỗi\s*đang\s*xảy\s*ra|recent\s*change)",
-    re.IGNORECASE,
-)
+# Gate 2: Freshness/temporal keywords - loaded from rules.yaml
+_FRESHNESS_CACHE: dict = {"rules_id": None, "pattern": None}
+_FRESHNESS_LOCK = threading.Lock()
+
+
+def _get_freshness_pattern() -> re.Pattern:
+    """Get freshness pattern compiled from rules.yaml keywords."""
+    loader = get_rules_loader()
+    rules = loader.get_rules()
+    rules_id = id(rules)
+
+    with _FRESHNESS_LOCK:
+        if _FRESHNESS_CACHE["rules_id"] == rules_id and _FRESHNESS_CACHE["pattern"]:
+            return _FRESHNESS_CACHE["pattern"]
+
+        keywords = loader.get_freshness_keywords()
+        if not keywords:
+            keywords = ["recently", "just", "latest", "current"]
+
+        escaped = [re.escape(kw).replace(r"\ ", r"\s*") for kw in keywords]
+        pattern = re.compile(rf"(?:{'|'.join(escaped)})", re.IGNORECASE)
+
+        _FRESHNESS_CACHE["rules_id"] = rules_id
+        _FRESHNESS_CACHE["pattern"] = pattern
+        return pattern
 
 # Gate 3: Volatile data type keywords
 _VOLATILE_PATTERNS = re.compile(
@@ -95,7 +138,7 @@ def route_context(state: AgentState) -> dict:
     # --- Gate 1: Explicit File Mention ---
     mentioned_files: list[str] = []
 
-    for pattern in _FILE_PATTERNS:
+    for pattern in _get_file_patterns():
         for match in pattern.finditer(text):
             mentioned_files.append(match.group(1))
 
@@ -112,7 +155,7 @@ def route_context(state: AgentState) -> dict:
         }
 
     # --- Gate 2: Freshness Force Signal ---
-    if _FRESHNESS_PATTERNS.search(text):
+    if _get_freshness_pattern().search(text):
         return {
             "mentioned_files": [],
             "force_reindex": True,

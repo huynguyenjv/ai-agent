@@ -20,13 +20,13 @@ async def test_graph_rag_off_code_gen_goes_direct_to_generate(fake_services, mon
         calls.append("generate")
         return {"draft": "ok", "pending_tool_calls": []}
 
-    async def fake_classify(state):
+    async def fake_classify(state, **kw):
         return {"intent": "code_gen", "is_tool_result_turn": False}
 
-    async def fake_route_ctx(state):
+    async def fake_route_ctx(state, **kw):
         return {"volatile_rejected": False, "mentioned_files": []}
 
-    async def fake_post_process(state):
+    async def fake_post_process(state, **kw):
         return {}
 
     monkeypatch.setattr(graph_mod, "generate", fake_generate)
@@ -46,11 +46,11 @@ async def test_graph_tool_result_turn_bypasses_route_context(fake_services, monk
     vllm, qdrant, embedder = fake_services
     seen = []
 
-    async def fake_classify(state):
+    async def fake_classify(state, **kw):
         seen.append("classify")
         return {"intent": "explain", "is_tool_result_turn": True}
 
-    async def fake_route_ctx(state):
+    async def fake_route_ctx(state, **kw):
         seen.append("route_context")
         return {}
 
@@ -58,7 +58,7 @@ async def test_graph_tool_result_turn_bypasses_route_context(fake_services, monk
         seen.append("generate")
         return {"draft": "x", "pending_tool_calls": []}
 
-    async def fake_post_process(state):
+    async def fake_post_process(state, **kw):
         return {}
 
     monkeypatch.setattr(graph_mod, "classify_intent", fake_classify)

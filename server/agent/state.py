@@ -33,11 +33,18 @@ class AgentState(TypedDict, total=False):
 
     # --- Code review (Section: code_review spec) ---
     review_mode: str                 # "" | "pr" | "file"
-    pr_context: dict | None          # {provider, repo, pr_id, commit_sha, base_sha, diff, files, previous_reviews, note_id}
+    pr_context: dict | None          # {provider, repo, pr_id, commit_sha, base_sha, diff, files, previous_reviews}
     review_findings: list[dict]      # [{file, line, severity, category, title, description, suggestion}]
     output_format: str               # "" | "markdown" | "sse_stream"
-    auto_post: bool                  # True khi gọi từ /review/pr
 
     # --- Native tool-call (client-forwarded) ---
     client_tools: list[dict]             # raw tool schemas from ChatRequest.tools
     tool_choice: str | dict | None       # forwarded tool_choice
+
+    # --- Validation (Phase 3) ---
+    validation_warnings: list[str]       # warnings from post_process validation
+
+    # --- Agentic Loop (Phase 2) ---
+    verification_passed: bool            # True if verify_result passed
+    retry_reason: str                    # Reason for retry if verification failed
+    retry_count: int                     # Number of retries attempted

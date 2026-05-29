@@ -28,6 +28,11 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, System
 
 from server.auth import verify_api_key
 from server.continue_compat import extract_active_file
+from server.metrics.counter import RequestTimer
+from server.metrics.prometheus import record_request, record_tokens, ACTIVE_REQUESTS
+from server.rate_limit import get_rate_limiter
+from server.session import get_session_store
+from server.utils.content import normalize_content
 from server.streaming.sse import (
     thinking_event,
     tool_error_event,
@@ -62,6 +67,7 @@ class ChatRequest(BaseModel):
     tool_choice: str | dict | None = None
     active_file: str | None = None
     repo_path: str | None = None
+    conversation_id: str | None = None  # Session tracking for multi-turn
 
 
 @router.post("/v1/chat/completions")
@@ -72,6 +78,18 @@ async def chat_completions(
     authorization: str = Header(None),
 ) -> StreamingResponse:
     verify_api_key(req, x_api_key, authorization)
+
+    # Rate limiting by API key or IP
+    client_id = x_api_key or authorization or req.client.host if req.client else "unknown"
+    limiter = get_rate_limiter()
+    if not limiter.allow(client_id):
+        retry_after = limiter.retry_after(client_id)
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Retry after {retry_after:.1f}s",
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
 
     logger.info(
         "chat request: model=%s tools=%d tool_names=%s",
@@ -90,20 +108,10 @@ async def chat_completions(
     )
 
 
-def _flatten_content(content) -> str:
-    """Normalize content: list[{"type":"text","text":"..."}] → str."""
-    if isinstance(content, list):
-        return "\n".join(
-            item.get("text", "") if isinstance(item, dict) else str(item)
-            for item in content
-        )
-    return content or ""
-
-
 def _convert_messages(request_messages: list[ChatMessage]):
     out = []
     for msg in request_messages:
-        text = _flatten_content(msg.content)
+        text = normalize_content(msg.content)
         if msg.role == "user":
             out.append(HumanMessage(content=text))
         elif msg.role == "tool":
@@ -117,14 +125,15 @@ def _convert_messages(request_messages: list[ChatMessage]):
                 ai.additional_kwargs["tool_calls"] = msg.tool_calls
             out.append(ai)
         elif msg.role == "system":
-            out.append(SystemMessage(content=msg.content or ""))
+            out.append(SystemMessage(content=text))
         else:
             out.append(HumanMessage(content=msg.content or ""))
     return out
 
 
 def _enable_rag() -> bool:
-    return os.environ.get("ENABLE_RAG", "false").lower() in ("1", "true", "yes")
+    # RAG enabled by default in v2.0
+    return os.environ.get("ENABLE_RAG", "true").lower() in ("1", "true", "yes")
 
 
 async def _stream_response(
@@ -133,18 +142,42 @@ async def _stream_response(
 ) -> AsyncGenerator[str, None]:
     yield thinking_event("Phân tích intent...")
 
+    # Initialize metrics tracking
+    request_id = getattr(req.state, "correlation_id", str(time.time()))
+    model = req.app.state.vllm_model
+    metrics_timer = RequestTimer(
+        request_id=request_id,
+        model=model,
+        correlation_id=request_id,
+    )
+    first_token_recorded = False
+
     event_queue: asyncio.Queue = asyncio.Queue()
     content_streamed = False
+    output_tokens_estimate = 0
 
     async def sse_callback(event_type: str, content: str) -> None:
-        nonlocal content_streamed
+        nonlocal content_streamed, first_token_recorded, output_tokens_estimate
         if event_type == "content":
+            # Track first token
+            if not first_token_recorded:
+                metrics_timer.mark_first_token()
+                first_token_recorded = True
             content_streamed = True
+            output_tokens_estimate += len(content) // 4  # Rough estimate
             await event_queue.put(content_delta_event(content))
         elif event_type == "error":
             await event_queue.put(tool_error_event("generate", content))
 
     messages = _convert_messages(request.messages)
+
+    # Load session context if conversation_id provided
+    session_store = get_session_store()
+    session_data = {}
+    if request.conversation_id:
+        session_data = session_store.get(request.conversation_id) or {}
+        if session_data:
+            logger.info("Loaded session context for %s", request.conversation_id[:8])
 
     active_file = extract_active_file(messages, request.active_file)
     if active_file:
@@ -160,16 +193,16 @@ async def _stream_response(
 
     initial_state = {
         "messages": messages,
-        "intent": "",
-        "active_file": active_file,
-        "mentioned_files": [],
+        "intent": session_data.get("last_intent", ""),  # Carry over from session
+        "active_file": active_file or session_data.get("active_file"),
+        "mentioned_files": session_data.get("mentioned_files", []),
         "freshness_signal": False,
         "force_reindex": False,
         "rag_chunks": [],
         "rag_hit": False,
         "hash_verified": False,
         "tool_results": [],
-        "context_assembled": "",
+        "context_assembled": session_data.get("context_summary", ""),
         "draft": "",
         "emitted_steps": [],
         "volatile_rejected": False,
@@ -238,14 +271,50 @@ async def _stream_response(
     if isinstance(agent_result, Exception):
         logger.error("Agent execution failed: %s", agent_result)
         yield tool_error_event("agent", str(agent_result))
+        # Record failed metrics
+        metrics_timer.metrics.success = False
+        metrics_timer.metrics.error_message = str(agent_result)
     elif isinstance(agent_result, dict):
         tc = agent_result.get("pending_tool_calls") or []
         if tc:
             # Native OpenAI tool_calls format for Continue with tool-call enabled
             yield tool_calls_event(tc, native=True)
+            metrics_timer.set_tool_calls(tc)
         elif not content_streamed:
             draft = agent_result.get("draft", "")
             if draft:
                 yield content_delta_event(draft)
+                output_tokens_estimate += len(draft) // 4
+
+        # Set intent from result
+        metrics_timer.set_intent(agent_result.get("intent", ""))
+
+        # Save session context for multi-turn
+        if request.conversation_id:
+            session_store.set(request.conversation_id, {
+                "last_intent": agent_result.get("intent", ""),
+                "active_file": agent_result.get("active_file"),
+                "mentioned_files": agent_result.get("mentioned_files", []),
+                "context_summary": agent_result.get("context_assembled", "")[:2000],
+            })
+            logger.debug("Saved session context for %s", request.conversation_id[:8])
+
+    # Record metrics
+    metrics_timer.metrics.total_time_ms = metrics_timer.get_elapsed_ms()
+    metrics_timer.metrics.output_tokens = output_tokens_estimate
+    # Estimate input tokens from messages
+    input_text = " ".join(normalize_content(msg.content) for msg in request.messages)
+    metrics_timer.metrics.input_tokens = len(input_text) // 4
+
+    from server.metrics import get_metrics_counter
+    get_metrics_counter().record(metrics_timer.metrics)
+
+    # Record Prometheus metrics
+    intent = agent_result.get("intent", "unknown") if isinstance(agent_result, dict) else "error"
+    status = "success" if not isinstance(agent_result, Exception) else "error"
+    duration = metrics_timer.get_elapsed_ms() / 1000.0
+    ttft = metrics_timer.metrics.time_to_first_token_ms / 1000.0 if metrics_timer.metrics.time_to_first_token_ms else None
+    record_request(intent, status, duration, ttft)
+    record_tokens(metrics_timer.metrics.input_tokens, output_tokens_estimate, model)
 
     yield done_event()

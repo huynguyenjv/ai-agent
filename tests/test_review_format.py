@@ -27,15 +27,15 @@ def test_count_buckets():
 
 def test_render_finding_has_framework_tag():
     out = _render_finding(_f(framework="OWASP:A03", file="app.py", line=5, title="sql inj"))
-    assert "[OWASP:A03]" in out
-    assert "`app.py:5`" in out
+    assert "<code>OWASP:A03</code>" in out
+    assert "`app.py`" in out
 
 
 def test_render_findings_block_groups_by_severity():
     fs = [_f(severity="critical"), _f(severity="medium")]
     out = _render_findings_block(fs)
-    assert "Critical" in out and "Medium" in out
-    assert out.index("Critical") < out.index("Medium")
+    assert "CRITICAL" in out and "MEDIUM" in out
+    assert out.index("CRITICAL") < out.index("MEDIUM")
 
 
 def test_render_findings_block_empty():
@@ -62,8 +62,8 @@ def test_parse_previous_reviews_no_block():
 def test_render_previous_reviews_block_truncates():
     prev = [{"sha": f"sha{i}", "ts": "t", "summary": "s"} for i in range(5)]
     out = _render_previous_reviews_block(prev)
-    # KEEP_HISTORY=3 → only 3 entries rendered
-    assert out.count("- `sha") == 3
+    # KEEP_HISTORY=3 → only 3 entries rendered (table format)
+    assert out.count("| `sha") == 3
 
 
 def test_review_format_output_contains_marker_and_template_bits():

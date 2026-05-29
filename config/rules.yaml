@@ -1,0 +1,360 @@
+# =============================================================================
+# Intent Classification Rules for AI Coding Agent
+# =============================================================================
+# Edit this file to add or modify rules.
+# Changes apply within 30 seconds — no server restart needed.
+#
+# Priority: Lower number = higher priority (evaluated first)
+# =============================================================================
+
+intents:
+  # ---------------------------------------------------------------------------
+  # Priority 1: Unit Test Generation
+  # ---------------------------------------------------------------------------
+  - name: unit_test
+    description: "Generate unit tests, mock dependencies, write assertions, test edge cases"
+    keywords_vi:
+      - "viết test"
+      - "tạo test"
+      - "unit test"
+      - "test cho"
+      - "test case"
+      - "mock"
+      - "assert"
+      - "coverage"
+      - "test hàm"
+      - "test method"
+      - "test class"
+    keywords_en:
+      - "write test"
+      - "create test"
+      - "unit test"
+      - "test for"
+      - "test case"
+      - "mock"
+      - "assert"
+      - "coverage"
+      - "test function"
+      - "test method"
+      - "test class"
+      - "generate test"
+    tools: ["vtrip_read_file", "vtrip_index_with_deps"]
+    requires_file: true
+    priority: 1
+
+  # ---------------------------------------------------------------------------
+  # Priority 2: Code Review
+  # ---------------------------------------------------------------------------
+  - name: code_review
+    description: "Review code for bugs, security vulnerabilities, performance issues, best practices"
+    keywords_vi:
+      - "review code"
+      - "code review"
+      - "review lại"
+      - "review giúp"
+      - "đánh giá code"
+      - "kiểm tra code"
+      - "check code"
+      - "audit"
+      - "merge request"
+      - "pull request"
+    keywords_en:
+      - "code review"
+      - "review code"
+      - "review this"
+      - "check this code"
+      - "audit"
+      - "pull request"
+      - "merge request"
+      - "pr review"
+      - "mr review"
+      - "security review"
+    tools: ["vtrip_read_file", "vtrip_get_pr_diff"]
+    requires_file: false
+    priority: 2
+
+  # ---------------------------------------------------------------------------
+  # Priority 3: Structural Analysis
+  # ---------------------------------------------------------------------------
+  - name: structural_analysis
+    description: "Analyze project architecture, dependencies, module structure, design patterns"
+    keywords_vi:
+      - "phân tích cấu trúc"
+      - "kiến trúc"
+      - "architecture"
+      - "tổng quan"
+      - "toàn bộ project"
+      - "cấu trúc project"
+      - "dependency"
+      - "module"
+      - "package"
+      - "circular"
+    keywords_en:
+      - "analyze architecture"
+      - "project structure"
+      - "architecture"
+      - "overview"
+      - "dependency"
+      - "module structure"
+      - "package structure"
+      - "circular dependency"
+      - "design pattern"
+      - "codebase structure"
+    tools: ["vtrip_get_project_skeleton"]
+    requires_file: false
+    priority: 3
+
+  # ---------------------------------------------------------------------------
+  # Priority 4: Search / Find
+  # ---------------------------------------------------------------------------
+  - name: search
+    description: "Find symbols, classes, functions, methods in the codebase"
+    keywords_vi:
+      - "tìm"
+      - "tìm kiếm"
+      - "ở đâu"
+      - "tìm class"
+      - "tìm hàm"
+      - "tìm method"
+      - "định nghĩa ở"
+      - "nằm ở đâu"
+      - "file nào"
+    keywords_en:
+      - "find"
+      - "search"
+      - "where is"
+      - "locate"
+      - "find class"
+      - "find function"
+      - "find method"
+      - "defined in"
+      - "which file"
+      - "look for"
+    tools: ["vtrip_search_symbol"]
+    requires_file: false
+    priority: 4
+
+  # ---------------------------------------------------------------------------
+  # Priority 5: Debug / Fix Bug
+  # ---------------------------------------------------------------------------
+  - name: debug
+    description: "Debug issues, fix bugs, troubleshoot errors, investigate problems"
+    keywords_vi:
+      - "fix bug"
+      - "sửa lỗi"
+      - "debug"
+      - "lỗi"
+      - "error"
+      - "exception"
+      - "không hoạt động"
+      - "bị lỗi"
+      - "tại sao lỗi"
+      - "nguyên nhân"
+    keywords_en:
+      - "fix bug"
+      - "debug"
+      - "error"
+      - "exception"
+      - "not working"
+      - "broken"
+      - "why error"
+      - "troubleshoot"
+      - "investigate"
+      - "issue"
+    tools: ["vtrip_read_file", "vtrip_search_symbol"]
+    requires_file: false
+    priority: 5
+
+  # ---------------------------------------------------------------------------
+  # Priority 6: Refactor / Improve
+  # ---------------------------------------------------------------------------
+  - name: refine
+    description: "Refactor code, optimize performance, improve code quality, clean up"
+    keywords_vi:
+      - "refactor"
+      - "cải thiện"
+      - "tối ưu"
+      - "optimize"
+      - "clean up"
+      - "dọn dẹp"
+      - "sửa lại"
+      - "viết lại"
+      - "cải tiến"
+      - "nâng cấp"
+    keywords_en:
+      - "refactor"
+      - "improve"
+      - "optimize"
+      - "clean up"
+      - "rewrite"
+      - "restructure"
+      - "simplify"
+      - "performance"
+      - "better way"
+      - "best practice"
+    tools: ["vtrip_read_file", "vtrip_index_with_deps"]
+    requires_file: true
+    priority: 6
+
+  # ---------------------------------------------------------------------------
+  # Priority 7: Explain / Understand
+  # ---------------------------------------------------------------------------
+  - name: explain
+    description: "Explain how code works, what a function does, understand logic flow"
+    keywords_vi:
+      - "giải thích"
+      - "explain"
+      - "làm gì"
+      - "hoạt động như thế nào"
+      - "hiểu"
+      - "đọc code"
+      - "ý nghĩa"
+      - "mục đích"
+      - "tại sao"
+      - "logic"
+    keywords_en:
+      - "explain"
+      - "what does"
+      - "how does"
+      - "understand"
+      - "walk through"
+      - "meaning"
+      - "purpose"
+      - "why"
+      - "logic"
+      - "flow"
+    tools: ["vtrip_read_file"]
+    requires_file: false
+    priority: 7
+
+  # ---------------------------------------------------------------------------
+  # Priority 8: Implement Feature (fallback)
+  # ---------------------------------------------------------------------------
+  - name: code_gen
+    description: "Implement new features, add functionality, create new code"
+    keywords_vi:
+      - "implement"
+      - "thêm"
+      - "tạo"
+      - "viết"
+      - "xây dựng"
+      - "phát triển"
+      - "code"
+      - "feature"
+      - "chức năng"
+    keywords_en:
+      - "implement"
+      - "add"
+      - "create"
+      - "build"
+      - "develop"
+      - "code"
+      - "feature"
+      - "functionality"
+      - "generate"
+      - "write"
+    tools: ["vtrip_read_file", "vtrip_index_with_deps"]
+    requires_file: false
+    priority: 99
+
+# =============================================================================
+# Freshness Keywords - Indicates recent changes
+# =============================================================================
+freshness_keywords:
+  # Vietnamese
+  - "vừa sửa"
+  - "vừa thêm"
+  - "vừa commit"
+  - "vừa push"
+  - "mới sửa"
+  - "mới thêm"
+  - "hiện tại"
+  - "bây giờ"
+  - "mới nhất"
+  - "gần đây"
+  - "hôm nay"
+  # English
+  - "just changed"
+  - "just added"
+  - "just committed"
+  - "just pushed"
+  - "recently"
+  - "latest"
+  - "current"
+  - "today"
+  - "now"
+
+# =============================================================================
+# File Mention Suffixes - Common class naming patterns
+# =============================================================================
+file_mention_suffixes:
+  # Layers
+  - Service
+  - Repository
+  - Controller
+  - Handler
+  - Middleware
+  # Domain
+  - Entity
+  - Model
+  - Dto
+  - Vo
+  - Request
+  - Response
+  # Patterns
+  - Factory
+  - Builder
+  - Adapter
+  - Mapper
+  - Converter
+  - Validator
+  - Provider
+  - Manager
+  - Helper
+  - Util
+  - Utils
+  # Use Cases
+  - UseCase
+  - Interactor
+  - Command
+  - Query
+  # Config
+  - Config
+  - Configuration
+  - Properties
+  - Settings
+  # Tests
+  - Test
+  - Tests
+  - Spec
+
+# =============================================================================
+# File Extensions
+# =============================================================================
+file_extensions:
+  - .java
+  - .kt
+  - .go
+  - .py
+  - .ts
+  - .tsx
+  - .js
+  - .jsx
+  - .cs
+  - .rs
+  - .rb
+  - .php
+  - .swift
+  - .tf
+  - .hcl
+  - .yaml
+  - .yml
+  - .json
+  - .xml
+  - .sql
+
+# =============================================================================
+# Configuration
+# =============================================================================
+confidence_threshold: 0.7
+rules_reload_interval_seconds: 30

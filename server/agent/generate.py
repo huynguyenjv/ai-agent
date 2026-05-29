@@ -7,8 +7,10 @@ list for Turn 2.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -82,33 +84,376 @@ MCP_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_run_command",
+            "description": "Execute a shell command to run tests, lint, or build. Use to verify code changes work correctly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Command to execute (e.g., 'npm test', 'pytest tests/', 'mvn test')",
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Subdirectory to run in (relative to repo root)",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_diff_preview",
+            "description": "Preview changes before applying. Shows unified diff of proposed edits to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path relative to repo root",
+                    },
+                    "new_content": {
+                        "type": "string",
+                        "description": "Proposed new content for the file",
+                    },
+                },
+                "required": ["file_path", "new_content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_apply_edits",
+            "description": "Apply edits to multiple files atomically. Supports full content replacement or search/replace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "new_content": {"type": "string"},
+                                "search": {"type": "string"},
+                                "replace": {"type": "string"},
+                            },
+                            "required": ["file_path"],
+                        },
+                        "description": "List of edits. Each needs file_path + (new_content OR search+replace)",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Preview only, don't apply changes",
+                    },
+                },
+                "required": ["edits"],
+            },
+        },
+    },
+    # Git Integration Tools
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_git_status",
+            "description": "Get git status: branch, staged files, modified files, untracked files.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_git_diff",
+            "description": "Get git diff for a file or entire repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "File to diff (optional, defaults to all)"},
+                    "staged": {"type": "boolean", "default": False, "description": "Show staged changes only"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_git_log",
+            "description": "Get recent git commits.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer", "default": 10, "description": "Number of commits"},
+                    "file_path": {"type": "string", "description": "Filter by file (optional)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_git_commit",
+            "description": "Stage files and create a git commit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Commit message"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Files to stage (optional, defaults to all)"},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_git_branch",
+            "description": "List branches or create/checkout a branch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Branch name (optional, omit to list)"},
+                    "checkout": {"type": "boolean", "default": False, "description": "Checkout after creating"},
+                },
+            },
+        },
+    },
 ]
 
 MCP_TOOL_NAMES = {t["function"]["name"] for t in MCP_TOOLS}
 
 # =============================================================================
-# Intent-based System Prompts
+# Intent-based System Prompts - Senior Level
 # =============================================================================
 
 INTENT_PROMPTS = {
-    "code_gen": "You are an expert coding assistant. Write clean, efficient code. Respond in the user's language.",
-    "code_review": "You are a senior code reviewer. Analyze for bugs, security, performance. Respond in the user's language.",
-    "explain": "You are a patient coding teacher. Explain clearly with examples. Respond in the user's language.",
-    "search": "You are a codebase navigator. Find symbols and files precisely. Respond in the user's language.",
-    "structural_analysis": "You are a software architect. Analyze structure and dependencies. Respond in the user's language.",
-    "refine": "You are a refactoring expert. Improve code quality. Respond in the user's language.",
-    "unit_test": "You are a testing expert. Write comprehensive tests. Respond in the user's language.",
+    "unit_test": """You are a Senior QA Engineer with 10+ years of experience in test-driven development.
+
+EXPERTISE:
+- Write comprehensive unit tests with high coverage
+- Mock external dependencies properly (databases, APIs, file systems)
+- Test edge cases, boundary conditions, and error scenarios
+- Follow testing best practices: AAA pattern (Arrange-Act-Assert), single responsibility per test
+- Use appropriate testing frameworks for the language (JUnit/Mockito for Java, pytest for Python, Jest for JS/TS)
+
+APPROACH:
+1. Analyze the code structure and identify testable units
+2. Identify dependencies that need mocking
+3. Write tests for happy path first
+4. Add edge cases and error scenarios
+5. Ensure tests are independent and repeatable
+
+OUTPUT FORMAT:
+- Clear test class/file structure
+- Descriptive test method names (should_ReturnX_When_Y)
+- Comments only for complex setup
+- Complete, runnable test code
+
+Respond in the user's language (Vietnamese or English).""",
+
+    "code_review": """You are a Principal Software Engineer conducting code reviews.
+
+REVIEW FOCUS:
+1. **Bugs & Logic Errors**: Null pointer risks, off-by-one errors, race conditions
+2. **Security**: SQL injection, XSS, authentication/authorization issues, secrets in code
+3. **Performance**: N+1 queries, unnecessary loops, memory leaks, blocking operations
+4. **Best Practices**: SOLID principles, design patterns, error handling
+5. **Maintainability**: Code readability, naming conventions, complexity
+
+OUTPUT FORMAT:
+For each issue found:
+- **Location**: File:line
+- **Severity**: Critical / Major / Minor / Suggestion
+- **Issue**: What's wrong
+- **Recommendation**: How to fix
+- **Example**: Code snippet if helpful
+
+Be constructive, not critical. Explain WHY something is an issue.
+Respond in the user's language (Vietnamese or English).""",
+
+    "structural_analysis": """You are a Software Architect analyzing system design.
+
+ANALYSIS FOCUS:
+1. **Architecture Pattern**: Identify the architecture (Layered, Hexagonal, Microservices, etc.)
+2. **Module Structure**: How code is organized into packages/modules
+3. **Dependencies**: Internal and external dependencies, potential circular dependencies
+4. **Design Patterns**: Patterns used (Factory, Repository, Strategy, etc.)
+5. **Coupling & Cohesion**: How tightly coupled are components
+
+OUTPUT FORMAT:
+```
+## Architecture Overview
+[High-level description]
+
+## Module Structure
+[Package/folder organization]
+
+## Key Components
+[Main classes/services and their responsibilities]
+
+## Dependencies
+[Internal and external dependencies]
+
+## Observations
+[Strengths and potential improvements]
+```
+
+Respond in the user's language (Vietnamese or English).""",
+
+    "search": """You are a Codebase Navigator helping developers find code.
+
+CAPABILITIES:
+- Locate class, function, method definitions
+- Find usages and references
+- Identify file paths and line numbers
+
+OUTPUT FORMAT:
+For each match found:
+- **Symbol**: Name and type (class/function/method)
+- **Location**: file/path:line_number
+- **Context**: Brief description of what it does
+
+Be precise with file paths and line numbers.
+Respond in the user's language (Vietnamese or English).""",
+
+    "debug": """You are a Senior Debugger with expertise in troubleshooting complex issues.
+
+APPROACH:
+1. **Understand the Error**: Analyze error messages, stack traces, logs
+2. **Reproduce**: Identify conditions that trigger the issue
+3. **Isolate**: Narrow down to the specific component/line
+4. **Root Cause**: Find the actual cause, not just symptoms
+5. **Fix**: Propose a solution that doesn't introduce new issues
+
+OUTPUT FORMAT:
+```
+## Problem Analysis
+[What's happening and why]
+
+## Root Cause
+[The actual source of the issue]
+
+## Solution
+[Step-by-step fix with code]
+
+## Prevention
+[How to avoid similar issues]
+```
+
+Respond in the user's language (Vietnamese or English).""",
+
+    "refine": """You are a Refactoring Expert improving code quality.
+
+PRINCIPLES:
+- **SOLID**: Single responsibility, Open/closed, Liskov substitution, Interface segregation, Dependency inversion
+- **DRY**: Don't Repeat Yourself
+- **KISS**: Keep It Simple, Stupid
+- **YAGNI**: You Aren't Gonna Need It
+
+REFACTORING TECHNIQUES:
+- Extract Method/Class
+- Rename for clarity
+- Remove dead code
+- Simplify conditionals
+- Replace magic numbers with constants
+- Improve error handling
+
+OUTPUT FORMAT:
+1. **Current Issues**: What's wrong with the current code
+2. **Proposed Changes**: What to refactor and why
+3. **Refactored Code**: The improved version
+4. **Benefits**: How this improves the code
+
+Keep behavior unchanged. Make small, incremental changes.
+Respond in the user's language (Vietnamese or English).""",
+
+    "explain": """You are a Patient Coding Teacher explaining code to developers.
+
+TEACHING APPROACH:
+1. Start with the big picture (what does this code accomplish?)
+2. Break down into smaller parts
+3. Explain each part with simple language
+4. Use analogies when helpful
+5. Highlight key concepts and patterns
+
+OUTPUT FORMAT:
+```
+## Overview
+[What this code does in 1-2 sentences]
+
+## How It Works
+[Step-by-step explanation]
+
+## Key Concepts
+[Important patterns, techniques, or concepts used]
+
+## Example
+[If helpful, a simplified example]
+```
+
+Adjust explanation depth based on the question.
+Respond in the user's language (Vietnamese or English).""",
+
+    "code_gen": """You are a Senior Software Engineer implementing features.
+
+CODING STANDARDS:
+- Write clean, readable, maintainable code
+- Follow language idioms and conventions
+- Handle errors appropriately
+- Use meaningful variable/function names
+- Keep functions small and focused
+- Add types/interfaces where applicable
+
+IMPLEMENTATION APPROACH:
+1. Understand the requirement fully
+2. Consider edge cases upfront
+3. Write self-documenting code
+4. Handle errors gracefully
+5. Consider performance implications
+
+OUTPUT FORMAT:
+- Complete, working code (not snippets)
+- Brief explanation of design decisions
+- Note any assumptions made
+
+Respond in the user's language (Vietnamese or English).""",
 }
 
-DEFAULT_PROMPT = "You are an expert coding assistant. Respond in the user's language."
+DEFAULT_PROMPT = """You are a Senior Software Engineer helping developers.
+
+Provide accurate, well-structured, and practical answers.
+Consider best practices, performance, and maintainability.
+Respond in the user's language (Vietnamese or English)."""
 
 TOOL_INSTRUCTIONS = """
 
-You have access to these tools - use them when needed:
+You have access to these tools:
 - vtrip_read_file: Read file content (file_path, start_line, end_line)
-- vtrip_search_symbol: Find symbols in codebase (name, type_filter)
-- vtrip_get_project_skeleton: Get project structure overview
-- vtrip_index_with_deps: Index file with dependencies"""
+- vtrip_search_symbol: Find class/function/method in codebase (name, type_filter)
+- vtrip_get_project_skeleton: Get project structure overview (include_methods)
+- vtrip_index_with_deps: Index file with its dependencies (file_path, depth)
+- vtrip_run_command: Execute shell command to run tests, lint, build (command, working_dir)
+- vtrip_diff_preview: Preview changes before applying, shows unified diff (file_path, new_content)
+- vtrip_apply_edits: Apply edits to multiple files atomically (edits[], dry_run)
+- vtrip_git_status: Get git status (branch, staged, modified, untracked)
+- vtrip_git_diff: Get git diff (file_path, staged)
+- vtrip_git_log: Get recent commits (count, file_path)
+- vtrip_git_commit: Create commit (message, files[])
+- vtrip_git_branch: List/create/checkout branch (name, checkout)
+
+Use tools when you need to:
+- Read actual file content before making changes
+- Find where a symbol is defined or used
+- Understand project structure before analysis
+- Verify code changes by running tests or linting
+- Check git status and history before making commits
+- Create branches and commits for your changes"""
 
 # =============================================================================
 # Tool Name Mapping (for models trained on different tool sets)
@@ -125,6 +470,29 @@ TOOL_NAME_MAP = {
     "grep": "vtrip_search_symbol",
     "find_symbol": "vtrip_search_symbol",
     "index_file": "vtrip_index_with_deps",
+    "run_command": "vtrip_run_command",
+    "execute": "vtrip_run_command",
+    "shell": "vtrip_run_command",
+    "terminal": "vtrip_run_command",
+    "run_tests": "vtrip_run_command",
+    "test": "vtrip_run_command",
+    "diff": "vtrip_diff_preview",
+    "preview": "vtrip_diff_preview",
+    "show_diff": "vtrip_diff_preview",
+    "apply_edits": "vtrip_apply_edits",
+    "edit_files": "vtrip_apply_edits",
+    "write_files": "vtrip_apply_edits",
+    "multi_edit": "vtrip_apply_edits",
+    # Git tools
+    "git_status": "vtrip_git_status",
+    "status": "vtrip_git_status",
+    "git_diff": "vtrip_git_diff",
+    "git_log": "vtrip_git_log",
+    "log": "vtrip_git_log",
+    "git_commit": "vtrip_git_commit",
+    "commit": "vtrip_git_commit",
+    "git_branch": "vtrip_git_branch",
+    "branch": "vtrip_git_branch",
 }
 
 # Argument name mapping per tool
@@ -146,8 +514,10 @@ ARG_NAME_MAP = {
 # Configuration
 # =============================================================================
 
-MAX_TOOL_TURNS = 15  # Allow more tool turns for complex tasks
-MAX_INPUT_TOKENS = 24000
+MAX_TOOL_TURNS = int(os.environ.get("MAX_TOOL_TURNS", "5"))
+MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "24000"))
+MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_DELAY", "1.0"))
 
 
 # =============================================================================
@@ -155,10 +525,10 @@ MAX_INPUT_TOKENS = 24000
 # =============================================================================
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate."""
+    """Rough token estimate (~4 chars per token for code/English)."""
     if not text:
         return 0
-    return len(text) // 3
+    return len(text) // 4
 
 
 def _normalize_json(obj: Any) -> str:
@@ -380,20 +750,33 @@ def _map_and_validate_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return valid_calls
 
 
+def _normalize_call_key(name: str, arguments: str) -> str:
+    """Create normalized call key for deduplication.
+
+    Parses JSON once, sorts keys, and creates canonical form.
+    Returns name:normalized_args string.
+    """
+    args = _parse_json_safe(arguments)
+    return f"{name}:{_normalize_json(args)}"
+
+
 def _get_already_called_tools(state: AgentState) -> set[str]:
-    """Get normalized signatures of already-called tools."""
+    """Get normalized signatures of already-called tools.
+
+    Single pass through messages, O(n) complexity.
+    """
     already_called: set[str] = set()
 
     for msg in state.get("messages", []):
-        if getattr(msg, "type", None) == "ai":
-            tc_list = (getattr(msg, "additional_kwargs", {}) or {}).get("tool_calls", [])
-            for tc in tc_list:
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                args = _parse_json_safe(fn.get("arguments", "{}"))
-                # Normalize: sorted keys, no whitespace variations
-                call_key = f"{name}:{_normalize_json(args)}"
-                already_called.add(call_key)
+        if getattr(msg, "type", None) != "ai":
+            continue
+        tc_list = (getattr(msg, "additional_kwargs", {}) or {}).get("tool_calls", [])
+        for tc in tc_list:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            args_str = fn.get("arguments", "{}")
+            call_key = _normalize_call_key(name, args_str)
+            already_called.add(call_key)
 
     return already_called
 
@@ -408,14 +791,14 @@ def _deduplicate_tool_calls(
     for tc in tool_calls:
         fn = tc.get("function", {})
         name = fn.get("name", "")
-        args = _parse_json_safe(fn.get("arguments", "{}"))
-        call_key = f"{name}:{_normalize_json(args)}"
+        args_str = fn.get("arguments", "{}")
+        call_key = _normalize_call_key(name, args_str)
 
         if call_key in already_called:
             logger.warning("Skipping duplicate tool call: %s", name)
             continue
 
-        already_called.add(call_key)  # Prevent duplicates within same batch
+        already_called.add(call_key)
         deduped.append(tc)
 
     return deduped
@@ -480,39 +863,58 @@ async def generate(
     tool_names = [t["function"]["name"] for t in (all_tools or [])]
     logger.info("generate: tools=%s, tool_turns=%d/%d", tool_names, tool_turns_used, MAX_TOOL_TURNS)
 
-    # Stream response
+    # Stream response with retry logic
     content_buf: list[str] = []
     tool_calls_acc: list[dict] = []
+    last_error: Exception | None = None
 
-    try:
-        stream = await vllm_client.chat.completions.create(**kwargs)
+    for attempt in range(MAX_RETRIES):
+        content_buf.clear()
+        tool_calls_acc.clear()
 
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
+        try:
+            stream = await vllm_client.chat.completions.create(**kwargs)
 
-            delta = chunk.choices[0].delta
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
 
-            # Collect content
-            if getattr(delta, "content", None):
-                token = delta.content
-                content_buf.append(token)
+                delta = chunk.choices[0].delta
+
+                # Collect content
+                if getattr(delta, "content", None):
+                    token = delta.content
+                    content_buf.append(token)
+                    if sse_callback:
+                        await sse_callback("content", token)
+
+                # Collect tool calls
+                if getattr(delta, "tool_calls", None):
+                    _merge_tool_call_delta(tool_calls_acc, delta.tool_calls)
+
+            # Success - break out of retry loop
+            break
+
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "vLLM generation failed (attempt %d/%d): %s",
+                attempt + 1, MAX_RETRIES, e
+            )
+
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                logger.info("Retrying in %.1fs...", delay)
+                await asyncio.sleep(delay)
+            else:
+                logger.error("vLLM generation failed after %d attempts", MAX_RETRIES)
                 if sse_callback:
-                    await sse_callback("content", token)
-
-            # Collect tool calls
-            if getattr(delta, "tool_calls", None):
-                _merge_tool_call_delta(tool_calls_acc, delta.tool_calls)
-
-    except Exception as e:
-        logger.error("vLLM generation failed: %s", e)
-        if sse_callback:
-            await sse_callback("error", str(e))
-        return {
-            "draft": f"Generation error: {e}",
-            "pending_tool_calls": [],
-            "tool_turns_used": tool_turns_used,
-        }
+                    await sse_callback("error", str(e))
+                return {
+                    "draft": f"Generation error after {MAX_RETRIES} retries: {e}",
+                    "pending_tool_calls": [],
+                    "tool_turns_used": tool_turns_used,
+                }
 
     # Process results
     draft = "".join(content_buf)

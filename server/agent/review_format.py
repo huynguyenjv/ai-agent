@@ -15,19 +15,47 @@ logger = logging.getLogger("server.agent.review_format")
 MARKER = os.environ.get("AI_REVIEWER_MARKER", "AI_REVIEW_MARKER:v1")
 KEEP_HISTORY = int(os.environ.get("AI_REVIEWER_KEEP_HISTORY", "3"))
 
+# Inline-comment rendering (consumed by /review/analyze to build inline_comments).
+INLINE_MARKER = os.environ.get("AI_REVIEWER_INLINE_MARKER", "AI_REVIEW_INLINE:v1")
+INLINE_SEVERITIES = {"critical", "high", "medium"}
+
+# Single source for extension-to-language mapping
 _EXT_LANG = {
     ".java": "java", ".py": "python", ".js": "javascript", ".ts": "typescript",
     ".go": "go", ".cs": "csharp", ".rb": "ruby", ".kt": "kotlin", ".rs": "rust",
     ".tf": "hcl", ".sql": "sql", ".xml": "xml", ".yml": "yaml", ".yaml": "yaml",
     ".json": "json", ".sh": "bash", ".jsx": "jsx", ".tsx": "tsx",
 }
+_INLINE_SEV_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡"}
 
 
 def _guess_lang(file_path: str) -> str:
+    """Get language from file extension (single source of truth)."""
     for ext, lang in _EXT_LANG.items():
         if file_path.endswith(ext):
             return lang
     return ""
+
+
+def _render_inline_body(f: dict) -> str:
+    sev = f.get("severity", "low")
+    emoji = _INLINE_SEV_EMOJI.get(sev, "🔵")
+    fw = f.get("framework") or "—"
+    title = (f.get("title") or "").strip() or "Issue"
+    msg = (f.get("message") or "").strip()
+    sugg = (f.get("suggestion") or "").strip()
+    parts = [f"<!-- {INLINE_MARKER} -->", f"{emoji} **[{fw}] {title}**"]
+    if msg and msg != title:
+        parts.append("")
+        parts.append(msg)
+    if sugg and sugg.lower() not in {"null", "none", ""}:
+        lang = _guess_lang(f.get("file", ""))
+        parts.append("")
+        if sugg.startswith("```"):
+            parts.append(f"💡 **Suggested fix:**\n\n{sugg}")
+        else:
+            parts.append(f"💡 **Suggested fix:**\n\n```{lang}\n{sugg}\n```")
+    return "\n".join(parts)
 
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}

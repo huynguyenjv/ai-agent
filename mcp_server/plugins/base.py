@@ -73,3 +73,33 @@ class LanguagePlugin(abc.ABC):
             "classes": classes,
             "functions": functions,
         }
+
+    # =========================================================================
+    # Shared Helper Methods
+    # =========================================================================
+
+    @staticmethod
+    def _walk(node):
+        """Yield all descendant nodes using cursor-based traversal.
+
+        This is more efficient than recursive children iteration for large ASTs.
+
+        Args:
+            node: Tree-sitter node
+
+        Yields:
+            All descendant nodes including the given node
+        """
+        cursor = node.walk()
+        visited = False
+        while True:
+            if not visited:
+                yield cursor.node
+                if cursor.goto_first_child():
+                    continue
+            if cursor.goto_next_sibling():
+                visited = False
+                continue
+            if not cursor.goto_parent():
+                break
+            visited = True

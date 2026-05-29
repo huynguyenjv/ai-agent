@@ -6,16 +6,18 @@ Flow:
     └─ else → route_context
          ├─ volatile_rejected → reject_volatile → END
          └─ else → <intent router>
-              ├─ code_review → review_analyze → review_format
-              │                 ├─ auto_post → upsert_mr_comment → END
-              │                 └─ else → post_process → END
+              ├─ code_review → review_analyze → review_format → post_process → END
               └─ else → generate → post_process → END
 
 rag_search / plan_steps only wired when enable_rag=True (pending RAG redesign).
+
+Note: `code_review` here is only used by chat completions (Continue). The
+GitLab MR runner calls /review/analyze which bypasses the graph entirely.
 """
 
 from __future__ import annotations
 
+import os
 from functools import partial
 
 from langgraph.graph import END, StateGraph
@@ -27,14 +29,16 @@ from server.agent.generate import generate
 from server.agent.post_process import post_process
 from server.agent.review_analyze import review_analyze
 from server.agent.review_format import review_format
-from server.agent.upsert_mr_comment import upsert_mr_comment
+from server.agent.verify_result import verify_result
 
-_VOLATILE_RESPONSE = (
+_DEFAULT_VOLATILE_RESPONSE = (
     "Xin lỗi, tính năng này chưa được hỗ trợ trong phiên bản hiện tại (V1). "
     "Hệ thống chưa thể truy cập dữ liệu real-time như git diff, runtime logs, "
     "live metrics, hoặc error stack traces từ process đang chạy. "
     "Vui lòng mô tả vấn đề cụ thể để tôi hỗ trợ dựa trên source code."
 )
+
+_VOLATILE_RESPONSE = os.environ.get("VOLATILE_REJECTION_MESSAGE", _DEFAULT_VOLATILE_RESPONSE)
 
 
 def _reject_volatile(state: AgentState) -> dict:
@@ -55,8 +59,12 @@ def _route_after_context(state: AgentState) -> str:
     return "generate"
 
 
-def _route_after_review_format(state: AgentState) -> str:
-    return "upsert_mr_comment" if state.get("auto_post") else "post_process"
+def _route_after_verify(state: AgentState) -> str:
+    """Route after verification: retry generate or proceed to post_process."""
+    if state.get("verification_passed", True):
+        return "post_process"
+    # Verification failed - retry generate with context about the failure
+    return "generate"
 
 
 def build_agent_graph(
@@ -74,13 +82,17 @@ def build_agent_graph(
 
     graph = StateGraph(AgentState)
 
-    graph.add_node("classify_intent", _this.classify_intent)
+    graph.add_node(
+        "classify_intent",
+        partial(_this.classify_intent, vllm_client=vllm_client, model=model),
+    )
     graph.add_node("route_context", _this.route_context)
     graph.add_node("reject_volatile", _reject_volatile)
     graph.add_node(
         "generate",
         partial(_this.generate, vllm_client=vllm_client, model=model, sse_callback=sse_callback),
     )
+    graph.add_node("verify_result", _this.verify_result)
     graph.add_node("post_process", _this.post_process)
 
     graph.add_node(
@@ -88,7 +100,6 @@ def build_agent_graph(
         partial(review_analyze, vllm_client=vllm_client, model=model),
     )
     graph.add_node("review_format", review_format)
-    graph.add_node("upsert_mr_comment", upsert_mr_comment)
 
     graph.set_entry_point("classify_intent")
 
@@ -111,14 +122,15 @@ def build_agent_graph(
     graph.add_edge("reject_volatile", END)
 
     graph.add_edge("review_analyze", "review_format")
-    graph.add_conditional_edges(
-        "review_format",
-        _route_after_review_format,
-        {"upsert_mr_comment": "upsert_mr_comment", "post_process": "post_process"},
-    )
-    graph.add_edge("upsert_mr_comment", END)
+    graph.add_edge("review_format", "post_process")
 
-    graph.add_edge("generate", "post_process")
+    # Agentic loop: generate → verify → (retry or post_process)
+    graph.add_edge("generate", "verify_result")
+    graph.add_conditional_edges(
+        "verify_result",
+        _route_after_verify,
+        {"generate": "generate", "post_process": "post_process"},
+    )
     graph.add_edge("post_process", END)
 
     if enable_rag:

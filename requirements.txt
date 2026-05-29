@@ -24,8 +24,18 @@ openai>=1.54
 # Environment
 python-dotenv>=1.0
 
+# YAML parsing (for rules engine)
+pyyaml>=6.0
+
+# Prometheus metrics
+prometheus-client>=0.20
+
 # HTTP client
 httpx>=0.27
+
+# PostgreSQL (async)
+asyncpg>=0.29
+psycopg[binary,pool]>=3.1
 
 # === Testing ===
 pytest>=8.0

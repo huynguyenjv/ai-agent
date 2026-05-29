@@ -5,25 +5,26 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from server.agent.review_analyze import (
-    _parse_json_object, _split_diff_by_file, _normalise_findings,
+    _split_diff_by_file, _normalise_findings,
     _analyze_once, MAX_DIFF_CHARS_PER_FILE,
 )
+from server.utils.json_parser import extract_json_object
 
 
-def test_parse_json_object_plain():
-    assert _parse_json_object('{"a":1}') == {"a": 1}
+def testextract_json_object_plain():
+    assert extract_json_object('{"a":1}') == {"a": 1}
 
 
-def test_parse_json_object_fenced():
-    assert _parse_json_object('```json\n{"a":1}\n```') == {"a": 1}
+def testextract_json_object_fenced():
+    assert extract_json_object('```json\n{"a":1}\n```') == {"a": 1}
 
 
-def test_parse_json_object_invalid():
-    assert _parse_json_object("not json") is None
+def testextract_json_object_invalid():
+    assert extract_json_object("not json") is None
 
 
-def test_parse_json_object_not_object():
-    assert _parse_json_object("[1,2,3]") is None
+def testextract_json_object_not_object():
+    assert extract_json_object("[1,2,3]") is None
 
 
 def test_split_diff_by_file_basic():

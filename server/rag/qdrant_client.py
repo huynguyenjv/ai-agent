@@ -6,6 +6,7 @@ Hybrid search with RRF fusion.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from qdrant_client import AsyncQdrantClient
@@ -172,34 +173,36 @@ class QdrantService:
                 must=[FieldCondition(key="lang", match=MatchValue(value=lang_filter))]
             )
 
-        # Dense search via query_points
-        dense_response = await self._client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=dense_vector,
-            using="dense",
-            query_filter=query_filter,
-            limit=2 * top_k,
-            with_payload=True,
-        )
-        dense_results = dense_response.points
-
-        # Sparse search
-        sparse_indices = list(sparse_vector.keys())
-        sparse_values = list(sparse_vector.values())
-        sparse_results = []
-        if sparse_indices:
-            sparse_response = await self._client.query_points(
+        # Parallel dense + sparse searches
+        async def _dense_search():
+            resp = await self._client.query_points(
                 collection_name=COLLECTION_NAME,
-                query=SparseVector(
-                    indices=sparse_indices,
-                    values=sparse_values,
-                ),
+                query=dense_vector,
+                using="dense",
+                query_filter=query_filter,
+                limit=2 * top_k,
+                with_payload=True,
+            )
+            return resp.points
+
+        async def _sparse_search():
+            indices = list(sparse_vector.keys())
+            values = list(sparse_vector.values())
+            if not indices:
+                return []
+            resp = await self._client.query_points(
+                collection_name=COLLECTION_NAME,
+                query=SparseVector(indices=indices, values=values),
                 using="sparse",
                 query_filter=query_filter,
                 limit=2 * top_k,
                 with_payload=True,
             )
-            sparse_results = sparse_response.points
+            return resp.points
+
+        dense_results, sparse_results = await asyncio.gather(
+            _dense_search(), _sparse_search()
+        )
 
         # RRF Fusion (k=60)
         rrf_k = 60

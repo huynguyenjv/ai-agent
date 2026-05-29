@@ -181,18 +181,4 @@ class GoPlugin(LanguagePlugin):
             return signature, ""
         return signature, node_text
 
-    @staticmethod
-    def _walk(node):
-        cursor = node.walk()
-        visited = False
-        while True:
-            if not visited:
-                yield cursor.node
-                if cursor.goto_first_child():
-                    continue
-            if cursor.goto_next_sibling():
-                visited = False
-                continue
-            if not cursor.goto_parent():
-                break
-            visited = True
+    # _walk inherited from LanguagePlugin base class

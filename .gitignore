@@ -85,5 +85,9 @@ benchmark/results/
 # Qdrant data
 qdrant_data/
 
+# Metrics SQLite store
+data/
+*.db
+
 .agent/
 .env

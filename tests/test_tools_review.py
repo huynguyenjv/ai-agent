@@ -21,11 +21,7 @@ def test_validate_gitlab_only():
 
 
 def test_resolve_verify_default_true():
-    assert tools_review._resolve_verify.__wrapped__ is None or True  # smoke
-    # re-test function directly
-    import importlib
-    # Instead, unit-call with monkeypatch via env
-    # Just verify current _VERIFY is True
+    # Verify _VERIFY defaults to True
     assert tools_review._VERIFY is True
 
 

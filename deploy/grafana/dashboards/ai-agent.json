@@ -1,0 +1,130 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "ai-agent-main",
+    "title": "AI Agent Dashboard",
+    "tags": ["ai-agent"],
+    "timezone": "browser",
+    "schemaVersion": 30,
+    "version": 1,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(ai_agent_requests_total[5m])",
+            "legendFormat": "{{intent}} - {{status}}"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Active Requests",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "ai_agent_active_requests",
+            "legendFormat": "Active"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Success Rate",
+        "type": "gauge",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(rate(ai_agent_requests_total{status=\"success\"}[5m])) / sum(rate(ai_agent_requests_total[5m])) * 100"
+          }
+        ],
+        "options": {
+          "minValue": 0,
+          "maxValue": 100
+        }
+      },
+      {
+        "id": 4,
+        "title": "Latency P95",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(ai_agent_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 {{intent}}"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Tool Usage",
+        "type": "bargauge",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "sum by (tool_name) (rate(ai_agent_tool_calls_total[1h]))",
+            "legendFormat": "{{tool_name}}"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Time to First Token",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(ai_agent_ttft_seconds_bucket[5m]))",
+            "legendFormat": "P50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(ai_agent_ttft_seconds_bucket[5m]))",
+            "legendFormat": "P95"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Token Usage",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "rate(ai_agent_tokens_total[5m])",
+            "legendFormat": "{{type}} - {{model}}"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Verification Results",
+        "type": "piechart",
+        "gridPos": {"h": 8, "w": 6, "x": 12, "y": 20},
+        "targets": [
+          {
+            "expr": "sum by (result) (ai_agent_verification_total)",
+            "legendFormat": "{{result}}"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Feedback Distribution",
+        "type": "piechart",
+        "gridPos": {"h": 8, "w": 6, "x": 18, "y": 20},
+        "targets": [
+          {
+            "expr": "sum by (rating_bucket) (ai_agent_feedback_total)",
+            "legendFormat": "{{rating_bucket}}"
+          }
+        ]
+      }
+    ]
+  },
+  "overwrite": true
+}

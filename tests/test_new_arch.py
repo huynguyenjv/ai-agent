@@ -7,12 +7,6 @@ import tempfile
 
 import pytest
 
-# Tests for tool_selector / emit_tool_calls / old graph routing are obsolete
-# under the native tool-call architecture (see docs/superpowers/specs/
-# 2026-04-15-chat-completions-native-toolcall-design.md). Skipped en masse
-# via test name patterns in the relevant test functions below.
-_DEPRECATED_REASON = "obsolete after native tool-call refactor; see 2026-04-15 spec"
-
 # ============ Phase 1: Models, HashStore, Tools ============
 
 
@@ -302,7 +296,10 @@ def test_get_project_skeleton():
 # ============ Phase 5: Agent Nodes ============
 
 
-def test_classify_intent():
+@pytest.mark.asyncio
+async def test_classify_intent():
+    from langchain_core.messages import HumanMessage
+
     from server.agent.classify_intent import classify_intent
 
     cases = [
@@ -318,8 +315,8 @@ def test_classify_intent():
         ("create API endpoint", "code_gen"),
     ]
     for content, expected in cases:
-        state = {"messages": [type("M", (), {"content": content})()]}
-        result = classify_intent(state)
+        state = {"messages": [HumanMessage(content=content)]}
+        result = await classify_intent(state, vllm_client=None)
         assert result["intent"] == expected, f"{content!r}: expected {expected}, got {result['intent']}"
 
 
@@ -492,7 +489,7 @@ def test_tool_calls_event_format():
         {"index": 0, "id": "call_1", "type": "function",
          "function": {"name": "index_with_deps", "arguments": '{"file_path": "src/A.java"}'}},
     ]
-    result = tool_calls_event(tool_calls)
+    result = tool_calls_event(tool_calls, native=True)
 
     # Must have exactly two data lines
     data_lines = [l for l in result.split("\n") if l.startswith("data: ")]
@@ -509,7 +506,8 @@ def test_tool_calls_event_format():
     assert chunk2["choices"][0]["finish_reason"] == "tool_calls"
 
 
-def test_tool_result_turn_detection():
+@pytest.mark.asyncio
+async def test_tool_result_turn_detection():
     """classify_intent sets is_tool_result_turn=True when ToolMessage present."""
     from langchain_core.messages import ToolMessage, HumanMessage
     from server.agent.classify_intent import classify_intent
@@ -520,187 +518,30 @@ def test_tool_result_turn_detection():
         ToolMessage(content='{"files": ["UserService.java"]}', tool_call_id="call_1"),
     ]
     state = {"messages": messages, "intent": "unit_test"}
-    result = classify_intent(state)
+    result = await classify_intent(state, vllm_client=None)
 
     assert result["is_tool_result_turn"] is True
     # Must preserve prior intent, not re-classify from ToolMessage JSON content
     assert result["intent"] == "unit_test"
 
 
-def test_classify_intent_not_tool_result_turn_on_normal_message():
+@pytest.mark.asyncio
+async def test_classify_intent_not_tool_result_turn_on_normal_message():
     """classify_intent sets is_tool_result_turn=False for normal user messages."""
     from langchain_core.messages import HumanMessage
     from server.agent.classify_intent import classify_intent
 
     messages = [HumanMessage(content="viết test cho UserService")]
     state = {"messages": messages, "intent": ""}
-    result = classify_intent(state)
+    result = await classify_intent(state, vllm_client=None)
 
     assert result.get("is_tool_result_turn", False) is False
     assert result["intent"] == "unit_test"
 
 
-import pytest
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_tool_selector_structural_analysis():
-    """structural_analysis intent always emits get_project_skeleton."""
-    from unittest.mock import AsyncMock
-    from server.agent.tool_selector import tool_selector
-
-    mock_qdrant = AsyncMock()
-    mock_qdrant.count_by_file = AsyncMock(return_value=0)
-
-    state = {
-        "intent": "structural_analysis",
-        "mentioned_files": [],
-        "active_file": None,
-        "freshness_signal": False,
-        "is_tool_result_turn": False,
-        "tool_turns_used": 0,
-        "messages": [],
-    }
-    result = await tool_selector(state, qdrant=mock_qdrant)
-
-    assert len(result["pending_tool_calls"]) == 1
-    assert result["pending_tool_calls"][0]["function"]["name"] == "get_project_skeleton"
-    assert result["tool_turns_used"] == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_tool_selector_search():
-    """search intent always emits search_symbol regardless of Qdrant state."""
-    from unittest.mock import AsyncMock
-    from server.agent.tool_selector import tool_selector
-
-    mock_qdrant = AsyncMock()
-    state = {
-        "intent": "search",
-        "mentioned_files": [],
-        "active_file": None,
-        "freshness_signal": False,
-        "is_tool_result_turn": False,
-        "tool_turns_used": 0,
-        "messages": [type("M", (), {"content": "find UserService class"})()],
-    }
-    result = await tool_selector(state, qdrant=mock_qdrant)
-
-    assert len(result["pending_tool_calls"]) == 1
-    assert result["pending_tool_calls"][0]["function"]["name"] == "search_symbol"
-    args = result["pending_tool_calls"][0]["function"]["arguments"]
-    import json
-    assert "UserService" in json.loads(args)["name"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_tool_selector_code_gen_miss():
-    """code_gen + Qdrant miss + file mentioned -> [index_with_deps, read_file]."""
-    from unittest.mock import AsyncMock
-    from server.agent.tool_selector import tool_selector
-
-    mock_qdrant = AsyncMock()
-    mock_qdrant.count_by_file = AsyncMock(return_value=0)  # miss
-
-    state = {
-        "intent": "code_gen",
-        "mentioned_files": ["src/UserService.java"],
-        "active_file": None,
-        "freshness_signal": False,
-        "is_tool_result_turn": False,
-        "tool_turns_used": 0,
-        "messages": [],
-    }
-    result = await tool_selector(state, qdrant=mock_qdrant)
-
-    names = [c["function"]["name"] for c in result["pending_tool_calls"]]
-    assert "index_with_deps" in names
-    assert "read_file" in names
-    assert result["tool_turns_used"] == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_tool_selector_code_gen_hit_no_freshness():
-    """code_gen + hit + file mentioned, no freshness -> [read_file] only."""
-    from unittest.mock import AsyncMock
-    from server.agent.tool_selector import tool_selector
-
-    mock_qdrant = AsyncMock()
-    mock_qdrant.count_by_file = AsyncMock(return_value=10)  # hit
-
-    state = {
-        "intent": "code_gen",
-        "mentioned_files": ["src/UserService.java"],
-        "active_file": None,
-        "freshness_signal": False,
-        "is_tool_result_turn": False,
-        "tool_turns_used": 0,
-        "messages": [],
-    }
-    result = await tool_selector(state, qdrant=mock_qdrant)
-
-    names = [c["function"]["name"] for c in result["pending_tool_calls"]]
-    assert names == ["read_file"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_tool_selector_cap():
-    """tool_turns_used >= 1 always returns empty pending_tool_calls."""
-    from unittest.mock import AsyncMock
-    from server.agent.tool_selector import tool_selector
-
-    mock_qdrant = AsyncMock()
-    state = {
-        "intent": "structural_analysis",  # would normally emit tool
-        "mentioned_files": [],
-        "active_file": None,
-        "freshness_signal": False,
-        "is_tool_result_turn": False,
-        "tool_turns_used": 1,  # already used
-        "messages": [],
-    }
-    result = await tool_selector(state, qdrant=mock_qdrant)
-
-    assert result["pending_tool_calls"] == []
-    assert result["tool_turns_used"] == 1  # not incremented again
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_emit_tool_calls_sse_format():
-    """emit_tool_calls streams thinking comment + two-chunk tool_calls + DONE."""
-    import json
-    from server.agent.emit_tool_calls import emit_tool_calls
-
-    emitted = []
-
-    async def mock_sse_callback(event_type: str, content: str) -> None:
-        emitted.append((event_type, content))
-
-    tool_calls = [
-        {"index": 0, "id": "call_1", "type": "function",
-         "function": {"name": "index_with_deps", "arguments": '{"file_path": "A.java"}'}},
-    ]
-    state = {"pending_tool_calls": tool_calls}
-    result = await emit_tool_calls(state, sse_callback=mock_sse_callback)
-
-    # Node returns empty dict (pure side-effect)
-    assert result == {}
-
-    # Must have emitted thinking + tool_calls events
-    event_types = [e[0] for e in emitted]
-    assert "thinking" in event_types
-    assert "tool_calls" in event_types
-
-    # tool_calls content is JSON-serialized tool call list
-    tc_events = [e for e in emitted if e[0] == "tool_calls"]
-    assert len(tc_events) == 1
-    parsed = json.loads(tc_events[0][1])
-    assert parsed[0]["function"]["name"] == "index_with_deps"
+# Tests for tool_selector / emit_tool_calls were removed when those modules were
+# deleted in favor of the native tool-call flow in server/agent/generate.py.
+# See docs/superpowers/specs/2026-04-15-chat-completions-native-toolcall-design.md.
 
 
 def test_chat_message_accepts_null_content():
@@ -719,138 +560,6 @@ def test_chat_message_accepts_null_content():
     assert msg2.tool_call_id == "call_1"
 
 
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_graph_routes_to_emit_tool_calls():
-    """Graph routes to emit_tool_calls when pending_tool_calls is non-empty."""
-    from unittest.mock import AsyncMock, patch
-    from server.agent.graph import build_agent_graph
-    from langchain_core.messages import HumanMessage
-
-    mock_qdrant = AsyncMock()
-    mock_qdrant.count_by_file = AsyncMock(return_value=0)
-
-    emitted_events = []
-
-    async def mock_sse_callback(event_type, content):
-        emitted_events.append(event_type)
-
-    mock_vllm = AsyncMock()
-
-    with patch("server.agent.tool_selector.tool_selector") as mock_selector:
-        mock_selector.return_value = {
-            "pending_tool_calls": [{"index": 0, "id": "c1", "type": "function",
-                                     "function": {"name": "get_project_skeleton", "arguments": "{}"}}],
-            "tool_turns_used": 1,
-        }
-
-        agent = build_agent_graph(
-            vllm_client=mock_vllm,
-            model="test",
-            qdrant=mock_qdrant,
-            embedder=None,
-            sse_callback=mock_sse_callback,
-        )
-
-        result = await agent.ainvoke({
-            "messages": [HumanMessage(content="analyze architecture")],
-            "intent": "", "active_file": None, "mentioned_files": [], "freshness_signal": False,
-            "force_reindex": False, "rag_chunks": [], "rag_hit": False, "hash_verified": False,
-            "tool_results": [], "context_assembled": "", "draft": "", "emitted_steps": [],
-            "volatile_rejected": False, "pending_tool_calls": [], "is_tool_result_turn": False,
-            "tool_turns_used": 0,
-        })
-
-    assert "tool_calls" in emitted_events
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_graph_skips_to_rag_search():
-    """Graph completes without emitting tool_calls when pending_tool_calls is empty."""
-    from unittest.mock import AsyncMock, patch
-    from server.agent.graph import build_agent_graph
-    from langchain_core.messages import HumanMessage
-
-    mock_qdrant = AsyncMock()
-    mock_qdrant.count_by_file = AsyncMock(return_value=10)
-
-    emitted_events = []
-
-    async def mock_sse_callback(event_type, content):
-        emitted_events.append(event_type)
-
-    mock_vllm = AsyncMock()
-
-    with patch("server.agent.tool_selector.tool_selector") as mock_selector:
-        mock_selector.return_value = {"pending_tool_calls": [], "tool_turns_used": 0}
-
-        agent = build_agent_graph(
-            vllm_client=mock_vllm,
-            model="test",
-            qdrant=mock_qdrant,
-            embedder=None,
-            sse_callback=mock_sse_callback,
-        )
-
-        result = await agent.ainvoke({
-            "messages": [HumanMessage(content="explain this code")],
-            "intent": "", "active_file": None, "mentioned_files": [], "freshness_signal": False,
-            "force_reindex": False, "rag_chunks": [], "rag_hit": False, "hash_verified": False,
-            "tool_results": [], "context_assembled": "", "draft": "", "emitted_steps": [],
-            "volatile_rejected": False, "pending_tool_calls": [], "is_tool_result_turn": False,
-            "tool_turns_used": 0,
-        })
-
-    assert "tool_calls" not in emitted_events
-    assert isinstance(result, dict)
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason=_DEPRECATED_REASON)
-async def test_graph_turn2_skips_route_context():
-    """Turn 2 (is_tool_result_turn=True) skips route_context, goes classify_intent -> tool_selector -> rag_search."""
-    from unittest.mock import AsyncMock, patch
-    from server.agent.graph import build_agent_graph
-    from langchain_core.messages import HumanMessage, ToolMessage
-
-    mock_qdrant = AsyncMock()
-    mock_qdrant.count_by_file = AsyncMock(return_value=5)
-
-    async def mock_sse_callback(event_type, content):
-        pass
-
-    mock_vllm = AsyncMock()
-
-    with patch("server.agent.route_context.route_context") as mock_rc, \
-         patch("server.agent.tool_selector.tool_selector") as mock_ts:
-        mock_rc.return_value = {
-            "mentioned_files": [], "force_reindex": False, "freshness_signal": False,
-        }
-        mock_ts.return_value = {"pending_tool_calls": [], "tool_turns_used": 0}
-
-        agent = build_agent_graph(
-            vllm_client=mock_vllm,
-            model="test",
-            qdrant=mock_qdrant,
-            embedder=None,
-            sse_callback=mock_sse_callback,
-        )
-
-        result = await agent.ainvoke({
-            "messages": [
-                HumanMessage(content="generate tests for UserService"),
-                ToolMessage(content='{"chunks": 5}', tool_call_id="call_1"),
-            ],
-            "intent": "unit_test",
-            "active_file": None, "mentioned_files": [], "freshness_signal": False,
-            "force_reindex": False, "rag_chunks": [], "rag_hit": False, "hash_verified": False,
-            "tool_results": [], "context_assembled": "", "draft": "", "emitted_steps": [],
-            "volatile_rejected": False, "pending_tool_calls": [], "is_tool_result_turn": False,
-            "tool_turns_used": 0,
-        })
-
-    # route_context should NOT have been called on Turn 2
-    mock_rc.assert_not_called()
-    # tool_selector should have been called (and returned empty due to is_tool_result_turn)
-    mock_ts.assert_called_once()
+# Old graph-routing tests for tool_selector/emit_tool_calls were removed;
+# coverage now lives in tests/test_graph_routing_v2.py against the native
+# tool-call topology.

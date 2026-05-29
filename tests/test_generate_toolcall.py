@@ -55,6 +55,7 @@ async def test_generate_streams_content():
 
 @pytest.mark.asyncio
 async def test_generate_captures_tool_calls():
+    # Model returns "read_file" which gets mapped to "vtrip_read_file" via TOOL_NAME_MAP
     tc_delta = [{"index": 0, "id": "call_1", "type": "function",
                  "function": {"name": "read_file", "arguments": '{"path":"/a"}'}}]
     d1 = MagicMock(content=None, tool_calls=tc_delta)
@@ -67,7 +68,8 @@ async def test_generate_captures_tool_calls():
     result = await generate(state, vllm_client=vllm, model="m", sse_callback=None)
 
     assert result["pending_tool_calls"]
-    assert result["pending_tool_calls"][0]["function"]["name"] == "read_file"
+    # Tool name is mapped from "read_file" to "vtrip_read_file"
+    assert result["pending_tool_calls"][0]["function"]["name"] == "vtrip_read_file"
 
 
 @pytest.mark.asyncio
@@ -88,12 +90,15 @@ async def test_generate_forwards_client_tools_to_vllm():
     await generate(state, vllm_client=vllm, model="m", sse_callback=None)
 
     call_kwargs = vllm.chat.completions.create.call_args.kwargs
-    assert call_kwargs["tools"] == client_tools
+    # MCP_TOOLS are prepended, client_tools appended (if not duplicating MCP names)
+    from server.agent.generate import MCP_TOOLS
+    assert call_kwargs["tools"] == MCP_TOOLS + client_tools
     assert call_kwargs["stream"] is True
 
 
 @pytest.mark.asyncio
-async def test_generate_no_tools_omits_tools_key():
+async def test_generate_with_empty_client_tools_still_has_mcp_tools():
+    """When client_tools is empty, MCP_TOOLS are still included."""
     d1 = MagicMock(content="ok", tool_calls=None)
     stream = FakeStream([FakeChunk(d1, finish_reason="stop")])
     vllm = MagicMock()
@@ -103,4 +108,6 @@ async def test_generate_no_tools_omits_tools_key():
     await generate(state, vllm_client=vllm, model="m", sse_callback=None)
 
     call_kwargs = vllm.chat.completions.create.call_args.kwargs
-    assert "tools" not in call_kwargs
+    # MCP_TOOLS are always included
+    from server.agent.generate import MCP_TOOLS
+    assert call_kwargs["tools"] == MCP_TOOLS

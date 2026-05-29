@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 
 from server.agent.prompts import load_prompt
 from server.agent.state import AgentState
+from server.utils.json_parser import extract_json_object
 
 logger = logging.getLogger("server.agent.review_analyze")
 
@@ -121,34 +122,17 @@ def _split_diff_by_file(diff: str, max_chars: int = MAX_DIFF_CHARS_PER_FILE) -> 
         path = m.group(1).strip() if m else "<unknown>"
         added = _extract_added_lines(part)
         annotated = _annotate_diff_lines(part)
+        skipped = False
+        reason = None
         if len(annotated) > max_chars:
             annotated = annotated[:max_chars] + f"\n... [diff truncated, original {len(annotated)} chars]\n"
+            skipped = True
+            reason = "too_large"
         chunks.append({
             "path": path, "diff": annotated, "added_lines": added,
-            "skipped": False, "reason": None,
+            "skipped": skipped, "reason": reason,
         })
     return chunks
-
-
-def _parse_json_object(text: str) -> dict | None:
-    stripped = text.strip()
-    # Strip <tool_call>...</tool_call> or <tools>...</tools> wrappers Qwen models love
-    tag = re.match(r"^<(tool_call|tools)>\s*(.*?)\s*</\1>\s*$", stripped, re.DOTALL)
-    if tag:
-        stripped = tag.group(2).strip()
-    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL)
-    if fence:
-        stripped = fence.group(1).strip()
-    try:
-        obj = json.loads(stripped)
-    except Exception:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    # If model wrapped output in tool_call envelope {name, arguments}, unwrap
-    if set(obj.keys()) == {"name", "arguments"} and isinstance(obj.get("arguments"), dict):
-        return obj["arguments"]
-    return obj
 
 
 async def _call_llm(client: AsyncOpenAI, model: str, system: str, user: str) -> str:
@@ -194,7 +178,7 @@ async def _analyze_once(client: AsyncOpenAI, model: str, system: str, user: str)
         except Exception as exc:
             logger.error("review_analyze LLM error: %s", exc)
             return None
-        parsed = _parse_json_object(raw)
+        parsed = extract_json_object(raw)
         if parsed is not None:
             return parsed
         logger.warning("review_analyze invalid JSON (attempt %d), raw=%s", attempt + 1, raw[:200])
@@ -233,8 +217,9 @@ async def review_analyze(state: AgentState, vllm_client: AsyncOpenAI, model: str
         all_findings: list[dict] = []
         summaries: list[str] = []
 
-        for chunk in chunks:
-            user = user_tpl.format(
+        # Build user prompts for all chunks
+        user_prompts = [
+            user_tpl.format(
                 title=diff_payload.get("title", ""),
                 source_branch=diff_payload.get("source_branch", ""),
                 target_branch=diff_payload.get("target_branch", ""),
@@ -242,8 +227,17 @@ async def review_analyze(state: AgentState, vllm_client: AsyncOpenAI, model: str
                 file_list=chunk["path"],
                 diff=chunk["diff"],
             )
-            result = await _analyze_once(vllm_client, model, system, user)
-            if result is None:
+            for chunk in chunks
+        ]
+
+        # Parallel LLM calls for all chunks
+        results = await asyncio.gather(
+            *[_analyze_once(vllm_client, model, system, user) for user in user_prompts],
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if result is None or isinstance(result, Exception):
                 continue
             summaries.append(result.get("summary", ""))
             all_findings.extend(_normalise_findings(result.get("findings", [])))
