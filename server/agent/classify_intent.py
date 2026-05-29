@@ -15,6 +15,7 @@ from langchain_core.messages import ToolMessage
 
 from server.agent.rules_loader import RulesLoader, get_rules_loader
 from server.agent.state import AgentState
+from server.utils.sanitize import sanitize_user_input
 
 logger = logging.getLogger("server.classify_intent")
 
@@ -332,6 +333,12 @@ async def classify_intent(
             "confidence": 0.3,
             "reasoning": "No user message found, using default",
         }
+
+    # Step 2.5: Sanitize user input (prompt injection defense)
+    sanitize_result = sanitize_user_input(text)
+    text = sanitize_result.text
+    if sanitize_result.jailbreak_detected:
+        logger.warning("classify_intent: jailbreak pattern detected, proceeding with caution")
 
     # Step 3: Load rules
     rules_loader = get_rules_loader()

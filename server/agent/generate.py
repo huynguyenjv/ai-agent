@@ -17,6 +17,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from server.agent.state import AgentState
+from server.utils.sanitize import sanitize_tool_output
 
 logger = logging.getLogger("server.agent.generate")
 

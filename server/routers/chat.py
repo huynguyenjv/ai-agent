@@ -33,6 +33,7 @@ from server.metrics.prometheus import record_request, record_tokens, ACTIVE_REQU
 from server.rate_limit import get_rate_limiter
 from server.session import get_session_store
 from server.utils.content import normalize_content
+from server.utils.sanitize import sanitize_user_input, sanitize_tool_output
 from server.streaming.sse import (
     thinking_event,
     tool_error_event,
@@ -113,10 +114,13 @@ def _convert_messages(request_messages: list[ChatMessage]):
     for msg in request_messages:
         text = normalize_content(msg.content)
         if msg.role == "user":
-            out.append(HumanMessage(content=text))
+            # Sanitize user input for prompt injection defense
+            sanitized = sanitize_user_input(text)
+            out.append(HumanMessage(content=sanitized.text))
         elif msg.role == "tool":
+            # Sanitize tool output to prevent injection via tool results
             out.append(ToolMessage(
-                content=text,
+                content=sanitize_tool_output(text),
                 tool_call_id=msg.tool_call_id or "",
             ))
         elif msg.role == "assistant":

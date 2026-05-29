@@ -248,9 +248,10 @@ def run_command(
     logger.info("run_command: %s (cwd=%s)", command, cwd)
 
     try:
+        # SECURITY: Use shell=False with parsed command list to prevent injection
         result = subprocess.run(
-            command,
-            shell=True,
+            parts,  # Already parsed via shlex.split()
+            shell=False,
             cwd=cwd,
             capture_output=True,
             text=True,
