@@ -105,7 +105,7 @@ async def plan_task(
         return {
             "complexity": "simple",
             "task_plan": None,
-            "plan_steps": [],
+            "planner_steps": [],
             "current_step": 0,
         }
 
@@ -115,7 +115,7 @@ async def plan_task(
         return {
             "complexity": "simple",
             "task_plan": None,
-            "plan_steps": [],
+            "planner_steps": [],
             "current_step": 0,
         }
 
@@ -125,7 +125,7 @@ async def plan_task(
         return {
             "complexity": "simple",
             "task_plan": None,
-            "plan_steps": [],
+            "planner_steps": [],
             "current_step": 0,
         }
 
@@ -158,7 +158,7 @@ async def plan_task(
         return {
             "complexity": plan["complexity"],
             "task_plan": plan,
-            "plan_steps": plan.get("steps", []),
+            "planner_steps": plan.get("steps", []),
             "current_step": 0,
             "planner_reasoning": plan.get("reasoning", ""),
         }
@@ -168,7 +168,7 @@ async def plan_task(
         return {
             "complexity": "simple",
             "task_plan": None,
-            "plan_steps": [],
+            "planner_steps": [],
             "current_step": 0,
             "planner_error": str(e),
         }

@@ -2,14 +2,16 @@
 
 Flow:
   classify_intent
-    ├─ is_tool_result_turn=True → generate → post_process → END
+    ├─ is_tool_result_turn=True → generate → verify → post_process → END
     └─ else → route_context
          ├─ volatile_rejected → reject_volatile → END
          └─ else → <intent router>
               ├─ code_review → review_analyze → review_format → post_process → END
-              └─ else → generate → post_process → END
-
-rag_search / plan_steps only wired when enable_rag=True (pending RAG redesign).
+              └─ else → planner
+                   ├─ simple → generate → verify → post_process → END
+                   └─ complex → generate → verify → critic
+                        ├─ passed → post_process → END
+                        └─ failed → generate (retry with feedback)
 
 Note: `code_review` here is only used by chat completions (Continue). The
 GitLab MR runner calls /review/analyze which bypasses the graph entirely.
@@ -30,6 +32,8 @@ from server.agent.post_process import post_process
 from server.agent.review_analyze import review_analyze
 from server.agent.review_format import review_format
 from server.agent.verify_result import verify_result
+from server.agent.planner import plan_task
+from server.agent.critic import critique_output
 
 _DEFAULT_VOLATILE_RESPONSE = (
     "Xin lỗi, tính năng này chưa được hỗ trợ trong phiên bản hiện tại (V1). "
@@ -56,14 +60,40 @@ def _route_after_context(state: AgentState) -> str:
         return "reject_volatile"
     if state.get("intent") == "code_review":
         return "review_analyze"
+    return "planner"
+
+
+def _route_after_planner(state: AgentState) -> str:
+    """Route after planning: complex tasks are marked for critic review."""
+    # Always proceed to generate, but complexity is tracked in state
     return "generate"
 
 
 def _route_after_verify(state: AgentState) -> str:
-    """Route after verification: retry generate or proceed to post_process."""
-    if state.get("verification_passed", True):
+    """Route after verification: retry, critic, or post_process."""
+    if not state.get("verification_passed", True):
+        # Verification failed - retry generate
+        return "generate"
+
+    # For complex tasks, go to critic for quality review
+    if state.get("complexity") == "complex":
+        return "critic"
+
+    return "post_process"
+
+
+def _route_after_critic(state: AgentState) -> str:
+    """Route after critic: retry if quality issues, else post_process."""
+    if state.get("critic_passed", True):
         return "post_process"
-    # Verification failed - retry generate with context about the failure
+
+    # Critic found issues - check retry count
+    critic_retries = state.get("critic_retries", 0)
+    if critic_retries >= 2:
+        # Max retries reached, proceed anyway
+        return "post_process"
+
+    # Retry with critic feedback
     return "generate"
 
 
@@ -89,10 +119,18 @@ def build_agent_graph(
     graph.add_node("route_context", _this.route_context)
     graph.add_node("reject_volatile", _reject_volatile)
     graph.add_node(
+        "planner",
+        partial(_this.plan_task, vllm_client=vllm_client, model=model),
+    )
+    graph.add_node(
         "generate",
         partial(_this.generate, vllm_client=vllm_client, model=model, sse_callback=sse_callback),
     )
     graph.add_node("verify_result", _this.verify_result)
+    graph.add_node(
+        "critic",
+        partial(_this.critique_output, vllm_client=vllm_client, model=model),
+    )
     graph.add_node("post_process", _this.post_process)
 
     graph.add_node(
@@ -115,7 +153,7 @@ def build_agent_graph(
         {
             "reject_volatile": "reject_volatile",
             "review_analyze": "review_analyze",
-            "generate": "generate",
+            "planner": "planner",
         },
     )
 
@@ -124,13 +162,28 @@ def build_agent_graph(
     graph.add_edge("review_analyze", "review_format")
     graph.add_edge("review_format", "post_process")
 
-    # Agentic loop: generate → verify → (retry or post_process)
+    # Planner → Generate
+    graph.add_conditional_edges(
+        "planner",
+        _route_after_planner,
+        {"generate": "generate"},
+    )
+
+    # Agentic loop: generate → verify → (retry, critic, or post_process)
     graph.add_edge("generate", "verify_result")
     graph.add_conditional_edges(
         "verify_result",
         _route_after_verify,
+        {"generate": "generate", "critic": "critic", "post_process": "post_process"},
+    )
+
+    # Critic → (retry or post_process)
+    graph.add_conditional_edges(
+        "critic",
+        _route_after_critic,
         {"generate": "generate", "post_process": "post_process"},
     )
+
     graph.add_edge("post_process", END)
 
     if enable_rag:

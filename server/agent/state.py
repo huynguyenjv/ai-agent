@@ -48,3 +48,17 @@ class AgentState(TypedDict, total=False):
     verification_passed: bool            # True if verify_result passed
     retry_reason: str                    # Reason for retry if verification failed
     retry_count: int                     # Number of retries attempted
+
+    # --- Planner (Phase 5) ---
+    complexity: str                      # "simple" | "complex"
+    task_plan: dict | None               # Full plan from planner
+    planner_steps: list[dict]            # Steps to execute
+    current_step: int                    # Current step index
+    planner_reasoning: str               # Why this complexity
+
+    # --- Critic (Phase 5) ---
+    critic_passed: bool                  # True if critic approved
+    critic_score: int                    # 0-10 score
+    critic_issues: list[dict]            # Issues found
+    critic_feedback: str                 # Feedback for retry
+    critic_retries: int                  # Number of critic retries
