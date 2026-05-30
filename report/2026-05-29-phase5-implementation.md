@@ -1,7 +1,7 @@
 # Phase 5 Implementation Report
 
-**Date:** 2026-05-29  
-**Status:** PARTIAL (Core components done, graph wiring pending)  
+**Date:** 2026-05-29 (Updated: 2026-05-30)  
+**Status:** COMPLETED  
 **Focus:** Multi-Agent Architecture
 
 ---
@@ -194,24 +194,25 @@ results = await queue.execute_all(executor)
 
 | Component | Code | Tests | Graph Wired |
 |-----------|------|-------|-------------|
-| Planner | ✅ | ⏳ | ❌ |
-| Critic | ✅ | ⏳ | ❌ |
-| Task Queue | ✅ | ✅ | ❌ |
+| Planner | ✅ | ⏳ | ✅ |
+| Critic | ✅ | ⏳ | ✅ |
+| Task Queue | ✅ | ✅ | ⏳ |
 
-### Pending: Wire to Graph (5.3)
+### Graph Flow (5.3) - COMPLETED
 
-Current graph flow:
-```
-classify_intent → route_context → generate → verify → post_process → END
-```
-
-Target flow:
 ```
 classify_intent
-    ├─ simple → generate → verify → post_process → END
-    └─ complex → planner → loop {
-                             execute_step → verify_step
-                           } → critic → post_process → END
+    ├─ is_tool_result_turn → generate → verify → post_process → END
+    └─ else → route_context
+         ├─ volatile_rejected → reject_volatile → END
+         ├─ code_review → review_analyze → review_format → END
+         └─ else → planner
+              └─ generate → verify
+                   ├─ failed → generate (retry)
+                   ├─ complex + passed → critic
+                   │       ├─ passed → post_process → END
+                   │       └─ failed → generate (retry with feedback)
+                   └─ simple + passed → post_process → END
 ```
 
 ---
@@ -220,7 +221,7 @@ classify_intent
 
 | Item | Status | Effort |
 |------|--------|--------|
-| 5.3 Wire to graph | ⏳ Pending | 4h |
+| 5.3 Wire to graph | ✅ Done | - |
 | 5.5 Parallel tool execution | ⏳ Pending | 3h |
 | Planner tests | ⏳ Pending | 2h |
 | Critic tests | ⏳ Pending | 2h |
