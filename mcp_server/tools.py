@@ -690,6 +690,7 @@ TEST_COMMANDS = {
     "jest": "npx jest --colors",
     "mocha": "npx mocha",
     "junit": "mvn test -Dtest=",
+    "gradle": "./gradlew test",
     "go": "go test -v",
     "cargo": "cargo test",
 }
@@ -733,6 +734,11 @@ def _detect_test_framework(repo_path: str) -> str:
     # Check for Cargo
     if os.path.exists(os.path.join(repo_path, "Cargo.toml")):
         return "cargo"
+
+    # Check for Gradle
+    if os.path.exists(os.path.join(repo_path, "build.gradle")) or \
+       os.path.exists(os.path.join(repo_path, "build.gradle.kts")):
+        return "gradle"
 
     # Check for Maven/JUnit
     if os.path.exists(os.path.join(repo_path, "pom.xml")):
@@ -827,6 +833,24 @@ def _parse_test_output(output: str, framework: str) -> dict:
             result["skipped"] = int(match.group(1))
         result["total"] = result["passed"] + result["failed"] + result["skipped"]
 
+    elif framework == "gradle":
+        # Parse Gradle test output: "5 tests completed, 2 failed"
+        # Or: "BUILD SUCCESSFUL" with test counts
+        match = re.search(r"(\d+) tests completed", output)
+        if match:
+            result["total"] = int(match.group(1))
+        match = re.search(r"(\d+) failed", output)
+        if match:
+            result["failed"] = int(match.group(1))
+        match = re.search(r"(\d+) skipped", output)
+        if match:
+            result["skipped"] = int(match.group(1))
+        result["passed"] = result["total"] - result["failed"] - result["skipped"]
+
+        # Extract failure details
+        failures = re.findall(r"(?:FAILED|> .+) > (\w+)", output)
+        result["failure_details"] = failures
+
     return result
 
 
@@ -868,6 +892,10 @@ def run_tests(
             # Extract class name from file
             class_name = os.path.splitext(os.path.basename(test_file))[0]
             cmd += class_name
+        elif framework == "gradle":
+            # Gradle: --tests "ClassName" or --tests "ClassName.methodName"
+            class_name = os.path.splitext(os.path.basename(test_file))[0]
+            cmd += f" --tests '{class_name}'"
         elif framework == "go":
             cmd += f" ./{os.path.dirname(test_file)}/..."
 
@@ -876,6 +904,8 @@ def run_tests(
             cmd += f" -k '{test_name}'"
         elif framework == "jest":
             cmd += f" -t '{test_name}'"
+        elif framework == "gradle":
+            cmd += f" --tests '*{test_name}*'"
         elif framework == "go":
             cmd += f" -run '{test_name}'"
 

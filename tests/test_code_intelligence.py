@@ -34,6 +34,14 @@ class TestTestFrameworkDetection:
         (tmp_path / "Cargo.toml").write_text("[package]")
         assert _detect_test_framework(str(tmp_path)) == "cargo"
 
+    def test_detect_gradle(self, tmp_path):
+        (tmp_path / "build.gradle").write_text("plugins { id 'java' }")
+        assert _detect_test_framework(str(tmp_path)) == "gradle"
+
+    def test_detect_gradle_kts(self, tmp_path):
+        (tmp_path / "build.gradle.kts").write_text("plugins { java }")
+        assert _detect_test_framework(str(tmp_path)) == "gradle"
+
 
 class TestParseTestOutput:
     """Tests for test output parsing."""
@@ -84,6 +92,14 @@ class TestParseTestOutput:
         assert result["passed"] == 5
         assert result["failed"] == 2
         assert result["skipped"] == 1
+
+    def test_parse_gradle_tests(self):
+        output = "10 tests completed, 2 failed, 1 skipped"
+        result = _parse_test_output(output, "gradle")
+        assert result["total"] == 10
+        assert result["failed"] == 2
+        assert result["skipped"] == 1
+        assert result["passed"] == 7
 
 
 class TestLinterDetection:
