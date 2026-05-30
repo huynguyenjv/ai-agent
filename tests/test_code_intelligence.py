@@ -70,6 +70,21 @@ class TestParseTestOutput:
         assert result["passed"] == 10
         assert result["failed"] == 2
 
+    def test_parse_junit_tests(self):
+        output = "Tests run: 10, Failures: 2, Errors: 1, Skipped: 1"
+        result = _parse_test_output(output, "junit")
+        assert result["total"] == 10
+        assert result["passed"] == 6  # 10 - 2 - 1 - 1
+        assert result["failed"] == 3  # 2 failures + 1 error
+        assert result["skipped"] == 1
+
+    def test_parse_mocha_tests(self):
+        output = "  5 passing (2s)\n  2 failing\n  1 pending"
+        result = _parse_test_output(output, "mocha")
+        assert result["passed"] == 5
+        assert result["failed"] == 2
+        assert result["skipped"] == 1
+
 
 class TestLinterDetection:
     """Tests for linter detection."""

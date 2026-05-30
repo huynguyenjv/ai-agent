@@ -797,6 +797,36 @@ def _parse_test_output(output: str, framework: str) -> dict:
             result["failed"] = int(match.group(2))
             result["total"] = result["passed"] + result["failed"]
 
+    elif framework == "junit":
+        # Parse Maven/JUnit output: "Tests run: 5, Failures: 1, Errors: 0, Skipped: 1"
+        match = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)", output)
+        if match:
+            total = int(match.group(1))
+            failures = int(match.group(2))
+            errors = int(match.group(3))
+            skipped = int(match.group(4))
+            result["total"] = total
+            result["failed"] = failures + errors
+            result["skipped"] = skipped
+            result["passed"] = total - failures - errors - skipped
+
+        # Extract failure details from Maven output
+        failures = re.findall(r"(?:FAILURE!|Failed tests:)\s*([\w.]+)", output)
+        result["failure_details"] = failures
+
+    elif framework == "mocha":
+        # Parse Mocha output: "5 passing", "2 failing"
+        match = re.search(r"(\d+) passing", output)
+        if match:
+            result["passed"] = int(match.group(1))
+        match = re.search(r"(\d+) failing", output)
+        if match:
+            result["failed"] = int(match.group(1))
+        match = re.search(r"(\d+) pending", output)
+        if match:
+            result["skipped"] = int(match.group(1))
+        result["total"] = result["passed"] + result["failed"] + result["skipped"]
+
     return result
 
 
