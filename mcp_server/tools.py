@@ -679,3 +679,360 @@ def git_branch(repo_path: str, name: str | None = None, checkout: bool = False) 
         return {"error": result.stderr}
 
     return {"success": True, "branch": name, "action": "created" if not checkout else "created_and_checkout"}
+
+
+# =============================================================================
+# Test Execution Tool (Phase 7.2)
+# =============================================================================
+
+TEST_COMMANDS = {
+    "pytest": "pytest --tb=short -v",
+    "jest": "npx jest --colors",
+    "mocha": "npx mocha",
+    "junit": "mvn test -Dtest=",
+    "go": "go test -v",
+    "cargo": "cargo test",
+}
+
+TEST_FILE_PATTERNS = {
+    "pytest": ["test_*.py", "*_test.py", "tests/*.py"],
+    "jest": ["*.test.js", "*.test.ts", "*.spec.js", "*.spec.ts"],
+    "mocha": ["test/*.js", "*.test.js"],
+    "junit": ["*Test.java", "*Tests.java"],
+    "go": ["*_test.go"],
+    "cargo": ["tests/*.rs"],
+}
+
+
+def _detect_test_framework(repo_path: str) -> str:
+    """Auto-detect test framework from project files."""
+    # Check for pytest
+    if os.path.exists(os.path.join(repo_path, "pytest.ini")) or \
+       os.path.exists(os.path.join(repo_path, "pyproject.toml")):
+        return "pytest"
+
+    # Check for Jest
+    pkg_json = os.path.join(repo_path, "package.json")
+    if os.path.exists(pkg_json):
+        try:
+            with open(pkg_json, "r") as f:
+                import json
+                pkg = json.load(f)
+                if "jest" in pkg.get("devDependencies", {}) or \
+                   "jest" in pkg.get("dependencies", {}):
+                    return "jest"
+                if "mocha" in pkg.get("devDependencies", {}):
+                    return "mocha"
+        except Exception:
+            pass
+
+    # Check for Go
+    if os.path.exists(os.path.join(repo_path, "go.mod")):
+        return "go"
+
+    # Check for Cargo
+    if os.path.exists(os.path.join(repo_path, "Cargo.toml")):
+        return "cargo"
+
+    # Check for Maven/JUnit
+    if os.path.exists(os.path.join(repo_path, "pom.xml")):
+        return "junit"
+
+    # Default to pytest
+    return "pytest"
+
+
+def _parse_test_output(output: str, framework: str) -> dict:
+    """Parse test output to extract results."""
+    import re
+
+    result = {
+        "total": 0,
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "failure_details": [],
+    }
+
+    if framework == "pytest":
+        # Parse pytest summary line: "5 passed, 2 failed, 1 skipped"
+        match = re.search(r"(\d+) passed", output)
+        if match:
+            result["passed"] = int(match.group(1))
+        match = re.search(r"(\d+) failed", output)
+        if match:
+            result["failed"] = int(match.group(1))
+        match = re.search(r"(\d+) skipped", output)
+        if match:
+            result["skipped"] = int(match.group(1))
+        result["total"] = result["passed"] + result["failed"] + result["skipped"]
+
+        # Extract failure details
+        failures = re.findall(r"FAILED ([\w/.:]+)", output)
+        result["failure_details"] = failures
+
+    elif framework == "jest":
+        # Parse Jest output
+        match = re.search(r"Tests:\s+(\d+) passed", output)
+        if match:
+            result["passed"] = int(match.group(1))
+        match = re.search(r"Tests:\s+\d+ passed,\s+(\d+) failed", output)
+        if match:
+            result["failed"] = int(match.group(1))
+        result["total"] = result["passed"] + result["failed"]
+
+    elif framework == "go":
+        # Parse Go test output
+        passed = output.count("--- PASS:")
+        failed = output.count("--- FAIL:")
+        result["passed"] = passed
+        result["failed"] = failed
+        result["total"] = passed + failed
+
+    elif framework == "cargo":
+        # Parse Cargo test output
+        match = re.search(r"(\d+) passed; (\d+) failed", output)
+        if match:
+            result["passed"] = int(match.group(1))
+            result["failed"] = int(match.group(2))
+            result["total"] = result["passed"] + result["failed"]
+
+    return result
+
+
+def run_tests(
+    repo_path: str,
+    test_file: str | None = None,
+    test_name: str | None = None,
+    framework: str = "auto",
+    timeout: int = 300,
+) -> dict:
+    """Run tests and parse results.
+
+    Args:
+        repo_path: Repository root path
+        test_file: Specific test file to run (optional)
+        test_name: Specific test name/pattern (optional)
+        framework: Test framework (auto, pytest, jest, junit, go, cargo)
+        timeout: Test timeout in seconds
+
+    Returns:
+        {stdout, stderr, exit_code, tests_run, tests_passed, tests_failed, failures}
+    """
+    # Auto-detect framework
+    if framework == "auto":
+        framework = _detect_test_framework(repo_path)
+
+    if framework not in TEST_COMMANDS:
+        return {"error": f"Unsupported test framework: {framework}"}
+
+    # Build command
+    cmd = TEST_COMMANDS[framework]
+
+    if test_file:
+        if framework == "pytest":
+            cmd += f" {test_file}"
+        elif framework == "jest":
+            cmd += f" {test_file}"
+        elif framework == "junit":
+            # Extract class name from file
+            class_name = os.path.splitext(os.path.basename(test_file))[0]
+            cmd += class_name
+        elif framework == "go":
+            cmd += f" ./{os.path.dirname(test_file)}/..."
+
+    if test_name:
+        if framework == "pytest":
+            cmd += f" -k '{test_name}'"
+        elif framework == "jest":
+            cmd += f" -t '{test_name}'"
+        elif framework == "go":
+            cmd += f" -run '{test_name}'"
+
+    logger.info("run_tests: %s (framework=%s)", cmd, framework)
+
+    # Run tests
+    result = run_command(repo_path, cmd, timeout=timeout)
+
+    if "error" in result and "exit_code" not in result:
+        return result
+
+    # Parse output
+    stdout = result.get("stdout", "")
+    parsed = _parse_test_output(stdout, framework)
+
+    return {
+        **result,
+        "framework": framework,
+        "tests_run": parsed["total"],
+        "tests_passed": parsed["passed"],
+        "tests_failed": parsed["failed"],
+        "tests_skipped": parsed.get("skipped", 0),
+        "failures": parsed["failure_details"],
+    }
+
+
+# =============================================================================
+# Linting Tool (Phase 7.3)
+# =============================================================================
+
+LINT_COMMANDS = {
+    "ruff": "ruff check",
+    "flake8": "flake8",
+    "pylint": "pylint",
+    "eslint": "npx eslint",
+    "prettier": "npx prettier --check",
+    "golint": "golint",
+    "gofmt": "gofmt -l",
+    "rustfmt": "cargo fmt --check",
+}
+
+
+def _detect_linter(repo_path: str) -> str:
+    """Auto-detect linter from project files."""
+    # Python linters
+    if os.path.exists(os.path.join(repo_path, "ruff.toml")) or \
+       os.path.exists(os.path.join(repo_path, ".ruff.toml")):
+        return "ruff"
+
+    pyproject = os.path.join(repo_path, "pyproject.toml")
+    if os.path.exists(pyproject):
+        try:
+            with open(pyproject, "r") as f:
+                content = f.read()
+                if "[tool.ruff]" in content:
+                    return "ruff"
+        except Exception:
+            pass
+
+    if os.path.exists(os.path.join(repo_path, ".flake8")):
+        return "flake8"
+
+    # JS/TS linters
+    if os.path.exists(os.path.join(repo_path, ".eslintrc.js")) or \
+       os.path.exists(os.path.join(repo_path, ".eslintrc.json")):
+        return "eslint"
+
+    # Go
+    if os.path.exists(os.path.join(repo_path, "go.mod")):
+        return "gofmt"
+
+    # Rust
+    if os.path.exists(os.path.join(repo_path, "Cargo.toml")):
+        return "rustfmt"
+
+    # Default
+    return "ruff"
+
+
+def _parse_lint_output(output: str, linter: str) -> list[dict]:
+    """Parse linter output to extract issues."""
+    import re
+
+    issues = []
+
+    if linter in ("ruff", "flake8", "pylint"):
+        # Format: file.py:10:5: E501 line too long
+        pattern = r"([^:]+):(\d+):(\d+): (\w+) (.+)"
+        for match in re.finditer(pattern, output):
+            issues.append({
+                "file": match.group(1),
+                "line": int(match.group(2)),
+                "column": int(match.group(3)),
+                "code": match.group(4),
+                "message": match.group(5),
+            })
+
+    elif linter == "eslint":
+        # Format: file.js:10:5: error/warning message (rule)
+        pattern = r"([^:]+):(\d+):(\d+): (error|warning) (.+) \((.+)\)"
+        for match in re.finditer(pattern, output):
+            issues.append({
+                "file": match.group(1),
+                "line": int(match.group(2)),
+                "column": int(match.group(3)),
+                "severity": match.group(4),
+                "message": match.group(5),
+                "rule": match.group(6),
+            })
+
+    elif linter in ("gofmt", "golint"):
+        # gofmt just lists files that need formatting
+        for line in output.strip().split("\n"):
+            if line.strip():
+                issues.append({
+                    "file": line.strip(),
+                    "message": "needs formatting",
+                })
+
+    return issues
+
+
+def lint_code(
+    repo_path: str,
+    file_path: str | None = None,
+    fix: bool = False,
+    linter: str = "auto",
+) -> dict:
+    """Run linter and return issues.
+
+    Args:
+        repo_path: Repository root path
+        file_path: Specific file to lint (optional)
+        fix: Auto-fix issues if supported
+        linter: Linter to use (auto, ruff, flake8, eslint, etc.)
+
+    Returns:
+        {linter, issues, fixed, stdout, stderr}
+    """
+    # Auto-detect linter
+    if linter == "auto":
+        linter = _detect_linter(repo_path)
+
+    if linter not in LINT_COMMANDS:
+        return {"error": f"Unsupported linter: {linter}"}
+
+    # Build command
+    cmd = LINT_COMMANDS[linter]
+
+    if fix:
+        if linter == "ruff":
+            cmd += " --fix"
+        elif linter == "eslint":
+            cmd += " --fix"
+        elif linter == "prettier":
+            cmd = cmd.replace("--check", "--write")
+        elif linter == "gofmt":
+            cmd = "gofmt -w"
+        elif linter == "rustfmt":
+            cmd = "cargo fmt"
+
+    if file_path:
+        cmd += f" {file_path}"
+    else:
+        # Lint common directories
+        if linter in ("ruff", "flake8", "pylint"):
+            cmd += " ."
+        elif linter == "eslint":
+            cmd += " src/"
+
+    logger.info("lint_code: %s (linter=%s, fix=%s)", cmd, linter, fix)
+
+    result = run_command(repo_path, cmd, timeout=120)
+
+    if "error" in result and "exit_code" not in result:
+        return result
+
+    # Parse issues
+    stdout = result.get("stdout", "")
+    issues = _parse_lint_output(stdout, linter)
+
+    return {
+        "linter": linter,
+        "issues": issues,
+        "issue_count": len(issues),
+        "fixed": fix,
+        "stdout": stdout,
+        "stderr": result.get("stderr", ""),
+        "exit_code": result.get("exit_code", 0),
+    }
