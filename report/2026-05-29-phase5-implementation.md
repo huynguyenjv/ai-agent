@@ -217,14 +217,29 @@ classify_intent
 
 ---
 
-## 7. Remaining Phase 5 Items
+## 7. Phase 5 Completion Status
 
-| Item | Status | Effort |
+| Item | Status | Commit |
 |------|--------|--------|
-| 5.3 Wire to graph | ✅ Done | - |
-| 5.5 Parallel tool execution | ⏳ Pending | 3h |
-| Planner tests | ⏳ Pending | 2h |
-| Critic tests | ⏳ Pending | 2h |
+| 5.1 Planner Agent | ✅ Done | `8f68698` |
+| 5.2 Critic Agent | ✅ Done | `8f68698` |
+| 5.3 Wire to graph | ✅ Done | `54b27b8` |
+| 5.4 Task Queue | ✅ Done | `8f68698` |
+| 5.5 Parallel tool execution | ✅ Done | `a7032cf` |
+
+### 5.5 Parallel Tool Execution
+
+**File:** `server/agent/parallel_tools.py`
+
+| Tool Type | Execution | Examples |
+|-----------|-----------|----------|
+| Read-only | Parallel | read_file, search_symbol, git_status |
+| Write | Sequential | apply_edits, run_command, git_commit |
+
+```python
+# Usage
+results = await execute_tools_parallel(tool_calls, executor, max_parallel=5)
+```
 
 ---
 
