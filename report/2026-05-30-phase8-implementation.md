@@ -226,18 +226,48 @@ embedding_stats = get_embedding_cache().stats()
 
 ---
 
-## 8. Remaining Phase 8 Items
+## 8. Phase 8 Completion Status
 
-| Item | Status |
-|------|--------|
-| 8.1 Smart Context Selection | ✅ Done |
-| 8.2 Conversation Summarization | ✅ Done |
-| 8.3 Wire Embedding Cache | ⏳ Already exists |
-| 8.4 LLM Response Caching | ✅ Done |
-| 8.5 RAG Result Caching | ✅ Done |
-| 8.6 Async File I/O | ⏳ Lower priority |
+| Item | Status | File |
+|------|--------|------|
+| 8.1 Smart Context Selection | ✅ Done | `context_builder.py` |
+| 8.2 Conversation Summarization | ✅ Done | `summarize.py` |
+| 8.3 Wire Embedding Cache | ✅ Already exists | `cache.py` |
+| 8.4 LLM Response Caching | ✅ Done | `cache.py` |
+| 8.5 RAG Result Caching | ✅ Done | `cache.py` |
+| 8.6 Async File I/O | ✅ Done | `async_io.py` |
+
+---
+
+## 9. Async File I/O (8.6)
+
+**File:** `server/utils/async_io.py`
+
+### Functions
+
+| Function | Description |
+|----------|-------------|
+| `read_file_async` | Non-blocking file read |
+| `read_file_lines_async` | Read specific line range |
+| `write_file_async` | Non-blocking file write |
+| `file_exists_async` | Async existence check |
+| `list_files_async` | Async directory listing |
+| `read_files_parallel` | Read multiple files concurrently |
+| `get_file_stats_async` | Async file stats |
+
+### Usage
+
+```python
+from server.utils.async_io import read_file_async, read_files_parallel
+
+# Single file
+content = await read_file_async("/path/to/file.py")
+
+# Multiple files in parallel
+results = await read_files_parallel(["/a.py", "/b.py", "/c.py"])
+```
 
 ---
 
 *Report generated: 2026-05-30*  
-*Commit: b4a8444*
+*Commits: b4a8444, af33dd4*
