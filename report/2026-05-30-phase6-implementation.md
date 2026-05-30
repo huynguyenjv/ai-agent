@@ -1,7 +1,7 @@
 # Phase 6 Implementation Report
 
 **Date:** 2026-05-30  
-**Status:** COMPLETED (Core items done)  
+**Status:** COMPLETED (All items done)  
 **Focus:** Advanced RAG
 
 ---
@@ -187,17 +187,28 @@ results = await hyde_search(
 
 ---
 
-## 7. Remaining Phase 6 Items
+## 7. Phase 6 Completion Status
 
-| Item | Status | Notes |
-|------|--------|-------|
-| 6.1 Wire RAG to Graph | ✅ Done | |
-| 6.2 Re-ranking Layer | ✅ Done | Optional via env var |
-| 6.3 Query Expansion | ⏳ Pending | Lower priority |
-| 6.4 Parent-Child Retrieval | ⏳ Pending | Lower priority |
-| 6.5 HyDE | ✅ Done | Optional via env var |
-| 6.6 Chunk Overlap | ⏳ Pending | Requires re-indexing |
-| 6.7 Hallucination Mitigation | ✅ Done | |
+| Item | Status | File |
+|------|--------|------|
+| 6.1 Wire RAG to Graph | ✅ Done | `graph.py` |
+| 6.2 Re-ranking Layer | ✅ Done | `server/rag/reranker.py` |
+| 6.3 Query Expansion | ✅ Done | `server/rag/query_expand.py` |
+| 6.4 Parent-Child Retrieval | ✅ Done | `server/rag/context_retrieval.py` |
+| 6.5 HyDE | ✅ Done | `server/rag/hyde.py` |
+| 6.6 Chunk Overlap | ✅ Done | `server/rag/chunking.py` |
+| 6.7 Hallucination Mitigation | ✅ Done | `server/agent/verify_sources.py` |
+
+### New Environment Variables
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `ENABLE_RERANKER` | false | CrossEncoder reranking |
+| `ENABLE_HYDE` | false | Hypothetical document embedding |
+| `ENABLE_QUERY_EXPANSION` | false | Multi-query search |
+| `RAG_CONTEXT_LINES` | 30 | Context lines before/after chunk |
+| `RAG_CHUNK_SIZE` | 100 | Lines per chunk |
+| `RAG_CHUNK_OVERLAP` | 20 | Overlap lines between chunks |
 
 ---
 
