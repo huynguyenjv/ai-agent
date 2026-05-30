@@ -21,6 +21,7 @@ class AgentState(TypedDict, total=False):
     force_reindex: bool
     rag_chunks: list[dict]
     rag_hit: bool
+    rag_enabled: bool                    # Whether RAG is enabled for this request
     hash_verified: bool
     tool_results: list[dict]
     context_assembled: str

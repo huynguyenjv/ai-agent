@@ -204,6 +204,7 @@ async def _stream_response(
         "force_reindex": False,
         "rag_chunks": [],
         "rag_hit": False,
+        "rag_enabled": _enable_rag(),
         "hash_verified": False,
         "tool_results": [],
         "context_assembled": session_data.get("context_summary", ""),

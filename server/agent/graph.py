@@ -64,9 +64,27 @@ def _route_after_context(state: AgentState) -> str:
 
 
 def _route_after_planner(state: AgentState) -> str:
-    """Route after planning: complex tasks are marked for critic review."""
-    # Always proceed to generate, but complexity is tracked in state
+    """Route after planning: to RAG search if enabled, else generate."""
+    # Check if RAG is enabled and beneficial
+    if state.get("rag_enabled") and _should_use_rag(state):
+        return "rag_search"
     return "generate"
+
+
+def _should_use_rag(state: AgentState) -> bool:
+    """Determine if RAG search would be beneficial for this query."""
+    intent = state.get("intent", "")
+
+    # Intents that benefit from RAG
+    rag_intents = {"code_gen", "unit_test", "refactor", "explain", "search"}
+    if intent not in rag_intents:
+        return False
+
+    # Skip RAG for very simple queries (already have file target)
+    if state.get("file_target") and state.get("complexity") == "simple":
+        return False
+
+    return True
 
 
 def _route_after_verify(state: AgentState) -> str:
@@ -162,12 +180,19 @@ def build_agent_graph(
     graph.add_edge("review_analyze", "review_format")
     graph.add_edge("review_format", "post_process")
 
-    # Planner → Generate
-    graph.add_conditional_edges(
-        "planner",
-        _route_after_planner,
-        {"generate": "generate"},
-    )
+    # Planner → RAG (if enabled) or Generate
+    if enable_rag:
+        graph.add_conditional_edges(
+            "planner",
+            _route_after_planner,
+            {"rag_search": "rag_search", "generate": "generate"},
+        )
+    else:
+        graph.add_conditional_edges(
+            "planner",
+            _route_after_planner,
+            {"generate": "generate"},
+        )
 
     # Agentic loop: generate → verify → (retry, critic, or post_process)
     graph.add_edge("generate", "verify_result")
@@ -187,11 +212,11 @@ def build_agent_graph(
     graph.add_edge("post_process", END)
 
     if enable_rag:
-        # Nodes kept resident for future wiring; edges intentionally not added.
         from server.agent.rag_search import rag_search
-        from server.agent.plan_steps import plan_steps
 
         graph.add_node("rag_search", partial(rag_search, qdrant=qdrant, embedder=embedder))
-        graph.add_node("plan_steps", partial(plan_steps, vllm_client=vllm_client, model=model))
+
+        # RAG → Generate (rag_search enriches context then proceeds to generate)
+        graph.add_edge("rag_search", "generate")
 
     return graph.compile()
