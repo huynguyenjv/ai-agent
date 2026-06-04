@@ -16,7 +16,9 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from server.agent.context_builder import build_optimal_context
 from server.agent.state import AgentState
+from server.cache import get_llm_cache
 from server.utils.sanitize import sanitize_tool_output
 
 logger = logging.getLogger("server.agent.generate")
@@ -54,6 +56,23 @@ MCP_TOOLS = [
                     "type_filter": {"type": "string", "enum": ["class", "function", "method", "any"], "default": "any"},
                 },
                 "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_grep",
+            "description": "Full-text/regex content search across the repo (ripgrep-style). Reads files fresh from disk. Use to find where text/patterns appear when you don't know the exact symbol name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for"},
+                    "path_glob": {"type": "string", "description": "Optional glob filter, e.g. '**/*.py'"},
+                    "ignore_case": {"type": "boolean", "default": False},
+                    "max_results": {"type": "integer", "default": 100},
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -222,6 +241,88 @@ MCP_TOOLS = [
                     "name": {"type": "string", "description": "Branch name (optional, omit to list)"},
                     "checkout": {"type": "boolean", "default": False, "description": "Checkout after creating"},
                 },
+            },
+        },
+    },
+    # Code Intelligence Tools (Phase 7)
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_run_tests",
+            "description": "Run tests with automatic framework detection (pytest/jest/junit/go/cargo) and parse pass/fail results. Use to verify generated code behaves correctly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "test_file": {"type": "string", "description": "Specific test file (optional)"},
+                    "test_name": {"type": "string", "description": "Specific test name/pattern (optional)"},
+                    "framework": {"type": "string", "default": "auto", "description": "Framework or 'auto'"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_lint_code",
+            "description": "Run a linter (auto-detected: ruff/eslint/gofmt/...) and return issues; set fix=true to auto-fix where supported.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Specific file to lint (optional)"},
+                    "fix": {"type": "boolean", "default": False, "description": "Auto-fix issues if supported"},
+                    "linter": {"type": "string", "default": "auto", "description": "Linter or 'auto'"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_rename_symbol",
+            "description": "Rename a symbol (class/function/method) across the codebase using AST-aware search. Use dry_run to preview edits first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_name": {"type": "string", "description": "Current symbol name"},
+                    "new_name": {"type": "string", "description": "New symbol name"},
+                    "scope": {"type": "string", "enum": ["project", "file"], "default": "project"},
+                    "dry_run": {"type": "boolean", "default": True, "description": "Preview only"},
+                },
+                "required": ["old_name", "new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_extract_function",
+            "description": "Extract a contiguous line range into a new function. Use dry_run to preview edits first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Path relative to repo root"},
+                    "start_line": {"type": "integer", "description": "Start line (1-based)"},
+                    "end_line": {"type": "integer", "description": "End line (1-based)"},
+                    "new_function_name": {"type": "string", "description": "Name for the extracted function"},
+                    "dry_run": {"type": "boolean", "default": True, "description": "Preview only"},
+                },
+                "required": ["file_path", "start_line", "end_line", "new_function_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_inline_variable",
+            "description": "Inline a variable by replacing all its uses with its value. Use dry_run to preview edits first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "File containing the variable"},
+                    "variable_name": {"type": "string", "description": "Variable to inline"},
+                    "dry_run": {"type": "boolean", "default": True, "description": "Preview only"},
+                },
+                "required": ["file_path", "variable_name"],
             },
         },
     },
@@ -436,7 +537,8 @@ TOOL_INSTRUCTIONS = """
 
 You have access to these tools:
 - vtrip_read_file: Read file content (file_path, start_line, end_line)
-- vtrip_search_symbol: Find class/function/method in codebase (name, type_filter)
+- vtrip_search_symbol: Find class/function/method by name (name, type_filter)
+- vtrip_grep: Full-text/regex content search across the repo (pattern, path_glob, ignore_case)
 - vtrip_get_project_skeleton: Get project structure overview (include_methods)
 - vtrip_index_with_deps: Index file with its dependencies (file_path, depth)
 - vtrip_run_command: Execute shell command to run tests, lint, build (command, working_dir)
@@ -447,6 +549,15 @@ You have access to these tools:
 - vtrip_git_log: Get recent commits (count, file_path)
 - vtrip_git_commit: Create commit (message, files[])
 - vtrip_git_branch: List/create/checkout branch (name, checkout)
+- vtrip_run_tests: Run tests, auto-detect framework (test_file, test_name, framework)
+- vtrip_lint_code: Run linter, optionally auto-fix (file_path, fix, linter)
+- vtrip_rename_symbol: AST-aware rename across codebase (old_name, new_name, scope, dry_run)
+- vtrip_extract_function: Extract line range into a function (file_path, start_line, end_line, new_function_name, dry_run)
+- vtrip_inline_variable: Inline a variable into its uses (file_path, variable_name, dry_run)
+
+Prefer to explore the codebase with tools rather than guessing: use vtrip_grep
+for text/regex, vtrip_search_symbol for named definitions, then vtrip_read_file
+to read the exact lines. Files read this way are always up to date.
 
 Use tools when you need to:
 - Read actual file content before making changes
@@ -454,7 +565,8 @@ Use tools when you need to:
 - Understand project structure before analysis
 - Verify code changes by running tests or linting
 - Check git status and history before making commits
-- Create branches and commits for your changes"""
+- Create branches and commits for your changes
+- Refactor safely (rename/extract/inline) with a dry-run preview"""
 
 # =============================================================================
 # Tool Name Mapping (for models trained on different tool sets)
@@ -468,8 +580,13 @@ TOOL_NAME_MAP = {
     "cat": "vtrip_read_file",
     "view_file": "vtrip_read_file",
     "search": "vtrip_search_symbol",
-    "grep": "vtrip_search_symbol",
     "find_symbol": "vtrip_search_symbol",
+    "grep": "vtrip_grep",
+    "ripgrep": "vtrip_grep",
+    "rg": "vtrip_grep",
+    "search_text": "vtrip_grep",
+    "find_in_files": "vtrip_grep",
+    "content_search": "vtrip_grep",
     "index_file": "vtrip_index_with_deps",
     "run_command": "vtrip_run_command",
     "execute": "vtrip_run_command",
@@ -519,6 +636,11 @@ MAX_TOOL_TURNS = int(os.environ.get("MAX_TOOL_TURNS", "5"))
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "24000"))
 MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_DELAY", "1.0"))
+
+# Token budget reserved for injected RAG/file context (Phase 8.1)
+CONTEXT_TOKEN_BUDGET = int(os.environ.get("CONTEXT_TOKEN_BUDGET", "8000"))
+# LLM response cache for repeated final answers (Phase 8.4)
+ENABLE_LLM_CACHE = os.environ.get("ENABLE_LLM_CACHE", "true").lower() in ("1", "true", "yes")
 
 
 # =============================================================================
@@ -583,6 +705,27 @@ def _to_openai_messages(state: AgentState, tools_disabled: bool = False) -> list
         )
     else:
         system_prompt += TOOL_INSTRUCTIONS
+
+    # Phase 8.1: inject assembled RAG/file context into the system prompt so
+    # retrieved chunks actually reach the model (previously rag_chunks were
+    # retrieved but never used in generation).
+    if state.get("rag_chunks") or state.get("active_file"):
+        ctx = build_optimal_context(
+            state,
+            repo_path=state.get("repo_path") or "",
+            token_budget=CONTEXT_TOKEN_BUDGET,
+        )
+        if ctx["context"]:
+            system_prompt += (
+                "\n\n## Relevant Code Context\n"
+                "Use the following retrieved context when answering. "
+                "Cite file paths when you rely on it.\n\n"
+                + ctx["context"]
+            )
+            logger.info(
+                "generate: injected RAG context (%d parts, ~%d tokens)",
+                ctx["parts_included"], ctx["tokens_used"],
+            )
 
     out: list[dict] = [{"role": "system", "content": system_prompt}]
 
@@ -837,6 +980,27 @@ async def generate(
 
     messages = _to_openai_messages(state, tools_disabled=tools_disabled)
 
+    # Phase 8.4: serve a cached final answer for an identical recent context.
+    # Only used for final responses (cache only stores turns with no tool calls).
+    # Disabled when the answer depends on repo context (RAG chunks / active file),
+    # since the cache key does not capture that context and could serve a stale
+    # answer for a different repository state.
+    intent = state.get("intent", "code_gen")
+    context_sensitive = bool(state.get("rag_chunks") or state.get("active_file"))
+    llm_cache = get_llm_cache() if (ENABLE_LLM_CACHE and not context_sensitive) else None
+    cache_msgs = [m for m in messages if m.get("role") != "system"]
+    if llm_cache is not None:
+        cached = llm_cache.get(cache_msgs, all_tools, intent)
+        if cached is not None:
+            draft = cached.get("draft", "")
+            if sse_callback and draft:
+                await sse_callback("content", draft)
+            return {
+                "draft": draft,
+                "pending_tool_calls": [],
+                "tool_turns_used": tool_turns_used,
+            }
+
     # Calculate max_tokens dynamically based on estimated input
     # Model context: ~32k, reserve enough for output
     estimated_input = sum(_estimate_tokens(m.get("content") or "") for m in messages)
@@ -958,6 +1122,10 @@ async def generate(
 
     # Increment tool_turns_used if we're returning tool calls
     new_tool_turns = tool_turns_used + 1 if final_tool_calls else tool_turns_used
+
+    # Phase 8.4: cache only final answers (no pending tool calls).
+    if llm_cache is not None and not final_tool_calls and draft:
+        llm_cache.set(cache_msgs, all_tools, intent, {"draft": draft})
 
     return {
         "draft": draft,

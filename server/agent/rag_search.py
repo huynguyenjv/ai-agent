@@ -6,10 +6,12 @@ when freshness_signal or mentioned_files are active.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
 from server.agent.state import AgentState
+from server.cache import get_rag_cache
 from server.rag.hash_verifier import HashVerifier
 
 logger = logging.getLogger("server.agent.rag_search")
@@ -56,6 +58,16 @@ async def rag_search(state: AgentState, qdrant, embedder) -> dict:
         logger.warning("Embedder not available, skipping RAG search")
         return {"rag_chunks": [], "rag_hit": False, "hash_verified": False}
 
+    # Phase 8.5: short-lived cache of search results. Bypass when the request
+    # demands fresh data (freshness keyword or forced re-index).
+    query_hash = hashlib.sha256(str(query or "").encode()).hexdigest()[:16]
+    use_cache = not (state.get("freshness_signal") or state.get("force_reindex"))
+    rag_cache = get_rag_cache()
+    if use_cache:
+        cached = rag_cache.get(query_hash, lang_filter=lang_filter, top_k=8)
+        if cached is not None:
+            return {"rag_chunks": cached, "rag_hit": True, "hash_verified": False}
+
     try:
         # Produce embeddings
         dense_vector, sparse_vector = embedder.embed_both(query)
@@ -70,6 +82,9 @@ async def rag_search(state: AgentState, qdrant, embedder) -> dict:
     except Exception as e:
         logger.warning("RAG search failed: %s", e)
         return {"rag_chunks": [], "rag_hit": False, "hash_verified": False}
+
+    if use_cache and results:
+        rag_cache.set(query_hash, results, lang_filter=lang_filter, top_k=8)
 
     if not results:
         return {"rag_chunks": [], "rag_hit": False, "hash_verified": False}

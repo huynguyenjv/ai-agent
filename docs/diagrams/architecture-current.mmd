@@ -1,0 +1,64 @@
+flowchart TB
+    classDef client fill:#E3F2FD,stroke:#1565C0,color:#0D47A1;
+    classDef api fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20;
+    classDef agent fill:#FFF3E0,stroke:#EF6C00,color:#E65100;
+    classDef data fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C;
+    classDef infra fill:#ECEFF1,stroke:#455A64,color:#263238;
+
+    subgraph CLIENTS["Clients"]
+        IDE["Continue / Tabby IDE<br/>(full history mỗi request)"]:::client
+        MCP["MCP Server (stdio, client-side)<br/>read_file · search_symbol<br/>get_project_skeleton · index_with_deps<br/>plugins: java/go/py/ts/cs/hcl · sandbox"]:::client
+        CI["GitLab CI<br/>gitlab-review-runner"]:::client
+    end
+
+    subgraph API["FastAPI Server (server/app.py · v2.0)"]
+        MW["Middleware<br/>Auth · RateLimit · CORS · correlation-id"]:::api
+        R1["/v1/chat/completions (SSE)"]:::api
+        R2["/index"]:::api
+        R3["/review/analyze"]:::api
+        R4["/metrics"]:::api
+        R5["/feedback"]:::api
+    end
+
+    subgraph GRAPH["LangGraph Agent (server/agent/graph.py)"]
+        direction TB
+        N1["classify_intent"]:::agent
+        N2["route_context (5-gate)"]:::agent
+        N3["planner (simple/complex)"]:::agent
+        N4["rag_search"]:::agent
+        N5["generate (native tool-call)"]:::agent
+        N6["verify_result"]:::agent
+        N7["critic (complex)"]:::agent
+        N8["post_process"]:::agent
+        N9["review_analyze → review_format"]:::agent
+        N1 --> N2 --> N3 --> N4 --> N5 --> N6 --> N7 --> N8
+        N2 -. code_review .-> N9 --> N8
+        N6 -. fail/retry .-> N5
+        N7 -. fail/retry .-> N5
+    end
+
+    subgraph BACKEND["Backends"]
+        VLLM["vLLM (AsyncOpenAI)<br/>Qwen2.5-Coder"]:::data
+        RAG["RAG (server/rag)<br/>Embedder all-MiniLM-L6-v2<br/>HyDE · reranker · query_expand"]:::data
+        QDR["Qdrant (vector DB)"]:::data
+        SESS["Session / LRU Cache<br/>(in-memory)"]:::data
+    end
+
+    subgraph INFRA["Infra (docker-compose)"]
+        PG["Postgres (metrics_db)"]:::infra
+        PROM["Prometheus"]:::infra
+        GRAF["Grafana"]:::infra
+    end
+
+    IDE -- HTTPS/SSE --> MW
+    IDE -. spawn .-> MCP
+    CI -- /review/analyze --> R3
+    MCP -- upload chunks --> R2
+    MW --> R1 --> GRAPH
+    R3 --> N9
+    N5 --> VLLM
+    N4 --> RAG --> QDR
+    R2 --> RAG
+    GRAPH --> SESS
+    R4 --> PROM --> GRAF
+    API --> PG

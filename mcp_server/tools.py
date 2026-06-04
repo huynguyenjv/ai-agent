@@ -8,8 +8,10 @@ Core tools for AI coding agent:
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -18,6 +20,10 @@ from mcp_server.models import ExtractionMode, SKIP_DIRS, SKIP_EXTENSIONS
 from mcp_server.plugins.registry import PluginRegistry
 
 logger = logging.getLogger("mcp_server.tools")
+
+# grep_content limits
+GREP_MAX_FILE_BYTES = 2_000_000   # skip files larger than ~2MB
+GREP_MAX_RESULTS_CAP = 200        # hard cap regardless of caller request
 
 
 def read_file(
@@ -167,6 +173,113 @@ BLOCKED_PATTERNS = [
 
 MAX_OUTPUT_SIZE = 50000  # 50KB max output
 DEFAULT_TIMEOUT = 60  # 60 seconds
+
+
+def _matches_skip_extension(fname: str) -> bool:
+    """True if a filename matches SKIP_EXTENSIONS (handles multi-part like .min.js)."""
+    lower = fname.lower()
+    if Path(lower).suffix in SKIP_EXTENSIONS:
+        return True
+    # Multi-part suffix chain, e.g. "a.min.js" -> ".min.js"
+    suffixes = "".join(Path(lower).suffixes)
+    return any(suffixes.endswith(skip) for skip in SKIP_EXTENSIONS)
+
+
+def grep_content(
+    repo_path: str,
+    pattern: str,
+    path_glob: str | None = None,
+    ignore_case: bool = False,
+    max_results: int = 100,
+) -> dict:
+    """Full-text / regex content search across the repository (agentic search).
+
+    Pure-Python, ripgrep-style. Reads files fresh from the local filesystem so
+    results are never stale, and the working copy stays on the user's machine
+    (no upload to Qdrant). Skips SKIP_DIRS, SKIP_EXTENSIONS, binary and
+    oversized files.
+
+    Args:
+        repo_path: Repository root path
+        pattern: Regular expression to search for
+        path_glob: Optional glob to restrict files (e.g. "**/*.py", "src/*.go")
+        ignore_case: Case-insensitive match
+        max_results: Max matching lines to return (capped at 200)
+
+    Returns:
+        {matches: [{file_path, line_number, line}], total, files_scanned,
+         truncated, pattern}
+    """
+    if not pattern:
+        return {"error": "Empty pattern"}
+
+    try:
+        regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as e:
+        return {"error": f"Invalid regex: {e}"}
+
+    limit = max(1, min(max_results, GREP_MAX_RESULTS_CAP))
+    real_repo = os.path.realpath(repo_path)
+
+    matches: list[dict] = []
+    files_scanned = 0
+    truncated = False
+
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+        for fname in files:
+            if _matches_skip_extension(fname):
+                continue
+
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, repo_path).replace("\\", "/")
+
+            if path_glob and not (
+                fnmatch.fnmatch(rel_path, path_glob)
+                or fnmatch.fnmatch(fname, path_glob)
+            ):
+                continue
+
+            # Path traversal guard (symlinks escaping the repo)
+            if not os.path.realpath(full_path).startswith(real_repo):
+                continue
+
+            try:
+                if os.path.getsize(full_path) > GREP_MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="strict") as f:
+                    files_scanned += 1
+                    for lineno, line in enumerate(f, 1):
+                        if regex.search(line):
+                            matches.append({
+                                "file_path": rel_path,
+                                "line_number": lineno,
+                                "line": line.rstrip("\n")[:400],
+                            })
+                            if len(matches) >= limit:
+                                truncated = True
+                                break
+            except (OSError, UnicodeDecodeError):
+                # Unreadable or binary file — skip
+                continue
+
+            if truncated:
+                break
+        if truncated:
+            break
+
+    return {
+        "matches": matches,
+        "total": len(matches),
+        "files_scanned": files_scanned,
+        "truncated": truncated,
+        "pattern": pattern,
+    }
 
 
 def run_command(

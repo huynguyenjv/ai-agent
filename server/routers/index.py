@@ -93,4 +93,10 @@ async def index_chunks(
     # Upsert — idempotent due to deterministic chunk_id
     indexed = await qdrant.upsert_chunks(chunk_dicts, dense_vectors, sparse_vectors)
 
+    # Phase 8.5: invalidate cached RAG search results since the index changed.
+    if indexed or deleted:
+        from server.cache import get_rag_cache
+
+        get_rag_cache().invalidate()
+
     return {"indexed": indexed, "deleted": deleted}

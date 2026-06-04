@@ -40,7 +40,25 @@
       "Bash(c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/venv/Scripts/python.exe c:/Users/huynmb/IdeaProjects/source/train/tabby-pipeline/ai-agent/mcp_server/server.py)",
       "Bash(curl -s -X POST http://localhost:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"X-Api-Key: dev-secret-key\" -d '{\"\"\"\"messages\"\"\"\":[{\"\"\"\"role\"\"\"\":\"\"\"\"user\"\"\"\",\"\"\"\"content\"\"\"\":\"\"\"\"hello\"\"\"\"}],\"\"\"\"model\"\"\"\":\"\"\"\"test\"\"\"\",\"\"\"\"stream\"\"\"\":true}')",
       "WebFetch(domain:docs.continue.dev)",
-      "PowerShell(New-Item *)"
+      "PowerShell(New-Item *)",
+      "Bash(dot -V)",
+      "Bash(npx -v)",
+      "Bash(mmdc -V)",
+      "Bash(export PUPPETEER_SKIP_DOWNLOAD=false)",
+      "Bash(npx -y @mermaid-js/mermaid-cli@latest -i architecture-current.mmd -o architecture-current.png -b white -s 2 -p puppeteer-config.json)",
+      "Bash(npm cache *)",
+      "Bash(npm install *)",
+      "Bash(ls server/agents/)",
+      "Bash(ls eval/*.py)",
+      "Bash(ls config/prompts/)",
+      "Bash(ls server/utils/)",
+      "Bash(ls server/metrics/)",
+      "Bash(ls server/utils/secret_scanner.py)",
+      "Bash(ls server/audit.py server/validation.py server/circuit_breaker.py server/retry.py server/session_redis.py server/cache_redis.py)",
+      "Bash(ls report/)",
+      "Bash(bc)",
+      "Bash(awk '{s+=$1} END {print s\" tests total\"}')",
+      "Bash(echo \"compileall: exit $?\")"
     ]
   }
 }

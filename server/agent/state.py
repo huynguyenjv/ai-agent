@@ -16,6 +16,7 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     intent: str  # code_gen, unit_test, explain, structural_analysis, search, refine, code_review
     active_file: str | None
+    repo_path: str | None                # repository root (client-provided), used by context_builder
     mentioned_files: list[str]
     freshness_signal: bool
     force_reindex: bool

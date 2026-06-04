@@ -136,8 +136,11 @@ def _convert_messages(request_messages: list[ChatMessage]):
 
 
 def _enable_rag() -> bool:
-    # RAG enabled by default in v2.0
-    return os.environ.get("ENABLE_RAG", "true").lower() in ("1", "true", "yes")
+    # Agentic-first: RAG (Qdrant) is OPT-IN. Default OFF — the agent gathers
+    # context via client-side tools (grep/search_symbol/read_file) which are
+    # always fresh and naturally isolated per user. Enable RAG only for large
+    # repos needing semantic recall by setting ENABLE_RAG=true.
+    return os.environ.get("ENABLE_RAG", "false").lower() in ("1", "true", "yes")
 
 
 async def _stream_response(
@@ -199,6 +202,7 @@ async def _stream_response(
         "messages": messages,
         "intent": session_data.get("last_intent", ""),  # Carry over from session
         "active_file": active_file or session_data.get("active_file"),
+        "repo_path": request.repo_path or "",
         "mentioned_files": session_data.get("mentioned_files", []),
         "freshness_signal": False,
         "force_reindex": False,

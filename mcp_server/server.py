@@ -3,7 +3,10 @@
 stdio transport MCP server spawned by Continue IDE.
 Exposes tools to the LLM via Model Context Protocol.
 
-Tools: read_file, search_symbol, get_project_skeleton, index_with_deps.
+Tools: read_file, search_symbol, grep, get_project_skeleton, index_with_deps,
+run_command, diff_preview, apply_edits, git_* (status/diff/log/commit/branch),
+run_tests, lint_code, rename_symbol, extract_function, inline_variable,
+and GitLab review tools (get_pr_diff/get_mr_note/upsert_mr_comment).
 """
 
 from __future__ import annotations
@@ -30,8 +33,27 @@ from mcp_server.plugins.hcl_plugin import HCLPlugin
 from mcp_server.hash_store import HashStore
 from mcp_server.dep_classifier import DepClassifier
 from mcp_server.uploader import Uploader
-from mcp_server.tools import read_file, search_symbol
+from mcp_server.tools import (
+    read_file,
+    search_symbol,
+    grep_content,
+    run_command,
+    diff_preview,
+    apply_edits,
+    git_status,
+    git_diff,
+    git_log,
+    git_commit,
+    git_branch,
+    run_tests,
+    lint_code,
+)
 from mcp_server.tools_indexer import get_project_skeleton, index_with_deps
+from mcp_server.tools_refactor import (
+    rename_symbol,
+    extract_function,
+    inline_variable,
+)
 from mcp_server.tools_review import (
     get_pr_diff as review_get_pr_diff,
     get_mr_note as review_get_mr_note,
@@ -161,6 +183,188 @@ def create_server() -> Server:
                 },
             ),
             Tool(
+                name="vtrip_grep",
+                description=(
+                    "Full-text/regex content search across the repo (ripgrep-style). "
+                    "Reads files fresh from disk; use to find where text/patterns appear "
+                    "when you don't know the exact symbol name."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Regular expression to search for"},
+                        "path_glob": {"type": "string", "description": "Optional glob filter, e.g. '**/*.py'"},
+                        "ignore_case": {"type": "boolean", "default": False},
+                        "max_results": {"type": "integer", "default": 100},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            Tool(
+                name="vtrip_run_command",
+                description="Execute a whitelisted shell command (tests, lint, build) in the repo.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to execute"},
+                        "working_dir": {"type": "string", "description": "Subdirectory relative to repo root"},
+                    },
+                    "required": ["command"],
+                },
+            ),
+            Tool(
+                name="vtrip_diff_preview",
+                description="Preview a unified diff of proposed changes to a file before applying.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Path relative to repo root"},
+                        "new_content": {"type": "string", "description": "Proposed new file content"},
+                    },
+                    "required": ["file_path", "new_content"],
+                },
+            ),
+            Tool(
+                name="vtrip_apply_edits",
+                description="Apply edits to multiple files atomically (full content or search/replace).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file_path": {"type": "string"},
+                                    "new_content": {"type": "string"},
+                                    "search": {"type": "string"},
+                                    "replace": {"type": "string"},
+                                },
+                                "required": ["file_path"],
+                            },
+                        },
+                        "dry_run": {"type": "boolean", "default": False},
+                    },
+                    "required": ["edits"],
+                },
+            ),
+            Tool(
+                name="vtrip_git_status",
+                description="Get git status: branch, staged, modified, untracked files.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="vtrip_git_diff",
+                description="Get git diff for a file or the entire repo.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "staged": {"type": "boolean", "default": False},
+                    },
+                },
+            ),
+            Tool(
+                name="vtrip_git_log",
+                description="Get recent git commits.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer", "default": 10},
+                        "file_path": {"type": "string"},
+                    },
+                },
+            ),
+            Tool(
+                name="vtrip_git_commit",
+                description="Stage files and create a git commit.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "files": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["message"],
+                },
+            ),
+            Tool(
+                name="vtrip_git_branch",
+                description="List branches or create/checkout a branch.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "checkout": {"type": "boolean", "default": False},
+                    },
+                },
+            ),
+            Tool(
+                name="vtrip_run_tests",
+                description="Run tests with auto framework detection and parse pass/fail results.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "test_file": {"type": "string"},
+                        "test_name": {"type": "string"},
+                        "framework": {"type": "string", "default": "auto"},
+                    },
+                },
+            ),
+            Tool(
+                name="vtrip_lint_code",
+                description="Run a linter (auto-detected) and return issues; optionally auto-fix.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "fix": {"type": "boolean", "default": False},
+                        "linter": {"type": "string", "default": "auto"},
+                    },
+                },
+            ),
+            Tool(
+                name="vtrip_rename_symbol",
+                description="Rename a symbol across the codebase (AST-aware). dry_run previews edits.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "old_name": {"type": "string"},
+                        "new_name": {"type": "string"},
+                        "scope": {"type": "string", "enum": ["project", "file"], "default": "project"},
+                        "dry_run": {"type": "boolean", "default": True},
+                    },
+                    "required": ["old_name", "new_name"],
+                },
+            ),
+            Tool(
+                name="vtrip_extract_function",
+                description="Extract a line range into a new function. dry_run previews edits.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
+                        "new_function_name": {"type": "string"},
+                        "dry_run": {"type": "boolean", "default": True},
+                    },
+                    "required": ["file_path", "start_line", "end_line", "new_function_name"],
+                },
+            ),
+            Tool(
+                name="vtrip_inline_variable",
+                description="Inline a variable by replacing its uses with its value. dry_run previews edits.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "variable_name": {"type": "string"},
+                        "dry_run": {"type": "boolean", "default": True},
+                    },
+                    "required": ["file_path", "variable_name"],
+                },
+            ),
+            Tool(
                 name="get_pr_diff",
                 description="Fetch GitLab MR unified diff and metadata by project path and MR IID.",
                 inputSchema={
@@ -237,6 +441,97 @@ def create_server() -> Server:
                 file_path=arguments["file_path"],
                 depth=arguments.get("depth", DEPTH_DEFAULT),
                 token_budget=TOKEN_BUDGET,
+            )
+        elif name == "vtrip_grep":
+            result = grep_content(
+                repo_path=REPO_PATH,
+                pattern=arguments["pattern"],
+                path_glob=arguments.get("path_glob"),
+                ignore_case=arguments.get("ignore_case", False),
+                max_results=arguments.get("max_results", 100),
+            )
+        elif name == "vtrip_run_command":
+            result = run_command(
+                repo_path=REPO_PATH,
+                command=arguments["command"],
+                working_dir=arguments.get("working_dir"),
+            )
+        elif name == "vtrip_diff_preview":
+            result = diff_preview(
+                repo_path=REPO_PATH,
+                file_path=arguments["file_path"],
+                new_content=arguments["new_content"],
+            )
+        elif name == "vtrip_apply_edits":
+            result = apply_edits(
+                repo_path=REPO_PATH,
+                edits=arguments["edits"],
+                dry_run=arguments.get("dry_run", False),
+            )
+        elif name == "vtrip_git_status":
+            result = git_status(repo_path=REPO_PATH)
+        elif name == "vtrip_git_diff":
+            result = git_diff(
+                repo_path=REPO_PATH,
+                file_path=arguments.get("file_path"),
+                staged=arguments.get("staged", False),
+            )
+        elif name == "vtrip_git_log":
+            result = git_log(
+                repo_path=REPO_PATH,
+                count=arguments.get("count", 10),
+                file_path=arguments.get("file_path"),
+            )
+        elif name == "vtrip_git_commit":
+            result = git_commit(
+                repo_path=REPO_PATH,
+                message=arguments["message"],
+                files=arguments.get("files"),
+            )
+        elif name == "vtrip_git_branch":
+            result = git_branch(
+                repo_path=REPO_PATH,
+                name=arguments.get("name"),
+                checkout=arguments.get("checkout", False),
+            )
+        elif name == "vtrip_run_tests":
+            result = run_tests(
+                repo_path=REPO_PATH,
+                test_file=arguments.get("test_file"),
+                test_name=arguments.get("test_name"),
+                framework=arguments.get("framework", "auto"),
+            )
+        elif name == "vtrip_lint_code":
+            result = lint_code(
+                repo_path=REPO_PATH,
+                file_path=arguments.get("file_path"),
+                fix=arguments.get("fix", False),
+                linter=arguments.get("linter", "auto"),
+            )
+        elif name == "vtrip_rename_symbol":
+            result = rename_symbol(
+                repo_path=REPO_PATH,
+                registry=registry,
+                old_name=arguments["old_name"],
+                new_name=arguments["new_name"],
+                scope=arguments.get("scope", "project"),
+                dry_run=arguments.get("dry_run", True),
+            )
+        elif name == "vtrip_extract_function":
+            result = extract_function(
+                repo_path=REPO_PATH,
+                file_path=arguments["file_path"],
+                start_line=arguments["start_line"],
+                end_line=arguments["end_line"],
+                new_function_name=arguments["new_function_name"],
+                dry_run=arguments.get("dry_run", True),
+            )
+        elif name == "vtrip_inline_variable":
+            result = inline_variable(
+                repo_path=REPO_PATH,
+                file_path=arguments["file_path"],
+                variable_name=arguments["variable_name"],
+                dry_run=arguments.get("dry_run", True),
             )
         elif name == "get_pr_diff":
             result = await review_get_pr_diff(

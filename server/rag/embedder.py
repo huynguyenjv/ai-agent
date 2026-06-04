@@ -73,9 +73,21 @@ class Embedder:
     # ------------------------------------------------------------------
 
     def embed_dense(self, text: str) -> list[float]:
-        """Produce a 384-dimensional L2-normalized dense vector."""
-        embedding = self._model.encode(text, normalize_embeddings=True)
-        return embedding.tolist()
+        """Produce a 384-dimensional L2-normalized dense vector.
+
+        Phase 8.3: results are cached per-text to avoid recomputing embeddings
+        for repeated queries (query path goes through embed_both -> embed_dense).
+        """
+        from server.cache import get_embedding_cache
+
+        cache = get_embedding_cache()
+        cached = cache.get(text)
+        if cached is not None:
+            return cached
+
+        embedding = self._model.encode(text, normalize_embeddings=True).tolist()
+        cache.set(text, embedding)
+        return embedding
 
     def embed_dense_batch(self, texts: list[str]) -> list[list[float]]:
         """Batch dense embedding."""

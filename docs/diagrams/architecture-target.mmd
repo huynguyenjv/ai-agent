@@ -1,0 +1,75 @@
+flowchart TB
+    classDef client fill:#E3F2FD,stroke:#1565C0,color:#0D47A1;
+    classDef edge fill:#FFFDE7,stroke:#F9A825,color:#F57F17;
+    classDef api fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20;
+    classDef agent fill:#FFF3E0,stroke:#EF6C00,color:#E65100;
+    classDef data fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C;
+    classDef infra fill:#ECEFF1,stroke:#455A64,color:#263238;
+    classDef obs fill:#E0F7FA,stroke:#00838F,color:#006064;
+
+    subgraph CLIENTS["Clients"]
+        IDE["Continue / Tabby IDE + MCP (stdio)"]:::client
+        CI["GitLab CI · gitlab-review-runner"]:::client
+    end
+
+    EDGE["Ingress / LoadBalancer [P12]<br/>TLS · sticky-SSE · rate-limit · backpressure"]:::edge
+
+    subgraph PODS["AI-Agent API Pods · HPA 2..10 [P12]"]
+        MW["Middleware<br/>OIDC/SSO [P18] · tenant ctx [P18]<br/>input-validation + guard [P10]<br/>budget [P18] · correlation-id + OTel [P14] · audit [P10]"]:::api
+        ROUTERS["Routers<br/>/v1/chat · /index · /review/analyze<br/>/metrics · /feedback · /health-deep · /experiments · /admin"]:::api
+        subgraph COORD["Agent Coordinator [P15]"]
+            direction LR
+            A1["Planner"]:::agent --> A2["Researcher"]:::agent --> A3["Coder"]:::agent --> A4["Reviewer"]:::agent --> A5["Executor"]:::agent
+        end
+        BUS["Message Bus (Redis Pub/Sub) [P15]"]:::agent
+    end
+
+    subgraph SVC["Services"]
+        WORK["Celery workers [P12]<br/>index · batch · delta-reindex"]:::data
+        VLLM["vLLM pool + CircuitBreaker [P11/P19]<br/>batching · conn-pool"]:::data
+        RAGH["Hybrid RAG [P13]<br/>semantic + BM25 (RRF)<br/>delta-index · file-watcher · AST cache"]:::data
+        TOOLS["Sandboxed tool exec [P10/P17]<br/>multi-file atomic · call-graph · LSP · validator"]:::data
+        REDIS["Redis [P11]<br/>session · cache · bus · broker"]:::data
+    end
+
+    subgraph STORE["Stores"]
+        QDR["Qdrant cluster ×3 [P12]"]:::data
+        PG["Postgres [P10/P16/P18]<br/>metrics · audit · budget · agent-memory · dataset"]:::data
+        OBJ["S3/GCS backup [P18]"]:::infra
+    end
+
+    subgraph OBSV["Observability [P14]"]
+        OTEL["OpenTelemetry → Jaeger"]:::obs
+        PROM["Prometheus → Grafana (SLO)"]:::obs
+        SENTRY["Sentry"]:::obs
+        LOKI["Loki / ELK"]:::obs
+    end
+
+    subgraph AIENG["AI Engineering [P16]"]
+        JUDGE["LLM-as-Judge"]:::obs
+        AB["A/B Experiments"]:::obs
+        DS["Trace → Dataset (fine-tune)"]:::obs
+        PV["Prompt Versioning (yaml)"]:::obs
+    end
+
+    GITOPS["GitOps [P18]<br/>ArgoCD ← Helm ← CI/CD (build·test·Trivy·deploy)"]:::infra
+
+    IDE --> EDGE
+    CI --> EDGE
+    EDGE --> MW --> ROUTERS --> COORD
+    COORD <--> BUS
+    COORD --> VLLM
+    COORD --> RAGH --> QDR
+    COORD --> TOOLS
+    COORD --> REDIS
+    ROUTERS --> WORK --> QDR
+    WORK --> RAGH
+    PODS --> PG
+    PG --> OBJ
+    QDR --> OBJ
+    PODS --> OTEL
+    PODS --> PROM
+    PODS --> SENTRY
+    PODS --> LOKI
+    COORD --> AIENG
+    GITOPS -. deploy .-> PODS
