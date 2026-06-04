@@ -22,13 +22,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 
 from server.logging_config import correlation_id_var
-from server.rag.embedder import Embedder
-from server.rag.qdrant_client import QdrantService
+# NB: server.rag.embedder / qdrant_client are imported lazily inside lifespan
+# (only when ENABLE_RAG is on) so RAG-off startup never imports torch.
 from server.routers.chat import router as chat_router
 from server.routers.index import router as index_router
 from server.routers.review import router as review_router
 from server.routers.metrics import router as metrics_router
 from server.routers.feedback import router as feedback_router
+from server.routers.health import router as health_router
 
 logger = logging.getLogger("server")
 
@@ -41,22 +42,37 @@ async def lifespan(app: FastAPI):
     qdrant_url = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
     vllm_base_url = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 
-    # Initialize Qdrant (non-blocking — will retry on first request if unavailable)
-    qdrant = QdrantService(url=qdrant_url)
-    try:
-        await qdrant.ensure_collection()
-        logger.info("Qdrant connected: %s", qdrant_url)
-    except Exception as e:
-        logger.warning("Qdrant not available at startup (%s). Will retry on first request.", e)
-    app.state.qdrant = qdrant
+    # RAG (Qdrant + embedder) is opt-in (agentic-first default). When RAG is
+    # off, skip loading the embedding model and connecting Qdrant entirely —
+    # faster startup, less memory, no Qdrant dependency.
+    rag_enabled = os.environ.get("ENABLE_RAG", "false").lower() in ("1", "true", "yes")
 
-    # Initialize Embedder (lazy load on first use if model not cached)
-    try:
-        embedder = Embedder()
-        logger.info("Embedder initialized.")
-    except Exception as e:
-        logger.warning("Embedder init failed (%s). Will retry on first request.", e)
-        embedder = None
+    qdrant = None
+    embedder = None
+    if rag_enabled:
+        # Lazy imports — only pull in torch/sentence-transformers when RAG is on.
+        from server.rag.embedder import Embedder
+        from server.rag.qdrant_client import QdrantService
+
+        # Initialize Qdrant (non-blocking — will retry on first request if unavailable)
+        qdrant = QdrantService(url=qdrant_url)
+        try:
+            await qdrant.ensure_collection()
+            logger.info("Qdrant connected: %s", qdrant_url)
+        except Exception as e:
+            logger.warning("Qdrant not available at startup (%s). Will retry on first request.", e)
+
+        # Initialize Embedder (lazy load on first use if model not cached)
+        try:
+            embedder = Embedder()
+            logger.info("Embedder initialized.")
+        except Exception as e:
+            logger.warning("Embedder init failed (%s). Will retry on first request.", e)
+            embedder = None
+    else:
+        logger.info("RAG disabled (ENABLE_RAG=false) — skipping Qdrant + embedder init.")
+
+    app.state.qdrant = qdrant
     app.state.embedder = embedder
 
     # Initialize vLLM client
@@ -71,7 +87,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
-    await qdrant.close()
+    if qdrant is not None:
+        await qdrant.close()
     logger.info("Server shutdown complete.")
 
 
@@ -125,6 +142,7 @@ def create_app() -> FastAPI:
     app.include_router(review_router)
     app.include_router(metrics_router)
     app.include_router(feedback_router)
+    app.include_router(health_router)
 
     # Health check
     @app.get("/health")

@@ -91,3 +91,19 @@ class TestRagOptIn:
         from server.routers.chat import _enable_rag
 
         assert _enable_rag() is True
+
+
+class TestRagInitGating:
+    """When RAG is off, the app must not load Qdrant/embedder at startup."""
+
+    def test_rag_off_skips_qdrant_and_embedder(self, monkeypatch):
+        monkeypatch.delenv("ENABLE_RAG", raising=False)
+        from fastapi.testclient import TestClient
+        from server.app import create_app
+
+        app = create_app()
+        with TestClient(app):
+            assert app.state.qdrant is None
+            assert app.state.embedder is None
+            # vLLM client is always initialized
+            assert app.state.vllm_client is not None

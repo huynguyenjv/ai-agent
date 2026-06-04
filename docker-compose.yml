@@ -27,8 +27,7 @@ services:
       # Cho phép container gọi vLLM chạy trên host (Linux docker 20.10+)
       - "host.docker.internal:host-gateway"
     depends_on:
-      qdrant:
-        condition: service_healthy
+      # qdrant only needed when RAG is enabled (start it with: --profile rag)
       postgres:
         condition: service_healthy
     volumes:
@@ -55,6 +54,8 @@ services:
     image: qdrant/qdrant:latest
     container_name: ai-agent-qdrant
     restart: unless-stopped
+    # RAG is opt-in — qdrant only starts with: docker compose --profile rag up
+    profiles: ["rag"]
     ports:
       # Bind localhost only — ai-agent truy cập qua docker network service name
       - "127.0.0.1:6333:6333"

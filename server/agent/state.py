@@ -27,6 +27,7 @@ class AgentState(TypedDict, total=False):
     tool_results: list[dict]
     context_assembled: str
     draft: str
+    degraded: bool                       # True when served via graceful-degradation fallback
     emitted_steps: list[str]
     volatile_rejected: bool  # Gate 3: query requests volatile data not supported in V1
     pending_tool_calls: list[dict]   # tools to emit, set by tool_selector

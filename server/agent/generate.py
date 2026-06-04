@@ -17,8 +17,10 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from server.agent.context_builder import build_optimal_context
+from server.agent.fallback import llm_unavailable_draft
 from server.agent.state import AgentState
 from server.cache import get_llm_cache
+from server.circuit_breaker import get_circuit_breaker
 from server.utils.sanitize import sanitize_tool_output
 
 logger = logging.getLogger("server.agent.generate")
@@ -1028,6 +1030,17 @@ async def generate(
     tool_names = [t["function"]["name"] for t in (all_tools or [])]
     logger.info("generate: tools=%s, tool_turns=%d/%d", tool_names, tool_turns_used, MAX_TOOL_TURNS)
 
+    # Phase 11.3/11.4: fail fast + degrade gracefully when the vLLM circuit is
+    # open instead of retrying a backend we already know is down.
+    vllm_circuit = get_circuit_breaker("vllm")
+    if not vllm_circuit.allow():
+        logger.warning("vLLM circuit open — serving graceful-degradation fallback")
+        draft = llm_unavailable_draft("vLLM circuit open")["draft"]
+        if sse_callback:
+            await sse_callback("content", draft)
+        return {"draft": draft, "pending_tool_calls": [], "tool_turns_used": tool_turns_used,
+                "degraded": True}
+
     # Stream response with retry logic
     content_buf: list[str] = []
     tool_calls_acc: list[dict] = []
@@ -1057,28 +1070,33 @@ async def generate(
                 if getattr(delta, "tool_calls", None):
                     _merge_tool_call_delta(tool_calls_acc, delta.tool_calls)
 
-            # Success - break out of retry loop
+            # Success - record on circuit breaker and break out of retry loop
+            vllm_circuit.record_success()
             break
 
         except Exception as e:
             last_error = e
+            vllm_circuit.record_failure()
             logger.warning(
                 "vLLM generation failed (attempt %d/%d): %s",
                 attempt + 1, MAX_RETRIES, e
             )
 
-            if attempt < MAX_RETRIES - 1:
+            if attempt < MAX_RETRIES - 1 and vllm_circuit.allow():
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 logger.info("Retrying in %.1fs...", delay)
                 await asyncio.sleep(delay)
             else:
                 logger.error("vLLM generation failed after %d attempts", MAX_RETRIES)
+                # Graceful degradation rather than surfacing a raw stack/error.
+                draft = llm_unavailable_draft(str(e))["draft"]
                 if sse_callback:
-                    await sse_callback("error", str(e))
+                    await sse_callback("content", draft)
                 return {
-                    "draft": f"Generation error after {MAX_RETRIES} retries: {e}",
+                    "draft": draft,
                     "pending_tool_calls": [],
                     "tool_turns_used": tool_turns_used,
+                    "degraded": True,
                 }
 
     # Process results
