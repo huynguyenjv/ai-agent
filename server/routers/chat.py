@@ -32,8 +32,12 @@ from server.metrics.counter import RequestTimer
 from server.metrics.prometheus import record_request, record_tokens, ACTIVE_REQUESTS
 from server.rate_limit import get_rate_limiter
 from server.session import get_session_store
+from server.agent.input_guard import get_input_guard
+from server.audit import get_audit_logger
 from server.utils.content import normalize_content
 from server.utils.sanitize import sanitize_user_input, sanitize_tool_output
+from server.utils import secret_scanner
+from server.validation import validate_chat_request, ValidationError
 from server.streaming.sse import (
     thinking_event,
     tool_error_event,
@@ -80,6 +84,13 @@ async def chat_completions(
 ) -> StreamingResponse:
     verify_api_key(req, x_api_key, authorization)
 
+    # Phase 10.6: input validation (size/count/path) before any processing
+    try:
+        validate_chat_request(request)
+    except ValidationError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail=str(e))
+
     # Rate limiting by API key or IP
     client_id = x_api_key or authorization or req.client.host if req.client else "unknown"
     limiter = get_rate_limiter()
@@ -114,13 +125,20 @@ def _convert_messages(request_messages: list[ChatMessage]):
     for msg in request_messages:
         text = normalize_content(msg.content)
         if msg.role == "user":
-            # Sanitize user input for prompt injection defense
+            # Sanitize user input for prompt injection defense (Phase 4 markers
+            # + Phase 10.2 InputGuard: neutralize role-hijack/delimiter/unicode).
             sanitized = sanitize_user_input(text)
-            out.append(HumanMessage(content=sanitized.text))
+            guarded_text, _ = get_input_guard().check_and_sanitize(sanitized.text)
+            out.append(HumanMessage(content=guarded_text))
         elif msg.role == "tool":
-            # Sanitize tool output to prevent injection via tool results
+            # Sanitize tool output (injection) then redact secrets (Phase 10.3)
+            # before tool results enter the model context.
+            safe = sanitize_tool_output(text)
+            redacted, findings = secret_scanner.redact(safe)
+            if findings:
+                logger.warning("Redacted %d secret(s) from tool output", len(findings))
             out.append(ToolMessage(
-                content=sanitize_tool_output(text),
+                content=redacted,
                 tool_call_id=msg.tool_call_id or "",
             ))
         elif msg.role == "assistant":
@@ -177,6 +195,33 @@ async def _stream_response(
             await event_queue.put(tool_error_event("generate", content))
 
     messages = _convert_messages(request.messages)
+
+    # Phase 10.2: hard-block when the latest user turn is a critical prompt
+    # injection (InputGuard blocks on CRITICAL by default). Lower-severity
+    # threats are neutralized in _convert_messages, not blocked.
+    latest_user = next(
+        (normalize_content(m.content) for m in reversed(request.messages) if m.role == "user"),
+        "",
+    )
+    guard_result = get_input_guard().check(latest_user)
+    if guard_result.blocked:
+        logger.warning(
+            "Blocked prompt injection (level=%s, threats=%d)",
+            guard_result.threat_level.value, len(guard_result.threats),
+        )
+        actor = req.headers.get("x-api-key") or (req.client.host if req.client else "unknown")
+        get_audit_logger().security_violation(
+            action="prompt_injection",
+            actor=actor,
+            correlation_id=request_id,
+            threat_level=guard_result.threat_level.value,
+            threat_count=len(guard_result.threats),
+        )
+        yield content_delta_event(
+            "⚠️ Yêu cầu bị từ chối: phát hiện dấu hiệu prompt injection."
+        )
+        yield done_event()
+        return
 
     # Load session context if conversation_id provided
     session_store = get_session_store()

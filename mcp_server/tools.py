@@ -306,104 +306,33 @@ def run_command(
     Returns:
         {stdout, stderr, exit_code, truncated, command}
     """
-    # Validate command is not empty
-    if not command or not command.strip():
-        return {"error": "Empty command", "exit_code": -1}
+    # Phase 10.1: delegate to CommandSandbox (whitelist by category, dangerous
+    # pattern regex, env isolation, path-traversal guard, audit log). The legacy
+    # ALLOWED_COMMANDS/BLOCKED_PATTERNS path is superseded by the sandbox.
+    from mcp_server.sandbox import CommandSandbox, SandboxConfig, get_sandbox
 
-    # Check for dangerous patterns
-    cmd_lower = command.lower()
-    for pattern in BLOCKED_PATTERNS:
-        if pattern in cmd_lower:
-            return {
-                "error": f"Blocked pattern detected: {pattern}",
-                "exit_code": -1,
-                "command": command,
-            }
-
-    # Parse command to check first word
-    try:
-        parts = shlex.split(command)
-        if not parts:
-            return {"error": "Invalid command", "exit_code": -1}
-    except ValueError as e:
-        return {"error": f"Command parse error: {e}", "exit_code": -1}
-
-    # Check if base command is allowed
-    base_cmd = os.path.basename(parts[0])
-    if base_cmd not in ALLOWED_COMMANDS:
-        return {
-            "error": f"Command not in whitelist: {base_cmd}. Allowed: {sorted(ALLOWED_COMMANDS)}",
-            "exit_code": -1,
-            "command": command,
-        }
-
-    # Git: only allow read-only subcommands
-    if base_cmd == "git":
-        git_readonly = {"status", "log", "diff", "show", "branch", "blame", "ls-files"}
-        if len(parts) > 1 and parts[1] not in git_readonly:
-            return {
-                "error": f"Git subcommand not allowed: {parts[1]}. Allowed: {git_readonly}",
-                "exit_code": -1,
-            }
-
-    # Determine working directory
-    cwd = repo_path
-    if working_dir:
-        cwd = os.path.join(repo_path, working_dir)
-        # Validate it's within repo
-        real_cwd = os.path.realpath(cwd)
-        real_repo = os.path.realpath(repo_path)
-        if not real_cwd.startswith(real_repo):
-            return {"error": "working_dir must be within repository", "exit_code": -1}
-        if not os.path.isdir(cwd):
-            return {"error": f"Directory not found: {working_dir}", "exit_code": -1}
-
-    logger.info("run_command: %s (cwd=%s)", command, cwd)
-
-    try:
-        # SECURITY: Use shell=False with parsed command list to prevent injection
-        result = subprocess.run(
-            parts,  # Already parsed via shlex.split()
-            shell=False,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env={**os.environ, "CI": "true"},  # Signal CI environment
+    sandbox = get_sandbox()
+    # Honor a caller-specified timeout without mutating the shared singleton.
+    if timeout and timeout != sandbox.config.timeout_seconds:
+        sandbox = CommandSandbox(
+            SandboxConfig(timeout_seconds=timeout, max_output_bytes=MAX_OUTPUT_SIZE)
         )
 
-        stdout = result.stdout
-        stderr = result.stderr
-        truncated = False
+    result = sandbox.execute(command, repo_path, working_dir)
 
-        # Truncate output if too large
-        if len(stdout) > MAX_OUTPUT_SIZE:
-            stdout = stdout[:MAX_OUTPUT_SIZE] + f"\n... [truncated, {len(result.stdout)} bytes total]"
-            truncated = True
-        if len(stderr) > MAX_OUTPUT_SIZE:
-            stderr = stderr[:MAX_OUTPUT_SIZE] + f"\n... [truncated, {len(result.stderr)} bytes total]"
-            truncated = True
-
+    if result.success:
         return {
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": result.returncode,
-            "truncated": truncated,
-            "command": command,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.exit_code,
+            "truncated": result.truncated,
+            "command": result.command,
         }
-
-    except subprocess.TimeoutExpired:
-        return {
-            "error": f"Command timed out after {timeout}s",
-            "exit_code": -1,
-            "command": command,
-        }
-    except Exception as e:
-        return {
-            "error": f"Execution failed: {e}",
-            "exit_code": -1,
-            "command": command,
-        }
+    return {
+        "error": result.error,
+        "exit_code": -1,
+        "command": result.command,
+    }
 
 
 # =============================================================================
