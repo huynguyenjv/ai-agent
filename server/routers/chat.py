@@ -183,7 +183,9 @@ async def _stream_response(
     )
     first_token_recorded = False
 
-    event_queue: asyncio.Queue = asyncio.Queue()
+    from server.streaming.optimized import make_event_queue
+
+    event_queue: asyncio.Queue = make_event_queue()  # bounded → backpressure (19.4)
     content_streamed = False
     output_tokens_estimate = 0
 

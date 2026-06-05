@@ -75,12 +75,17 @@ async def lifespan(app: FastAPI):
     app.state.qdrant = qdrant
     app.state.embedder = embedder
 
-    # Initialize vLLM client
-    app.state.vllm_client = AsyncOpenAI(
-        base_url=vllm_base_url,
-        api_key="not-needed",  # vLLM local, no auth required
-    )
+    # Initialize vLLM client with a bounded httpx connection pool (Phase 19.2)
+    from server.connections import build_vllm_client
+
+    app.state.vllm_client = build_vllm_client(vllm_base_url)
     app.state.vllm_model = os.environ.get("VLLM_MODEL", "qwen2.5-coder")
+
+    # Phase 19.3: optional speculative pre-warm (off by default)
+    from server.speculative import prewarm_enabled, prewarm_vllm
+
+    if prewarm_enabled():
+        await prewarm_vllm(app.state.vllm_client, app.state.vllm_model)
 
     logger.info("Server ready. vLLM: %s", vllm_base_url)
 
