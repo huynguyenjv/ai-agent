@@ -154,10 +154,12 @@ class TestHealthEndpoints:
             assert r.json()["status"] == "ok"
 
     def test_deep_health_structure(self, monkeypatch):
+        monkeypatch.delenv("REDIS_URL", raising=False)
         with self._client(monkeypatch) as c:
             body = c.get("/health/deep").json()
-            assert set(body["checks"].keys()) == {"vllm", "qdrant", "postgres"}
-            # RAG off / no DB → those checks are intentionally 'disabled'
+            assert set(body["checks"].keys()) == {"vllm", "qdrant", "postgres", "redis"}
+            # RAG off / no DB / no Redis → those checks are intentionally 'disabled'
             assert body["checks"]["qdrant"]["status"] == "disabled"
             assert body["checks"]["postgres"]["status"] == "disabled"
+            assert body["checks"]["redis"]["status"] == "disabled"
             assert "circuits" in body

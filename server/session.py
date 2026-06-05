@@ -155,22 +155,84 @@ class SessionStore:
 
 
 # =============================================================================
+# Redis-backed session store (Phase 11.1) — shared across instances
+# =============================================================================
+
+import json
+
+
+class RedisSessionStore:
+    """Session store in Redis so multi-turn context survives across instances.
+
+    Falls back to an in-memory store on any Redis error.
+    """
+
+    def __init__(self, redis_client, ttl_minutes: int = 30, prefix: str = "sess:"):
+        self._redis = redis_client
+        self._ttl = ttl_minutes * 60
+        self._prefix = prefix
+        self._fallback = SessionStore(ttl_minutes=ttl_minutes)
+
+    def _key(self, session_id: str) -> str:
+        return f"{self._prefix}{session_id}"
+
+    def get(self, session_id: str) -> dict[str, Any] | None:
+        try:
+            raw = self._redis.get(self._key(session_id))
+            if raw is None:
+                return None
+            self._redis.expire(self._key(session_id), self._ttl)  # touch
+            return json.loads(raw)
+        except Exception as e:
+            logger.warning("Redis session get error, using fallback: %s", e)
+            return self._fallback.get(session_id)
+
+    def set(self, session_id: str, data: dict[str, Any]) -> None:
+        try:
+            self._redis.setex(self._key(session_id), self._ttl, json.dumps(data))
+        except Exception as e:
+            logger.warning("Redis session set error, using fallback: %s", e)
+            self._fallback.set(session_id, data)
+
+    def delete(self, session_id: str) -> bool:
+        try:
+            return bool(self._redis.delete(self._key(session_id)))
+        except Exception:
+            return self._fallback.delete(session_id)
+
+    def cleanup(self) -> int:
+        # Redis expires keys automatically.
+        return 0
+
+    def stats(self) -> dict:
+        return {"backend": "redis", "ttl_minutes": self._ttl / 60}
+
+
+# =============================================================================
 # Singleton
 # =============================================================================
 
-_session_store: SessionStore | None = None
+_session_store: SessionStore | RedisSessionStore | None = None
 _store_lock = threading.Lock()
 
 
-def get_session_store() -> SessionStore:
-    """Get the singleton SessionStore instance."""
+def get_session_store() -> SessionStore | RedisSessionStore:
+    """Get singleton session store — Redis-backed if REDIS_URL is reachable,
+    otherwise in-memory (per-instance)."""
     global _session_store
 
     if _session_store is None:
         with _store_lock:
             if _session_store is None:
-                _session_store = SessionStore()
-                logger.info("SessionStore initialized")
+                from server.redis_client import get_redis
+
+                redis_client = get_redis()
+                if redis_client is not None:
+                    _session_store = RedisSessionStore(redis_client)
+                    logger.info("SessionStore: Redis-backed")
+                else:
+                    _session_store = SessionStore()
+                    logger.info("SessionStore: in-memory")
 
     return _session_store
 

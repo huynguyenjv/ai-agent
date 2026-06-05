@@ -54,3 +54,5 @@ tree-sitter-python
 tree-sitter-c-sharp
 tree-sitter-javascript
 tree-sitter-hcl
+
+redis>=5

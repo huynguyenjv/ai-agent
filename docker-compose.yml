@@ -21,6 +21,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/metrics_db
+      # For multi-instance: uncomment and start redis with: docker compose --profile scale up
+      # REDIS_URL: redis://redis:6379/0
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     extra_hosts:
@@ -73,6 +75,21 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-agent-redis
+    restart: unless-stopped
+    # Shared session + rate-limit for multi-instance. Start with: --profile scale
+    profiles: ["scale"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   postgres:
     image: postgres:16-alpine

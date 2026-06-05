@@ -123,24 +123,84 @@ class RateLimiter:
 
 
 # =============================================================================
+# Redis-backed limiter (Phase 11.1) — shared across instances
+# =============================================================================
+
+class RedisRateLimiter:
+    """Fixed-window rate limiter in Redis, coordinated across instances.
+
+    Falls back to a local in-memory RateLimiter on any Redis error so a Redis
+    outage degrades (per-instance limiting) instead of failing requests.
+    """
+
+    def __init__(
+        self,
+        redis_client,
+        max_requests: int = RATE_LIMIT_REQUESTS,
+        window_seconds: int = RATE_LIMIT_WINDOW,
+        prefix: str = "rl:",
+    ):
+        self._redis = redis_client
+        self._max = max_requests
+        self._window = window_seconds
+        self._prefix = prefix
+        self._fallback = RateLimiter(max_requests, window_seconds)
+
+    def allow(self, client_id: str, tokens: int = 1) -> bool:
+        key = f"{self._prefix}{client_id}"
+        try:
+            count = self._redis.incrby(key, tokens)
+            if count == tokens:  # first hit in this window → set expiry
+                self._redis.expire(key, self._window)
+            return count <= self._max
+        except Exception as e:
+            logger.warning("Redis rate-limit error, using in-memory fallback: %s", e)
+            return self._fallback.allow(client_id, tokens)
+
+    def retry_after(self, client_id: str, tokens: int = 1) -> float:
+        try:
+            ttl = self._redis.ttl(f"{self._prefix}{client_id}")
+            return float(ttl) if ttl and ttl > 0 else 0.0
+        except Exception:
+            return self._fallback.retry_after(client_id, tokens)
+
+    def stats(self) -> dict:
+        return {"backend": "redis", "max_requests": self._max, "window_seconds": self._window}
+
+
+# =============================================================================
 # Singleton
 # =============================================================================
 
-_rate_limiter: RateLimiter | None = None
+_rate_limiter: RateLimiter | RedisRateLimiter | None = None
 _limiter_lock = threading.Lock()
 
 
-def get_rate_limiter() -> RateLimiter:
-    """Get singleton RateLimiter instance."""
+def get_rate_limiter() -> RateLimiter | RedisRateLimiter:
+    """Get singleton rate limiter — Redis-backed if REDIS_URL is reachable,
+    otherwise in-memory (per-instance)."""
     global _rate_limiter
 
     if _rate_limiter is None:
         with _limiter_lock:
             if _rate_limiter is None:
-                _rate_limiter = RateLimiter()
-                logger.info(
-                    "RateLimiter initialized: %d requests per %d seconds",
-                    RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW
-                )
+                from server.redis_client import get_redis
+
+                redis_client = get_redis()
+                if redis_client is not None:
+                    _rate_limiter = RedisRateLimiter(redis_client)
+                    logger.info("RateLimiter: Redis-backed (%d / %ds)",
+                                RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
+                else:
+                    _rate_limiter = RateLimiter()
+                    logger.info("RateLimiter: in-memory (%d / %ds)",
+                                RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
     return _rate_limiter
+
+
+def reset_rate_limiter() -> None:
+    """Reset the singleton (tests)."""
+    global _rate_limiter
+    with _limiter_lock:
+        _rate_limiter = None
