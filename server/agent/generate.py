@@ -180,6 +180,33 @@ MCP_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "vtrip_apply_edits_atomic",
+            "description": "Apply edits to multiple files atomically with backup + rollback on failure + conflict detection. Prefer this over vtrip_apply_edits for multi-file changes. dry_run previews diffs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "new_content": {"type": "string"},
+                                "search": {"type": "string"},
+                                "replace": {"type": "string"},
+                            },
+                            "required": ["file_path"],
+                        },
+                    },
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                "required": ["edits"],
+            },
+        },
+    },
     # Git Integration Tools
     {
         "type": "function",
@@ -545,7 +572,8 @@ You have access to these tools:
 - vtrip_index_with_deps: Index file with its dependencies (file_path, depth)
 - vtrip_run_command: Execute shell command to run tests, lint, build (command, working_dir)
 - vtrip_diff_preview: Preview changes before applying, shows unified diff (file_path, new_content)
-- vtrip_apply_edits: Apply edits to multiple files atomically (edits[], dry_run)
+- vtrip_apply_edits: Apply edits to multiple files (edits[], dry_run)
+- vtrip_apply_edits_atomic: Multi-file edit as one transaction with rollback + conflict detection (edits[], dry_run)
 - vtrip_git_status: Get git status (branch, staged, modified, untracked)
 - vtrip_git_diff: Get git diff (file_path, staged)
 - vtrip_git_log: Get recent commits (count, file_path)

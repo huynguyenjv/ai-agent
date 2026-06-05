@@ -49,6 +49,7 @@ from mcp_server.tools import (
     lint_code,
 )
 from mcp_server.tools_indexer import get_project_skeleton, index_with_deps
+from mcp_server.tools_multifile import apply_multi_file_edits
 from mcp_server.tools_refactor import (
     rename_symbol,
     extract_function,
@@ -227,6 +228,33 @@ def create_server() -> Server:
             Tool(
                 name="vtrip_apply_edits",
                 description="Apply edits to multiple files atomically (full content or search/replace).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file_path": {"type": "string"},
+                                    "new_content": {"type": "string"},
+                                    "search": {"type": "string"},
+                                    "replace": {"type": "string"},
+                                },
+                                "required": ["file_path"],
+                            },
+                        },
+                        "dry_run": {"type": "boolean", "default": False},
+                    },
+                    "required": ["edits"],
+                },
+            ),
+            Tool(
+                name="vtrip_apply_edits_atomic",
+                description=(
+                    "Apply edits to multiple files as ONE transaction: backup, conflict "
+                    "detection, apply all, roll back every file if any fails. dry_run previews diffs."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -464,6 +492,12 @@ def create_server() -> Server:
             )
         elif name == "vtrip_apply_edits":
             result = apply_edits(
+                repo_path=REPO_PATH,
+                edits=arguments["edits"],
+                dry_run=arguments.get("dry_run", False),
+            )
+        elif name == "vtrip_apply_edits_atomic":
+            result = apply_multi_file_edits(
                 repo_path=REPO_PATH,
                 edits=arguments["edits"],
                 dry_run=arguments.get("dry_run", False),

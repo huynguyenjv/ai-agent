@@ -33,7 +33,9 @@ from server.metrics.prometheus import record_request, record_tokens, ACTIVE_REQU
 from server.rate_limit import get_rate_limiter
 from server.session import get_session_store
 from server.agent.input_guard import get_input_guard
+from server.agent.tool_validator import validate_tool_result, annotate_invalid
 from server.audit import get_audit_logger
+from server.metrics.tools import get_tool_analytics
 from server.utils.content import normalize_content
 from server.utils.sanitize import sanitize_user_input, sanitize_tool_output
 from server.utils import secret_scanner
@@ -137,8 +139,12 @@ def _convert_messages(request_messages: list[ChatMessage]):
             redacted, findings = secret_scanner.redact(safe)
             if findings:
                 logger.warning("Redacted %d secret(s) from tool output", len(findings))
+            # Phase 17.4/17.5: validate the tool result + record analytics.
+            tool_name = getattr(msg, "name", None) or ""
+            validation = validate_tool_result(tool_name, redacted)
+            get_tool_analytics().record(tool_name or "unknown", success=validation.valid)
             out.append(ToolMessage(
-                content=redacted,
+                content=annotate_invalid(redacted, validation),
                 tool_call_id=msg.tool_call_id or "",
             ))
         elif msg.role == "assistant":
