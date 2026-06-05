@@ -75,10 +75,15 @@ async def lifespan(app: FastAPI):
     app.state.qdrant = qdrant
     app.state.embedder = embedder
 
-    # Initialize vLLM client with a bounded httpx connection pool (Phase 19.2)
-    from server.connections import build_vllm_client
+    # Initialize vLLM client. DEV_MODE → mock (no real model server needed).
+    from server.dev_mode import is_dev_mode, build_mock_vllm_client
 
-    app.state.vllm_client = build_vllm_client(vllm_base_url)
+    if is_dev_mode():
+        app.state.vllm_client = build_mock_vllm_client()
+    else:
+        from server.connections import build_vllm_client
+
+        app.state.vllm_client = build_vllm_client(vllm_base_url)
     app.state.vllm_model = os.environ.get("VLLM_MODEL", "qwen2.5-coder")
 
     # Phase 19.3: optional speculative pre-warm (off by default)

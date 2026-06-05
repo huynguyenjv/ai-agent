@@ -13,15 +13,40 @@ DEFAULT_API_KEY = os.environ.get("API_KEY", "dev-secret-key")
 
 
 def cmd_health(args):
-    """Check server health."""
-    url = f"{args.url}/health"
+    """Check server health (use --deep for dependency probes)."""
+    path = "/health/deep" if getattr(args, "deep", False) else "/health"
+    url = f"{args.url}{path}"
     try:
-        resp = httpx.get(url, timeout=5)
+        resp = httpx.get(url, timeout=10)
         print(json.dumps(resp.json(), indent=2))
         return 0 if resp.status_code == 200 else 1
     except httpx.ConnectError:
         print(f"Error: Cannot connect to {url}")
         return 1
+
+
+def cmd_config(args):
+    """Validate local CLI config + server reachability (Phase 20.4)."""
+    checks = []
+    api_key = args.api_key
+    checks.append(("API key set", bool(api_key and api_key != "dev-secret-key")))
+    checks.append(("Server URL", bool(args.url)))
+
+    reachable = False
+    try:
+        resp = httpx.get(f"{args.url}/health", timeout=5)
+        reachable = resp.status_code == 200
+    except httpx.HTTPError:
+        reachable = False
+    checks.append(("Server reachable", reachable))
+
+    print("Config validation:")
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'OK' if passed else 'WARN'}] {name}")
+        ok = ok and passed
+    print(f"\nResolved: url={args.url} api_key={'***' if api_key else '(none)'}")
+    return 0 if ok else 1
 
 
 def cmd_chat(args):
@@ -31,9 +56,12 @@ def cmd_chat(args):
         "Content-Type": "application/json",
         "X-Api-Key": args.api_key,
     }
+    message = args.message
+    if getattr(args, "agents", False):
+        message = f"/agents {message}"  # opt-in multi-agent (see docs/multi-agent-design.md)
     payload = {
         "model": "default",
-        "messages": [{"role": "user", "content": args.message}],
+        "messages": [{"role": "user", "content": message}],
         "stream": True,
     }
 
@@ -158,7 +186,11 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # health
-    subparsers.add_parser("health", help="Check server health")
+    health_parser = subparsers.add_parser("health", help="Check server health")
+    health_parser.add_argument("--deep", action="store_true", help="Deep dependency probe")
+
+    # config
+    subparsers.add_parser("config", help="Validate CLI config + server reachability")
 
     # chat
     chat_parser = subparsers.add_parser("chat", help="Send chat message")
@@ -170,6 +202,10 @@ Examples:
         "-m", "--message",
         dest="message_flag",
         help="Message to send (alternative)",
+    )
+    chat_parser.add_argument(
+        "--agents", action="store_true",
+        help="Run multi-agent workflow for this request (/agents)",
     )
 
     # review
@@ -198,6 +234,8 @@ Examples:
 
     if args.command == "health":
         return cmd_health(args)
+    elif args.command == "config":
+        return cmd_config(args)
     elif args.command == "chat":
         msg = args.message or getattr(args, "message_flag", None)
         if not msg:
