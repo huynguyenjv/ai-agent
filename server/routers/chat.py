@@ -295,9 +295,12 @@ async def _stream_response(
         enable_rag=_enable_rag(),
     )
 
+    from server.tracing import span
+
     async def _run_agent():
         try:
-            result = await agent.ainvoke(initial_state)
+            with span("agent.invoke", **{"agent.multi": False}):
+                result = await agent.ainvoke(initial_state)
             await event_queue.put((_SENTINEL, result))
         except Exception as exc:
             await event_queue.put((_SENTINEL, exc))

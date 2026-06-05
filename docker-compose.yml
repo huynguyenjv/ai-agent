@@ -23,6 +23,8 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/metrics_db
       # For multi-instance: uncomment and start redis with: docker compose --profile scale up
       # REDIS_URL: redis://redis:6379/0
+      # For tracing: uncomment and start jaeger with: docker compose --profile observability up
+      # OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     extra_hosts:
@@ -90,6 +92,18 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: ai-agent-jaeger
+    restart: unless-stopped
+    # OTel tracing backend. Start with: docker compose --profile observability up
+    profiles: ["observability"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"   # Jaeger UI
+      - "127.0.0.1:4317:4317"     # OTLP gRPC
 
   postgres:
     image: postgres:16-alpine

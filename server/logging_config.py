@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 from contextvars import ContextVar
 
 # Context variable for correlation ID propagation across async boundaries
 correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="-")
+
+_SERVICE = os.environ.get("OTEL_SERVICE_NAME", "ai-agent")
 
 
 class StructuredJsonFormatter(logging.Formatter):
@@ -24,6 +27,7 @@ class StructuredJsonFormatter(logging.Formatter):
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
+            "service": _SERVICE,
             "message": record.getMessage(),
             "correlation_id": correlation_id_var.get("-"),
         }

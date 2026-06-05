@@ -109,32 +109,15 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Request logging middleware with correlation ID (Phase 7)
-    @app.middleware("http")
-    async def logging_middleware(request: Request, call_next):
-        cid = str(uuid.uuid4())[:8]
-        request.state.correlation_id = cid
+    # Correlation ID + request logging middleware (Phase 14.3)
+    from server.middleware.correlation import register_correlation_middleware
 
-        # Propagate correlation_id to all loggers in this async context
-        token = correlation_id_var.set(cid)
-        try:
-            start = time.monotonic()
-            response = await call_next(request)
-            elapsed_ms = (time.monotonic() - start) * 1000
+    register_correlation_middleware(app)
 
-            logger.info(
-                "[%s] %s %s -> %d (%.1fms)",
-                cid,
-                request.method,
-                request.url.path,
-                response.status_code,
-                elapsed_ms,
-            )
+    # OpenTelemetry tracing (Phase 14.1) — no-op unless configured
+    from server.tracing import setup_tracing
 
-            response.headers["X-Correlation-ID"] = cid
-            return response
-        finally:
-            correlation_id_var.reset(token)
+    setup_tracing(app)
 
     # Include routers
     app.include_router(chat_router)

@@ -56,3 +56,9 @@ tree-sitter-javascript
 tree-sitter-hcl
 
 redis>=5
+
+# Optional: OpenTelemetry tracing (Phase 14.1). Uncomment + set OTEL_EXPORTER_OTLP_ENDPOINT.
+# opentelemetry-sdk>=1.25
+# opentelemetry-exporter-otlp-proto-grpc>=1.25
+# opentelemetry-instrumentation-fastapi>=0.46b0
+# opentelemetry-instrumentation-httpx>=0.46b0
