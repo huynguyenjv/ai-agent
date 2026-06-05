@@ -243,9 +243,15 @@ async def _stream_response(
     )
     logger.info("Detected %d tool turns from conversation history", tool_turns_used)
 
+    # Phase 16.2: assign an A/B prompt variant (stable per conversation/client).
+    from server.experiment import get_experiment_manager
+    ab_unit = request.conversation_id or request_id
+    experiment_variant = get_experiment_manager().get_variant("code_gen_prompt", ab_unit)
+
     initial_state = {
         "messages": messages,
         "intent": session_data.get("last_intent", ""),  # Carry over from session
+        "experiment_variant": experiment_variant,
         "active_file": active_file or session_data.get("active_file"),
         "repo_path": request.repo_path or "",
         "mentioned_files": session_data.get("mentioned_files", []),

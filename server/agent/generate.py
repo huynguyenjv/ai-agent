@@ -697,7 +697,15 @@ def _parse_json_safe(s: str) -> dict:
 def _to_openai_messages(state: AgentState, tools_disabled: bool = False) -> list[dict]:
     """Convert LangChain messages to OpenAI format, with truncation."""
     intent = state.get("intent", "code_gen")
-    system_prompt = INTENT_PROMPTS.get(intent, DEFAULT_PROMPT)
+    # Phase 16.4: prefer versioned YAML prompt (+ A/B variant); fall back to the
+    # hardcoded persona when the intent is not defined in config/prompts.
+    from server.agent.prompt_store import get_prompt_store
+
+    variant = state.get("experiment_variant", "default")
+    system_prompt = (
+        get_prompt_store().get_intent(intent, variant)
+        or INTENT_PROMPTS.get(intent, DEFAULT_PROMPT)
+    )
 
     if tools_disabled:
         system_prompt += (
