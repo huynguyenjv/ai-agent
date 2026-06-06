@@ -267,6 +267,17 @@ async def _stream_response(
         messages, req.app.state.vllm_client, req.app.state.vllm_model
     )
 
+    # R10: recall durable cross-session memory (opt-in, off by default)
+    from server.agent.memory_store import enable_memory, get_memory_store
+    _mem_scope = request.conversation_id or req.headers.get("x-api-key") or "default"
+    if enable_memory():
+        recalled = get_memory_store().recall(_mem_scope, latest_user, top_k=3)
+        if recalled:
+            note = "Relevant memory from earlier sessions:\n" + "\n".join(
+                f"- {m['content'][:200]}" for m in recalled
+            )
+            messages = [SystemMessage(content=note)] + messages
+
     # Load session context if conversation_id provided
     session_store = get_session_store()
     session_data = {}
@@ -292,6 +303,11 @@ async def _stream_response(
     ab_unit = request.conversation_id or request_id
     experiment_variant = get_experiment_manager().get_variant("code_gen_prompt", ab_unit)
 
+    # R11 RBAC: resolve role → tools this caller is allowed to use.
+    from server.auth_rbac import role_for_key, permissions_for, allowed_tool_names
+    _role = role_for_key(req.headers.get("x-api-key"))
+    allowed_tools = list(allowed_tool_names(permissions_for(_role)))
+
     initial_state = {
         "messages": messages,
         "intent": session_data.get("last_intent", ""),  # Carry over from session
@@ -315,6 +331,7 @@ async def _stream_response(
         "tool_turns_used": tool_turns_used,
         "client_tools": request.tools or [],
         "tool_choice": request.tool_choice,
+        "allowed_tools": allowed_tools,
     }
 
     from server.agent.graph import build_agent_graph
@@ -405,6 +422,12 @@ async def _stream_response(
                 "context_summary": agent_result.get("context_assembled", "")[:2000],
             })
             logger.debug("Saved session context for %s", request.conversation_id[:8])
+
+        # R10: persist durable cross-session memory (opt-in)
+        if enable_memory():
+            summary = agent_result.get("context_assembled") or agent_result.get("draft", "")
+            if summary:
+                get_memory_store().remember(_mem_scope, summary[:1000])
 
     # Record metrics
     metrics_timer.metrics.total_time_ms = metrics_timer.get_elapsed_ms()

@@ -1008,13 +1008,19 @@ async def generate(
         )
         all_tools = None
     else:
+        # R11 RBAC: only advertise tools the caller's role permits.
+        allowed = set(state.get("allowed_tools") or [])
+        mcp_tools = [
+            t for t in MCP_TOOLS
+            if not allowed or t["function"]["name"] in allowed
+        ]
         # Merge MCP tools with client tools (MCP takes priority)
         client_tools = state.get("client_tools") or []
         extra_tools = [
             t for t in client_tools
             if t.get("function", {}).get("name") not in MCP_TOOL_NAMES
         ]
-        all_tools = MCP_TOOLS + extra_tools if MCP_TOOLS or extra_tools else None
+        all_tools = mcp_tools + extra_tools if mcp_tools or extra_tools else None
 
     messages = _to_openai_messages(state, tools_disabled=tools_disabled)
 

@@ -44,6 +44,7 @@ class AgentState(TypedDict, total=False):
     # --- Native tool-call (client-forwarded) ---
     client_tools: list[dict]             # raw tool schemas from ChatRequest.tools
     tool_choice: str | dict | None       # forwarded tool_choice
+    allowed_tools: list[str]             # RBAC: tool names this role may use (R11)
 
     # --- Validation (Phase 3) ---
     validation_warnings: list[str]       # warnings from post_process validation
