@@ -30,6 +30,7 @@ from server.routers.review import router as review_router
 from server.routers.metrics import router as metrics_router
 from server.routers.feedback import router as feedback_router
 from server.routers.health import router as health_router
+from server.routers.jobs import router as jobs_router
 
 logger = logging.getLogger("server")
 
@@ -136,6 +137,7 @@ def create_app() -> FastAPI:
     app.include_router(metrics_router)
     app.include_router(feedback_router)
     app.include_router(health_router)
+    app.include_router(jobs_router)
 
     # Health check
     @app.get("/health")

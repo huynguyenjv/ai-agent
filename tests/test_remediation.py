@@ -75,3 +75,37 @@ class TestPromptMigration:
             "search", "debug", "refine", "explain",
         ):
             assert store.get_intent(intent), f"missing intent in YAML: {intent}"
+
+
+# --------------------------------------------------------------------------- #
+# R5 — summarize wiring (safe: never touches tool pairing)
+# --------------------------------------------------------------------------- #
+class TestSummarizeWiring:
+    async def test_long_pure_chat_is_condensed(self):
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from server.routers.chat import _maybe_summarize
+        from server.dev_mode import build_mock_vllm_client
+
+        msgs = [HumanMessage(content=f"question {i}") for i in range(12)]
+        out = await _maybe_summarize(msgs, build_mock_vllm_client(), "m")
+        assert len(out) < len(msgs)
+        assert isinstance(out[0], SystemMessage)
+
+    async def test_skips_when_tool_context_present(self):
+        from langchain_core.messages import HumanMessage, ToolMessage
+        from server.routers.chat import _maybe_summarize
+        from server.dev_mode import build_mock_vllm_client
+
+        msgs = [HumanMessage(content=f"q{i}") for i in range(12)]
+        msgs.append(ToolMessage(content="result", tool_call_id="1"))
+        out = await _maybe_summarize(msgs, build_mock_vllm_client(), "m")
+        assert out == msgs  # unchanged — tool pairing preserved
+
+    async def test_short_chat_untouched(self):
+        from langchain_core.messages import HumanMessage
+        from server.routers.chat import _maybe_summarize
+        from server.dev_mode import build_mock_vllm_client
+
+        msgs = [HumanMessage(content="hi"), HumanMessage(content="there")]
+        out = await _maybe_summarize(msgs, build_mock_vllm_client(), "m")
+        assert out == msgs

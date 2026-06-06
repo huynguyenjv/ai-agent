@@ -159,6 +159,37 @@ def _convert_messages(request_messages: list[ChatMessage]):
     return out
 
 
+def _has_tool_context(messages) -> bool:
+    """True if any message is a tool result or an assistant with tool_calls."""
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            return True
+        if isinstance(m, AIMessage) and (m.additional_kwargs or {}).get("tool_calls"):
+            return True
+    return False
+
+
+async def _maybe_summarize(messages, vllm_client, model):
+    """Phase R5: summarize long PURE-CHAT conversations to preserve context.
+
+    Conservative — skips entirely when any tool message is present so the
+    required assistant/tool_call pairing is never broken.
+    """
+    from server.agent.summarize import should_summarize, summarize_conversation
+
+    if not should_summarize(messages) or _has_tool_context(messages):
+        return messages
+    keep_recent = 4
+    if len(messages) <= keep_recent:
+        return messages
+    older, recent = messages[:-keep_recent], messages[-keep_recent:]
+    summary = await summarize_conversation(older, vllm_client, model)
+    if not summary:
+        return messages
+    logger.info("Summarized %d older messages into context", len(older))
+    return [SystemMessage(content=f"[Earlier conversation summary: {summary}]")] + recent
+
+
 def _enable_rag() -> bool:
     # Agentic-first: RAG (Qdrant) is OPT-IN. Default OFF — the agent gathers
     # context via client-side tools (grep/search_symbol/read_file) which are
@@ -230,6 +261,11 @@ async def _stream_response(
         )
         yield done_event()
         return
+
+    # R5: condense long pure-chat history (skipped when tools are involved)
+    messages = await _maybe_summarize(
+        messages, req.app.state.vllm_client, req.app.state.vllm_model
+    )
 
     # Load session context if conversation_id provided
     session_store = get_session_store()
