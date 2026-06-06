@@ -16,6 +16,7 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     intent: str  # code_gen, unit_test, explain, structural_analysis, search, refine, code_review
     experiment_variant: str              # A/B prompt variant (Phase 16.2), default "default"
+    multi_agent: bool                    # /agents opt-in: always run reviewer + refine loop (R9)
     active_file: str | None
     repo_path: str | None                # repository root (client-provided), used by context_builder
     mentioned_files: list[str]

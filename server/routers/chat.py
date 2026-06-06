@@ -159,6 +159,26 @@ def _convert_messages(request_messages: list[ChatMessage]):
     return out
 
 
+import re as _re
+
+_AGENTS_PREFIX = _re.compile(r"^\s*/agents\b\s*", _re.IGNORECASE)
+
+
+def _parse_agents_directive(messages) -> tuple[list, bool]:
+    """Detect & strip a leading /agents on the latest user turn (R9).
+
+    Returns (messages, multi_agent). /agents → run the reviewer + refine loop.
+    """
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            content = m.content if isinstance(m.content, str) else normalize_content(m.content)
+            if _AGENTS_PREFIX.match(content or ""):
+                m.content = _AGENTS_PREFIX.sub("", content, count=1)
+                return messages, True
+            return messages, False
+    return messages, False
+
+
 def _has_tool_context(messages) -> bool:
     """True if any message is a tool result or an assistant with tool_calls."""
     for m in messages:
@@ -234,6 +254,9 @@ async def _stream_response(
             await event_queue.put(tool_error_event("generate", content))
 
     messages = _convert_messages(request.messages)
+
+    # R9: /agents opt-in → thorough multi-agent (reviewer + refine loop)
+    messages, multi_agent = _parse_agents_directive(messages)
 
     # Phase 10.2: hard-block when the latest user turn is a critical prompt
     # injection (InputGuard blocks on CRITICAL by default). Lower-severity
@@ -312,6 +335,7 @@ async def _stream_response(
         "messages": messages,
         "intent": session_data.get("last_intent", ""),  # Carry over from session
         "experiment_variant": experiment_variant,
+        "multi_agent": multi_agent,
         "active_file": active_file or session_data.get("active_file"),
         "repo_path": request.repo_path or "",
         "mentioned_files": session_data.get("mentioned_files", []),

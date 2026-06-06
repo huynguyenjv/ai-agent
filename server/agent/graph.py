@@ -93,8 +93,8 @@ def _route_after_verify(state: AgentState) -> str:
         # Verification failed - retry generate
         return "generate"
 
-    # For complex tasks, go to critic for quality review
-    if state.get("complexity") == "complex":
+    # Complex tasks — or /agents "thorough mode" (R9) — go through the reviewer.
+    if state.get("complexity") == "complex" or state.get("multi_agent"):
         return "critic"
 
     return "post_process"
