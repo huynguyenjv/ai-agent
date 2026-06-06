@@ -72,12 +72,17 @@ async def rag_search(state: AgentState, qdrant, embedder) -> dict:
         # Produce embeddings
         dense_vector, sparse_vector = embedder.embed_both(query)
 
-        # Hybrid search
-        results = await qdrant.hybrid_search(
-            dense_vector=dense_vector,
-            sparse_vector=sparse_vector,
-            lang_filter=lang_filter,
-            top_k=8,
+        # Hybrid search through the Qdrant circuit breaker (fail fast when down)
+        from server.circuit_breaker import get_circuit_breaker
+
+        cb = get_circuit_breaker("qdrant")
+        results = await cb.call(
+            lambda: qdrant.hybrid_search(
+                dense_vector=dense_vector,
+                sparse_vector=sparse_vector,
+                lang_filter=lang_filter,
+                top_k=8,
+            )
         )
     except Exception as e:
         logger.warning("RAG search failed: %s", e)

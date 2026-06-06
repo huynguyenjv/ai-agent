@@ -30,7 +30,7 @@ class TestPromptStore:
 
     def test_version_and_variants(self):
         store = reset_prompt_store("config/prompts")
-        assert store.version() == "1.0.0"
+        assert store.version() == "1.1.0"
         assert "concise" in store.variants_for("code_gen")
 
 

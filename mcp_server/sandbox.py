@@ -42,13 +42,59 @@ class SandboxConfig:
     allowed_paths: list[str] = field(default_factory=list)
 
 
-# Command whitelist with categories
+# Phase R1 hardening — close the interpreter RCE vectors.
+# Interpreters that can execute inline code from a flag.
+_INTERPRETERS = {"python", "python3", "node", "ruby", "perl", "deno", "bun"}
+# Flags that execute inline code or read code from stdin.
+_INLINE_CODE_FLAGS = {"-c", "-e", "--eval", "-p", "--print", "-"}
+# Argument-level dangerous patterns (package install / remote fetch).
+_DANGEROUS_ARG_REGEX = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\bpip\d?\s+install\b", r"-m\s+pip\b",
+        r"\bnpm\s+(install|i|exec|x)\b", r"\bnpx\b",
+        r"\bgem\s+install\b", r"\bcargo\s+install\b", r"\bgo\s+install\b",
+        r"\bpoetry\s+add\b", r"\buv\s+pip\b",
+    ]
+]
+
+
+def exec_enabled() -> bool:
+    """Whether command execution is allowed at all (default on)."""
+    return os.environ.get("EXEC_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+def isolation_wrap(parts: list[str], cwd: str) -> list[str]:
+    """Optionally wrap a command in OS-level isolation.
+
+    EXEC_ISOLATION=container → run inside an ephemeral, network-less, read-only
+    container (workdir rw, resource-capped) for true isolation. Default (none)
+    returns parts unchanged (whitelist + arg-guards still apply).
+    """
+    mode = os.environ.get("EXEC_ISOLATION", "none").lower()
+    if mode == "container":
+        image = os.environ.get("EXEC_CONTAINER_IMAGE", "python:3.12-slim")
+        return [
+            "docker", "run", "--rm", "--network=none", "--read-only",
+            "--memory=512m", "--cpus=1", "--pids-limit=256",
+            "-v", f"{cwd}:/work:rw", "-w", "/work", "--tmpfs", "/tmp:rw",
+            image, *parts,
+        ]
+    return parts
+
+
+def _allow_npx() -> bool:
+    return os.environ.get("EXEC_ALLOW_NPX", "false").lower() in ("1", "true", "yes")
+
+
+# Command whitelist with categories.
+# NOTE: npx is intentionally NOT whitelisted (downloads + executes arbitrary
+# packages = supply-chain RCE). Enable only via EXEC_ALLOW_NPX in a trusted env.
 COMMAND_WHITELIST: dict[str, CommandCategory] = {
     # Test runners
     "pytest": CommandCategory.TEST,
     "python": CommandCategory.TEST,
+    "python3": CommandCategory.TEST,
     "npm": CommandCategory.TEST,
-    "npx": CommandCategory.TEST,
     "node": CommandCategory.TEST,
     "go": CommandCategory.TEST,
     "cargo": CommandCategory.TEST,
@@ -173,11 +219,21 @@ class CommandSandbox:
         if not command or not command.strip():
             return False, "Empty command", None
 
-        # Check dangerous patterns
+        if not exec_enabled():
+            return False, "Command execution disabled (EXEC_ENABLED=false)", None
+
+        # Check dangerous patterns (destructive / privilege / RCE)
         cmd_str = command.lower()
         for pattern in DANGEROUS_REGEX:
             if pattern.search(cmd_str):
                 return False, f"Dangerous pattern: {pattern.pattern}", None
+
+        # R1: block package-install / remote-exec argument patterns
+        for pattern in _DANGEROUS_ARG_REGEX:
+            if pattern.search(command):
+                if pattern.pattern == r"\bnpx\b" and _allow_npx():
+                    continue
+                return False, f"Blocked argument pattern: {pattern.pattern}", None
 
         # Parse command
         try:
@@ -190,9 +246,17 @@ class CommandSandbox:
         # Check whitelist
         base_cmd = os.path.basename(parts[0])
         category = COMMAND_WHITELIST.get(base_cmd)
+        if category is None and base_cmd == "npx" and _allow_npx():
+            category = CommandCategory.TEST
 
         if category is None:
             return False, f"Command not whitelisted: {base_cmd}", None
+
+        # R1: block interpreters executing inline code (python -c, node -e, ...)
+        if base_cmd in _INTERPRETERS:
+            for arg in parts[1:]:
+                if arg in _INLINE_CODE_FLAGS:
+                    return False, f"Inline code execution blocked: {base_cmd} {arg}", None
 
         # Git: only allow read-only subcommands
         if base_cmd == "git" and len(parts) > 1:
@@ -262,6 +326,7 @@ class CommandSandbox:
         # Execute command
         try:
             parts = shlex.split(command)
+            parts = isolation_wrap(parts, cwd)  # R1: optional container isolation
 
             # Build environment (isolated)
             env = {
