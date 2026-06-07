@@ -25,6 +25,9 @@ services:
       # REDIS_URL: redis://redis:6379/0
       # For tracing: uncomment and start jaeger with: docker compose --profile observability up
       # OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      # For translation: uncomment and start NLLB with: docker compose --profile translate up
+      # ENABLE_TRANSLATE: "true"
+      # TRANSLATION_URL: http://translation-service:8100
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     extra_hosts:
@@ -104,6 +107,29 @@ services:
     ports:
       - "127.0.0.1:16686:16686"   # Jaeger UI
       - "127.0.0.1:4317:4317"     # OTLP gRPC
+
+  translation-service:
+    build: ./translation-service           # build on the server (needs nvidia-container-toolkit)
+    container_name: ai-agent-translation
+    restart: unless-stopped
+    # NLLB-200-3.3B (CC-BY-NC, internal only). Start with: docker compose --profile translate up
+    profiles: ["translate"]
+    environment:
+      MODEL_DIR: /models/nllb-200-3.3B-ct2
+      DEVICE: cuda
+      COMPUTE_TYPE: int8_float16
+      # TRANSLATE_MOCK: "true"   # run without the model (dev)
+    volumes:
+      - /models/nllb-200-3.3B-ct2:/models/nllb-200-3.3B-ct2:ro
+    ports:
+      - "127.0.0.1:8100:8100"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   postgres:
     image: postgres:16-alpine

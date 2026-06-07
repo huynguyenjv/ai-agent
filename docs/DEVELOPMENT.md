@@ -70,6 +70,22 @@ docker compose --profile scale up          # + redis (multi-instance)
 docker compose --profile observability up  # + jaeger (OTel tracing)
 ```
 
+## 6b. Translation API (NLLB-200-3.3B, opt-in)
+
+Multi-model: coding → vLLM, translation → a separate `translation-service`
+(NLLB + CTranslate2, GPU). See `docs/translation-api-implementation.md` and
+`translation-service/README.md`.
+
+```bash
+# 1. one-time: convert NLLB → CTranslate2 int8 (~4GB) into /models/nllb-200-3.3B-ct2
+# 2. start the service (build on server; needs nvidia-container-toolkit):
+docker compose --profile translate up -d --build
+# 3. enable on ai-agent: ENABLE_TRANSLATE=true, TRANSLATION_URL=http://translation-service:8100
+```
+API: `POST /v1/translate {text, source_lang, target_lang}` · `GET /v1/translate/languages`
+(languages are dynamic — all ~200 NLLB FLORES codes). Dev/CI: `TRANSLATE_MOCK=true`.
+License: NLLB is CC-BY-NC — internal use only.
+
 ## 7. Troubleshooting
 
 | Triệu chứng | Nguyên nhân / cách xử lý |

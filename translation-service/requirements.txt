@@ -1,0 +1,5 @@
+ctranslate2>=4.3
+transformers>=4.40
+sentencepiece>=0.2
+fastapi>=0.110
+uvicorn[standard]>=0.29
