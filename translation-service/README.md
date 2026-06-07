@@ -40,5 +40,12 @@ POST /translate   {text, source, target(FLORES)} → {translation}
 | DEVICE | cuda | cpu \| cuda |
 | COMPUTE_TYPE | int8_float16 | CPU: use `int8` |
 | TRANSLATE_MOCK | false | stub mode (no model) |
-| BEAM_SIZE | 2 | |
+| BEAM_SIZE | 4 | 4-5 = chất lượng cao hơn (chậm hơn) |
+| LENGTH_PENALTY | 1.0 | >1 ưu tiên câu đủ ý |
+| REPETITION_PENALTY | 1.1 | chống lặp từ |
+| NO_REPEAT_NGRAM | 3 | cấm lặp cụm 3-gram; 0=tắt |
 | MAX_DECODING_LENGTH | 512 | |
+
+> Các tham số decoding đọc từ env → tinh chỉnh trong `docker-compose.yml`
+> (`environment:`) rồi `docker compose --profile translate up -d` lại, **không
+> cần sửa code**.

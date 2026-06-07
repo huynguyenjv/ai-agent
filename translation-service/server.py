@@ -21,8 +21,11 @@ DEVICE = os.environ.get("DEVICE", "cuda")               # cpu | cuda
 COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "int8_float16")  # GPU: int8_float16; CPU: int8
 TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME", "facebook/nllb-200-3.3B")
 MOCK = os.environ.get("TRANSLATE_MOCK", "false").lower() in ("1", "true", "yes")
-BEAM_SIZE = int(os.environ.get("BEAM_SIZE", "2"))
+BEAM_SIZE = int(os.environ.get("BEAM_SIZE", "4"))               # 4-5 cho chất lượng cao hơn
 MAX_DECODING = int(os.environ.get("MAX_DECODING_LENGTH", "512"))
+LENGTH_PENALTY = float(os.environ.get("LENGTH_PENALTY", "1.0"))  # >1 ưu tiên câu dài/đủ ý
+REPETITION_PENALTY = float(os.environ.get("REPETITION_PENALTY", "1.1"))  # chống lặp từ
+NO_REPEAT_NGRAM = int(os.environ.get("NO_REPEAT_NGRAM", "3"))    # cấm lặp cụm 3-gram; 0=tắt
 
 app = FastAPI(title="translation-service", version="1.0.0")
 
@@ -91,6 +94,9 @@ def translate(req: TranslateReq) -> dict:
             target_prefix=[[req.target]],
             beam_size=BEAM_SIZE,
             max_decoding_length=MAX_DECODING,
+            length_penalty=LENGTH_PENALTY,
+            repetition_penalty=REPETITION_PENALTY,
+            no_repeat_ngram_size=NO_REPEAT_NGRAM,
         )
         hyp = result[0].hypotheses[0][1:]  # drop the target-language token
         outputs.append(_tokenizer.decode(_tokenizer.convert_tokens_to_ids(hyp)))
