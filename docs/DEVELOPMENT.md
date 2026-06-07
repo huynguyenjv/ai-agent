@@ -82,9 +82,24 @@ Multi-model: coding → vLLM, translation → a separate `translation-service`
 docker compose --profile translate up -d --build
 # 3. enable on ai-agent: ENABLE_TRANSLATE=true, TRANSLATION_URL=http://translation-service:8100
 ```
-API: `POST /v1/translate {text, source_lang, target_lang}` · `GET /v1/translate/languages`
-(languages are dynamic — all ~200 NLLB FLORES codes). Dev/CI: `TRANSLATE_MOCK=true`.
-License: NLLB is CC-BY-NC — internal use only.
+### API (batch, multi-model)
+```
+POST /v1/translate
+{
+  "sourceLang": "vi",                       // required (explicit)
+  "targetLangs": ["en", "ko"],              // 1..N
+  "items": [ { "ref": {"id":1,"field":"name"}, "text": "Quản trị viên" } ],
+  "context": "IAM role names",              // optional domain hint
+  "style": "llm",                           // llm (Qwen, default) | marketing | faithful (NLLB)
+  "glossary": ["Vinpearl"]                  // optional, keep verbatim
+}
+→ { "results":[{"ref":{...},"translations":{"en":"Administrator","ko":"관리자"}}],
+    "errors":[], "model":"qwen..." }
+```
+- `llm`/`marketing` → Qwen (vLLM); `faithful` → NLLB service (needs `--profile translate`).
+- `ref` echoed back untouched; `results` keep item order; failures go to `errors[]` (rest still returned).
+- Limits: `TRANSLATE_MAX_ITEMS=50`, `TRANSLATE_MAX_CHARS=20000`, `TRANSLATE_TIMEOUT_SECS=60`.
+- NLLB (`faithful`) is CC-BY-NC — internal only. Dev/CI: `TRANSLATE_MOCK=true`.
 
 ## 7. Troubleshooting
 

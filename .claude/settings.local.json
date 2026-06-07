@@ -60,7 +60,8 @@
       "Bash(awk '{s+=$1} END {print s\" tests total\"}')",
       "Bash(echo \"compileall: exit $?\")",
       "Bash(ls -la .env*)",
-      "Bash(cat .env.example)"
+      "Bash(cat .env.example)",
+      "Bash(git checkout *)"
     ]
   }
 }
