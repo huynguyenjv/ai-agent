@@ -120,7 +120,7 @@ services:
       COMPUTE_TYPE: int8_float16
       # TRANSLATE_MOCK: "true"   # run without the model (dev)
     volumes:
-      - /models/nllb-200-3.3B-ct2:/models/nllb-200-3.3B-ct2:ro
+      - ./models/nllb-200-3.3B-ct2:/models/nllb-200-3.3B-ct2:ro
     ports:
       - "127.0.0.1:8100:8100"
     deploy:
