@@ -58,7 +58,9 @@
       "Bash(ls report/)",
       "Bash(bc)",
       "Bash(awk '{s+=$1} END {print s\" tests total\"}')",
-      "Bash(echo \"compileall: exit $?\")"
+      "Bash(echo \"compileall: exit $?\")",
+      "Bash(ls -la .env*)",
+      "Bash(cat .env.example)"
     ]
   }
 }
