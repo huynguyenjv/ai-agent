@@ -1,4 +1,4 @@
-# AI Agent — JUnit5 Test Generator
+# AI Agent
 
 Self-hosted AI agent that generates **JUnit5 + Mockito** unit tests for Java services.  
 Uses RAG (Qdrant) + local LLM (vLLM) and is orchestrated by **LangGraph** for modular, maintainable, and extensible workflows.
