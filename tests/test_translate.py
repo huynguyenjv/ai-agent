@@ -209,7 +209,7 @@ class TestQwenTranscreate:
         assert "rough draft" in prompt            # draft
         assert "travel" in prompt                 # context
         assert "Vtrip" in prompt                  # glossary
-        assert '{"0":"..."}' in prompt            # literal JSON example survived
+        assert '{"0":"..."' in prompt             # literal JSON braces survived (any item count)
 
 
 class TestMarketingHybrid:
