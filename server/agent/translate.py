@@ -100,6 +100,25 @@ async def _qwen_translate_lang(vllm_client, model, items, source_lang, target_la
     return parsed or {}
 
 
+async def _nllb_draft_batch(items, source_lang, target_lang):
+    """Translate the whole batch into target_lang via NLLB.
+
+    Returns (drafts {index:int -> text}, failed:bool). On ANY NLLB error the
+    whole language is considered failed (caller falls back to Qwen-direct).
+    """
+    from server.translation import get_translation_client
+
+    client = get_translation_client()
+    drafts: dict[int, str] = {}
+    try:
+        for idx, it in enumerate(items):
+            drafts[idx] = await client.translate(it["text"], source_lang, target_lang)
+        return drafts, False
+    except Exception as e:
+        logger.warning("nllb draft failed (lang=%s): %s", target_lang, e)
+        return drafts, True
+
+
 async def translate_batch(vllm_client, model, items, source_lang, target_langs,
                           context=None, style="llm", glossary=None):
     """Translate items into target_langs. Returns (results, errors).

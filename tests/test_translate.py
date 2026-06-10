@@ -157,3 +157,28 @@ class TestTranslatePrompts:
         store = reset_translate_prompts(str(tmp_path))
         assert store.get("marketing_system") == "Hello copywriter"
         assert store.get("missing_key") is None
+
+
+# ----- hybrid marketing helpers --------------------------------------------- #
+class TestNllbDraftBatch:
+    async def test_success_returns_drafts(self, monkeypatch):
+        from server.agent.translate import _nllb_draft_batch
+
+        class FakeNLLB:
+            async def translate(self, text, src, tgt):
+                return f"draft[{text}->{tgt}]"
+        monkeypatch.setattr("server.translation.get_translation_client", lambda: FakeNLLB())
+        drafts, failed = await _nllb_draft_batch(ITEMS, "vi", "en")
+        assert failed is False
+        assert drafts[0] == "draft[Quản trị viên->en]"
+        assert drafts[1].startswith("draft[")
+
+    async def test_failure_returns_failed_true(self, monkeypatch):
+        from server.agent.translate import _nllb_draft_batch
+
+        class FakeNLLB:
+            async def translate(self, text, src, tgt):
+                raise RuntimeError("nllb down")
+        monkeypatch.setattr("server.translation.get_translation_client", lambda: FakeNLLB())
+        drafts, failed = await _nllb_draft_batch([ITEMS[0]], "vi", "en")
+        assert failed is True
