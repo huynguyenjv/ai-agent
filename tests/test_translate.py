@@ -141,3 +141,19 @@ class TestEndpoint:
                 "sourceLang": "vi", "targetLangs": ["en"],
                 "items": [{"text": "x"}] * 51})
             assert r.status_code == 422
+
+
+# ----- prompt loader -------------------------------------------------------- #
+class TestTranslatePrompts:
+    def test_absent_file_returns_none(self, tmp_path):
+        from server.agent.translate_prompts import reset_translate_prompts
+        store = reset_translate_prompts(str(tmp_path))
+        assert store.get("marketing_system") is None
+
+    def test_present_file_returns_value(self, tmp_path):
+        from server.agent.translate_prompts import reset_translate_prompts
+        (tmp_path / "translate.yaml").write_text(
+            "prompts:\n  marketing_system: |\n    Hello copywriter\n", encoding="utf-8")
+        store = reset_translate_prompts(str(tmp_path))
+        assert store.get("marketing_system") == "Hello copywriter"
+        assert store.get("missing_key") is None
