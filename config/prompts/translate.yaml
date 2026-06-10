@@ -17,6 +17,8 @@ prompts:
     language. Keep ALL facts, numbers and proper nouns unchanged. Be creative
     but accurate — never invent details.
 
+  # NOTE: test_prompt_includes_original_and_draft asserts the literal '{"0":"..."}'
+  # appears in this template. If you change the JSON example form, update that test.
   marketing_transcreate_user: |
     The items below were machine-translated into {target_lang}. For each item you
     are given the ORIGINAL source text and the machine DRAFT.
