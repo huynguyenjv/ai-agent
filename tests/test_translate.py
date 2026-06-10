@@ -210,3 +210,66 @@ class TestQwenTranscreate:
         assert "travel" in prompt                 # context
         assert "Vtrip" in prompt                  # glossary
         assert '{"0":"..."}' in prompt            # literal JSON example survived
+
+
+class TestMarketingHybrid:
+    def _nllb(self, monkeypatch, fn):
+        class FakeNLLB:
+            async def translate(self, text, src, tgt):
+                return fn(text, src, tgt)
+        monkeypatch.setattr("server.translation.get_translation_client", lambda: FakeNLLB())
+
+    async def test_both_ok_uses_qwen(self, monkeypatch):
+        self._nllb(monkeypatch, lambda t, s, g: "NLLB draft")
+        vllm = FakeVLLM(['{"0":"Polished!"}'])
+        results, errors = await translate_batch(
+            vllm, "qwen", [ITEMS[0]], "vi", ["en"], style="marketing")
+        assert errors == []
+        assert results[0]["translations"]["en"] == "Polished!"
+
+    async def test_nllb_ok_qwen_parsefail_falls_back_to_draft(self, monkeypatch):
+        self._nllb(monkeypatch, lambda t, s, g: "NLLB draft")
+        vllm = FakeVLLM(["junk", "still junk"])
+        results, errors = await translate_batch(
+            vllm, "qwen", [ITEMS[0]], "vi", ["en"], style="marketing")
+        assert errors == []
+        assert results[0]["translations"]["en"] == "NLLB draft"
+
+    async def test_nllb_down_qwen_direct(self, monkeypatch):
+        def boom(t, s, g):
+            raise RuntimeError("nllb down")
+        self._nllb(monkeypatch, boom)
+        vllm = FakeVLLM(['{"0":"Qwen direct"}'])
+        results, errors = await translate_batch(
+            vllm, "qwen", [ITEMS[0]], "vi", ["en"], style="marketing")
+        assert errors == []
+        assert results[0]["translations"]["en"] == "Qwen direct"
+
+    async def test_both_fail_goes_to_errors(self, monkeypatch):
+        def boom(t, s, g):
+            raise RuntimeError("nllb down")
+        self._nllb(monkeypatch, boom)
+
+        class _BoomCompletions:
+            calls = 0
+            async def create(self, **kw):
+                raise RuntimeError("vllm down")
+
+        class BoomVLLM:
+            def __init__(self):
+                self.chat = type("C", (), {"completions": _BoomCompletions()})()
+
+        results, errors = await translate_batch(
+            BoomVLLM(), "qwen", [ITEMS[0]], "vi", ["en"], style="marketing")
+        assert results[0]["translations"] == {}
+        assert errors == [{"index": 0, "lang": "en", "reason": "parse_failed"}]
+
+    async def test_multilang_partial_en_polished_ko_draft(self, monkeypatch):
+        self._nllb(monkeypatch, lambda t, s, g: f"draft-{g}")
+        # en: 1 call parses; ko: 2 calls both junk -> falls back to draft-ko
+        vllm = FakeVLLM(['{"0":"EN polished"}', "junk", "junk"])
+        results, errors = await translate_batch(
+            vllm, "qwen", [ITEMS[0]], "vi", ["en", "ko"], style="marketing")
+        assert errors == []
+        assert results[0]["translations"]["en"] == "EN polished"
+        assert results[0]["translations"]["ko"] == "draft-ko"

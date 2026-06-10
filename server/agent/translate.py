@@ -189,6 +189,33 @@ async def _qwen_transcreate_from_draft(vllm_client, model, items, drafts,
     return parsed or {}
 
 
+async def _marketing_translate_lang(vllm_client, model, items, source_lang,
+                                    target_lang, context, glossary) -> dict:
+    """Hybrid NLLB->Qwen for one language. Returns {index_str: text}.
+
+    NLLB ok  -> Qwen transcreates the draft; per item, Qwen wins, NLLB draft is
+                the fallback floor (so a Qwen parse-fail never empties the item).
+    NLLB down -> Qwen translates directly (old marketing behavior).
+    """
+    drafts, nllb_failed = await _nllb_draft_batch(items, source_lang, target_lang)
+    if nllb_failed:
+        return await _qwen_translate_lang(
+            vllm_client, model, items, source_lang, target_lang, context, "marketing", glossary)
+
+    try:
+        polished = await _qwen_transcreate_from_draft(
+            vllm_client, model, items, drafts, source_lang, target_lang, context, glossary)
+    except Exception as e:
+        logger.warning("qwen transcreate failed (lang=%s): %s", target_lang, e)
+        polished = {}
+
+    out: dict[str, str] = {}
+    for idx in range(len(items)):
+        val = polished.get(str(idx))
+        out[str(idx)] = val if val else drafts.get(idx, "")
+    return out
+
+
 async def translate_batch(vllm_client, model, items, source_lang, target_langs,
                           context=None, style="llm", glossary=None):
     """Translate items into target_langs. Returns (results, errors).
@@ -212,8 +239,12 @@ async def translate_batch(vllm_client, model, items, source_lang, target_langs,
                     errors.append({"index": idx, "lang": lang, "reason": str(e)[:120]})
         else:
             try:
-                per = await _qwen_translate_lang(
-                    vllm_client, model, items, source_lang, lang, context, style, glossary)
+                if style == "marketing":
+                    per = await _marketing_translate_lang(
+                        vllm_client, model, items, source_lang, lang, context, glossary)
+                else:
+                    per = await _qwen_translate_lang(
+                        vllm_client, model, items, source_lang, lang, context, style, glossary)
             except Exception as e:
                 logger.warning("qwen translate failed (lang=%s): %s", lang, e)
                 per = {}
