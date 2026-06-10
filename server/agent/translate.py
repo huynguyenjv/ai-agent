@@ -29,6 +29,20 @@ LANG_NAMES = {
     "th": "Thai", "id": "Indonesian", "ru": "Russian", "pt": "Portuguese",
 }
 
+_DEFAULT_TRANSCREATE_USER = (
+    "The items below were machine-translated into {target_lang}. For each item you "
+    "are given the ORIGINAL source text and the machine DRAFT.\n"
+    "Rewrite each item as fluent, evocative marketing copy in {target_lang}:\n"
+    "- Fix awkwardness or errors in the draft using the original as the source of truth.\n"
+    "- Keep ALL facts, numbers, prices, proper nouns and glossary terms unchanged.\n"
+    "- Never invent details that are not in the original.\n"
+    "{context_line}\n"
+    "{glossary_line}\n"
+    'Return ONLY a JSON object mapping each item index (as a string) to its '
+    'rewritten text, e.g. {"0":"..."}. No prose, no code fences.\n'
+    "Items:\n{items_block}"
+)
+
 
 def _lang_name(code: str) -> str:
     return LANG_NAMES.get((code or "").lower(), code)
@@ -117,6 +131,62 @@ async def _nllb_draft_batch(items, source_lang, target_lang):
     except Exception as e:
         logger.warning("nllb draft failed (lang=%s): %s", target_lang, e)
         return drafts, True
+
+
+def _build_transcreate_prompt(items, drafts, source_lang, target_lang, context, glossary) -> str:
+    """Build the marketing transcreate user prompt from template + fallback.
+
+    Uses str.replace (not str.format) so literal { } in the JSON example survive.
+    """
+    from server.agent.translate_prompts import get_translate_prompts
+
+    tmpl = get_translate_prompts().get("marketing_transcreate_user") or _DEFAULT_TRANSCREATE_USER
+    context_line = f"Domain/context: {context}" if context else ""
+    glossary_line = (
+        "Keep these terms unchanged (do NOT translate): " + ", ".join(glossary)
+        if glossary else ""
+    )
+    items_block = "\n".join(
+        f'{idx}: original="{it["text"]}" | draft="{drafts.get(idx, "")}"'
+        for idx, it in enumerate(items)
+    )
+    out = tmpl
+    for key, val in (
+        ("{target_lang}", _lang_name(target_lang)),
+        ("{context_line}", context_line),
+        ("{glossary_line}", glossary_line),
+        ("{items_block}", items_block),
+    ):
+        out = out.replace(key, val)
+    return out
+
+
+async def _qwen_transcreate_from_draft(vllm_client, model, items, drafts,
+                                       source_lang, target_lang, context, glossary) -> dict:
+    """Qwen rewrites the NLLB draft into marketing copy. Returns {index_str: text}."""
+    from server.agent.translate_prompts import get_translate_prompts
+
+    store = get_translate_prompts()
+    system = store.get("marketing_system") or _system_prompt("marketing")
+    nudge = store.get("json_nudge") or 'Output ONLY valid JSON like {"0":"..."} — nothing else.'
+    user = _build_transcreate_prompt(items, drafts, source_lang, target_lang, context, glossary)
+    base = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    async def _call(messages) -> dict | None:
+        resp = await vllm_client.chat.completions.create(
+            model=model, messages=messages,
+            temperature=TRANSLATE_MARKETING_TEMPERATURE,
+            max_tokens=TRANSLATE_MAX_TOKENS, stream=False,
+        )
+        return _extract_json_map(resp.choices[0].message.content or "")
+
+    parsed = await _call(base)
+    if parsed is None:
+        parsed = await _call(base + [{"role": "user", "content": nudge}])
+    return parsed or {}
 
 
 async def translate_batch(vllm_client, model, items, source_lang, target_langs,

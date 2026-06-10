@@ -182,3 +182,31 @@ class TestNllbDraftBatch:
         monkeypatch.setattr("server.translation.get_translation_client", lambda: FakeNLLB())
         drafts, failed = await _nllb_draft_batch([ITEMS[0]], "vi", "en")
         assert failed is True
+
+
+class TestQwenTranscreate:
+    async def test_uses_draft_and_returns_polished(self):
+        from server.agent.translate import _qwen_transcreate_from_draft
+        vllm = FakeVLLM(['{"0":"Polished EN"}'])
+        out = await _qwen_transcreate_from_draft(
+            vllm, "qwen", [ITEMS[0]], {0: "rough draft"}, "vi", "en", None, None)
+        assert out == {"0": "Polished EN"}
+
+    async def test_retries_once_on_bad_json(self):
+        from server.agent.translate import _qwen_transcreate_from_draft
+        vllm = FakeVLLM(["not json", '{"0":"OK"}'])
+        out = await _qwen_transcreate_from_draft(
+            vllm, "qwen", [ITEMS[0]], {0: "d"}, "vi", "en", None, None)
+        assert out == {"0": "OK"}
+        assert vllm.chat.completions.calls == 2
+
+    async def test_prompt_includes_original_and_draft(self):
+        from server.agent.translate import _build_transcreate_prompt
+        prompt = _build_transcreate_prompt(
+            [ITEMS[0]], {0: "rough draft"}, "vi", "en",
+            context="travel", glossary=["Vtrip"])
+        assert "Quản trị viên" in prompt          # original
+        assert "rough draft" in prompt            # draft
+        assert "travel" in prompt                 # context
+        assert "Vtrip" in prompt                  # glossary
+        assert '{"0":"..."}' in prompt            # literal JSON example survived

@@ -27,7 +27,7 @@ prompts:
     {context_line}
     {glossary_line}
     Return ONLY a JSON object mapping each item index (as a string) to its
-    rewritten text, e.g. {"0":"...","1":"..."}. No prose, no code fences.
+    rewritten text, e.g. {"0":"..."}. No prose, no code fences.
     Items:
     {items_block}
 
