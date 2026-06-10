@@ -45,8 +45,15 @@ def _load() -> None:
                 MODEL_DIR, DEVICE, COMPUTE_TYPE)
     _translator = ctranslate2.Translator(MODEL_DIR, device=DEVICE, compute_type=COMPUTE_TYPE)
     _tokenizer = transformers.AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    # DYNAMIC: ~200 FLORES language codes straight from the tokenizer
-    _langs = {t for t in (_tokenizer.additional_special_tokens or []) if "_" in t}
+    # DYNAMIC: ~200 FLORES language codes straight from the tokenizer.
+    # API differs across transformers versions: newer NllbTokenizer drops
+    # `additional_special_tokens`, so fall back to lang_code_to_id / all_special_tokens.
+    _lang_source = (
+        getattr(_tokenizer, "additional_special_tokens", None)
+        or getattr(_tokenizer, "lang_code_to_id", None)
+        or _tokenizer.all_special_tokens
+    )
+    _langs = {t for t in _lang_source if "_" in t}
     logger.info("Model loaded; %d languages", len(_langs))
 
 
