@@ -273,3 +273,41 @@ class TestMarketingHybrid:
         assert errors == []
         assert results[0]["translations"]["en"] == "EN polished"
         assert results[0]["translations"]["ko"] == "draft-ko"
+
+
+class TestQwenDirectUsesLoader:
+    async def test_system_prompt_from_yaml_when_present(self, monkeypatch, tmp_path):
+        from server.agent.translate_prompts import reset_translate_prompts
+        (tmp_path / "translate.yaml").write_text(
+            'prompts:\n  llm_system: |\n    CUSTOM LLM SYSTEM\n', encoding="utf-8")
+        reset_translate_prompts(str(tmp_path))
+
+        captured = {}
+        class _Comp:
+            async def create(self, **kw):
+                captured["system"] = kw["messages"][0]["content"]
+                return _Resp('{"0":"x"}')
+        class _VLLM:
+            def __init__(self): self.chat = type("C", (), {"completions": _Comp()})()
+
+        from server.agent.translate import _qwen_translate_lang
+        await _qwen_translate_lang(_VLLM(), "qwen", [ITEMS[0]], "vi", "en", None, "llm", None)
+        reset_translate_prompts()  # restore default singleton for other tests
+        assert captured["system"] == "CUSTOM LLM SYSTEM"
+
+    async def test_falls_back_to_hardcoded_when_absent(self, monkeypatch, tmp_path):
+        from server.agent.translate_prompts import reset_translate_prompts
+        reset_translate_prompts(str(tmp_path))  # empty dir -> no yaml -> None
+
+        captured = {}
+        class _Comp:
+            async def create(self, **kw):
+                captured["system"] = kw["messages"][0]["content"]
+                return _Resp('{"0":"x"}')
+        class _VLLM:
+            def __init__(self): self.chat = type("C", (), {"completions": _Comp()})()
+
+        from server.agent.translate import _qwen_translate_lang, _system_prompt
+        await _qwen_translate_lang(_VLLM(), "qwen", [ITEMS[0]], "vi", "en", None, "marketing", None)
+        reset_translate_prompts()
+        assert captured["system"] == _system_prompt("marketing")

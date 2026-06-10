@@ -93,9 +93,12 @@ def _extract_json_map(text: str) -> dict | None:
 async def _qwen_translate_lang(vllm_client, model, items, source_lang, target_lang,
                                context, style, glossary) -> dict:
     """Translate all items into one target language via Qwen. Returns {index_str: text}."""
+    from server.agent.translate_prompts import get_translate_prompts
+
     temperature = TRANSLATE_MARKETING_TEMPERATURE if style == "marketing" else TRANSLATE_TEMPERATURE
+    system = get_translate_prompts().get(f"{style}_system") or _system_prompt(style)
     base = [
-        {"role": "system", "content": _system_prompt(style)},
+        {"role": "system", "content": system},
         {"role": "user", "content": _build_prompt(items, source_lang, target_lang, context, glossary)},
     ]
 
